@@ -1,0 +1,40 @@
+# Optional server limits. Defaults: maxConcurrent 12, codexResumeIdleSeconds 1800.
+# maxConcurrent: 12
+# codexResumeIdleSeconds: 1800
+# allowances:
+#   cursor:
+#     maxSpawns: 20
+#     maxCostUsd: 5
+
+models:
+  claude:
+    - name: claude-sonnet-5
+      description: Balanced default for most delegated work
+    - name: claude-opus-5
+      description: Highest capability, slower and more expensive
+    - name: claude-haiku-4-5-20251001
+      description: Fast and cheap for narrow, well-scoped tasks
+  codex:
+    - name: gpt-5.6-sol
+      description: Codex CLI default model; verified working via app-server
+    - name: gpt-5.6-luna
+      description: Fast and affordable agentic coding model (from the Codex model cache)
+    # Endpoint models (NVIDIA NIM, any OpenAI-compatible URL) are added automatically from
+    # `subagent-mcp endpoint add ...` as "<endpoint>/<alias>" in the claude, codex and opencode rosters.
+  opencode:
+    - name: ollama-cloud/gpt-oss:20b
+      description: >-
+        OpenCode model IDs are "provider/model" (matching config/providers). Run
+        `opencode models` to see what's configured locally, then add entries here.
+  antigravity:
+    - name: gemini-3.8-flash-low
+      description: Fast, low-effort Gemini 3.8 Flash tier from `agy models`.
+    - name: gemini-3.8-flash-high
+      description: Higher-reasoning Gemini 3.8 Flash tier from `agy models`.
+    - name: gemini-3.1-pro-high
+      description: Higher-capability Gemini 3.1 Pro tier from `agy models`.
+  cursor:
+    # Cursor Agent CLI model ids are the exact values from `agent --list-models`.
+    # `auto` is the CLI default; effort is folded into the id (e.g. grok-4.7-high).
+    - name: auto
+      description: Cursor Agent CLI default model routing (`agent --list-models` for the full roster).

@@ -1,0 +1,109 @@
+import assert from "node:assert/strict";
+import test from "node:test";
+
+import { FakeAdapter } from "../src/adapters/fake.js";
+import { EventBuffer } from "../src/events/buffer.js";
+
+const spawnRequest = {
+  prompt: "Do work",
+  description: "Test work",
+  model: "explicit-model",
+  cwd: "/workspace",
+  systemPrompt: "Act as a test worker.",
+  env: { TEST_MODE: "true" },
+  permission: { allow: ["Read"], deny: [], default: "escalate" as const },
+};
+
+test("fake adapter buffers fast events and resumes the same agent", async () => {
+  const buffer = new EventBuffer();
+  const adapter = new FakeAdapter("claude", buffer);
+  adapter.queueScript([
+    {
+      create: ({ agentId, backend }) => ({
+        type: "message.delta",
+        agentId,
+        backend,
+        data: { text: "done" },
+      }),
+    },
+    {
+      create: ({ agentId, backend, turnId }) => ({
+        type: "turn.completed",
+        agentId,
+        backend,
+        data: { turnId, status: "completed", finalText: "done" },
+      }),
+    },
+  ]);
+  const first = await adapter.spawn(spawnRequest);
+  await Promise.resolve();
+  await Promise.resolve();
+  const events = buffer.read(first.agentId).events;
+  assert.deepEqual(events.map((event) => event.type), ["thread.started", "message.delta", "turn.completed"]);
+  assert.deepEqual(events.map((event) => event.sequence), [1, 2, 3]);
+
+  const resumed = await adapter.resume({
+    agentId: first.agentId,
+    prompt: "Again",
+    cwd: "/workspace",
+    model: "explicit-model",
+    systemPrompt: spawnRequest.systemPrompt,
+    env: spawnRequest.env,
+    permission: spawnRequest.permission,
+  });
+  assert.equal(resumed.agentId, first.agentId);
+  assert.notEqual(resumed.turnId, first.turnId);
+  assert.deepEqual(adapter.spawnRequests[0]?.permission, spawnRequest.permission);
+  assert.deepEqual(adapter.resumeRequests[0]?.env, spawnRequest.env);
+});
+
+test("buffer reports retention truncation", () => {
+  const buffer = new EventBuffer(2);
+  for (let index = 0; index < 3; index += 1) {
+    buffer.append({ type: "message.delta", agentId: "a", backend: "codex", data: { text: String(index) } });
+  }
+  const result = buffer.read("a", 0);
+  assert.deepEqual(result.events.map((event) => event.sequence), [2, 3]);
+  assert.equal(result.truncatedBefore, 2);
+});
+
+test("currentSequence is always the true latest sequence, even on an empty or out-of-range read (issue #3)", () => {
+  const buffer = new EventBuffer();
+  for (let index = 0; index < 5; index += 1) {
+    buffer.append({ type: "message.delta", agentId: "a", backend: "codex", data: { text: String(index) } });
+  }
+  // Caught up: no new events, but currentSequence still reports where "now" is instead of
+  // echoing the caller's own `since` back (the exact bug the review hit with `since: 100000`).
+  const caughtUp = buffer.read("a", 5);
+  assert.deepEqual(caughtUp.events, []);
+  assert.equal(caughtUp.currentSequence, 5);
+  assert.equal(caughtUp.nextSequence, 5);
+
+  // A `since` far beyond the true max behaves the same way, not as an error.
+  const wayAhead = buffer.read("a", 100_000);
+  assert.deepEqual(wayAhead.events, []);
+  assert.equal(wayAhead.currentSequence, 5);
+
+  // An agent with no events at all reports currentSequence 0, not the caller's `since`.
+  assert.equal(buffer.read("unknown-agent", 0).currentSequence, 0);
+});
+
+test("limit caps a read and hasMore reports whether more events remain", () => {
+  const buffer = new EventBuffer();
+  for (let index = 0; index < 5; index += 1) {
+    buffer.append({ type: "message.delta", agentId: "a", backend: "codex", data: { text: String(index) } });
+  }
+  const page = buffer.read("a", 0, 2);
+  assert.deepEqual(page.events.map((event) => event.sequence), [1, 2]);
+  assert.equal(page.nextSequence, 2);
+  assert.equal(page.currentSequence, 5);
+  assert.equal(page.hasMore, true);
+
+  const nextPage = buffer.read("a", page.nextSequence, 2);
+  assert.deepEqual(nextPage.events.map((event) => event.sequence), [3, 4]);
+  assert.equal(nextPage.hasMore, true);
+
+  const lastPage = buffer.read("a", nextPage.nextSequence, 2);
+  assert.deepEqual(lastPage.events.map((event) => event.sequence), [5]);
+  assert.equal(lastPage.hasMore, undefined);
+});

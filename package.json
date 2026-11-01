@@ -1,0 +1,30 @@
+{
+  "name": "subagent-mcp",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "A resumable, approval-aware MCP bridge for Claude Code, Codex, OpenCode, Cursor and Antigravity subagents.",
+  "engines": {
+    "node": ">=22"
+  },
+  "bin": {
+    "subagent-mcp": "bin/subagent-mcp"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "check": "tsc -p tsconfig.json --noEmit",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "npm run build && node --test \"dist/test/*.test.js\"",
+    "start": "npm run build && node dist/src/server.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.17.5",
+    "yaml": "^2.8.1",
+    "zod": "^4.0.0",
+    "ajv": "^8.20.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.18.1",
+    "typescript": "^5.9.2"
+  },
+  "license": "MIT"
+}

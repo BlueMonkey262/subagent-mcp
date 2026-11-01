@@ -1,0 +1,89 @@
+#!/usr/bin/env python3
+"""Status line: one colored row per active subagent-mcp agent.
+
+Row: Harness - model - Agent type - Mathematician
+"""
+import hashlib, json, os, sys, time
+from datetime import datetime, timezone
+
+LIVE = {"starting", "running", "needs_approval"}
+BLUE, BOLD, DIM, RESET = "\033[34m", "\033[1m", "\033[2m", "\033[0m"
+HARNESS_COLORS = {"codex": "\033[38;5;141m", "opencode": "\033[36m", "claude": "\033[38;5;208m"}  # purple, cyan, orange
+
+MATHEMATICIANS = [
+    "Pascal", "Turing", "Euler", "Gauss", "Noether", "Ramanujan", "Fermat", "Riemann",
+    "Hilbert", "Gödel", "Lovelace", "Cantor", "Fibonacci", "Euclid", "Archimedes", "Laplace",
+    "Lagrange", "Galois", "Kovalevskaya", "Hypatia", "Poincaré", "Bernoulli", "Descartes", "Newton",
+    "Leibniz", "Dirichlet", "Hamilton", "Fourier", "Cauchy", "Abel", "Germain", "Erdős",
+    "Shannon", "von Neumann", "Mirzakhani", "Conway", "Napier", "Cardano", "Kepler", "Banach",
+]
+
+def elapsed(created):
+    start = datetime.fromisoformat(created.replace("Z", "+00:00"))
+    secs = max(0, int((datetime.now(timezone.utc) - start).total_seconds()))
+    return f"{secs}s" if secs < 60 else f"{secs // 60}m{secs % 60:02d}s"
+
+def assign_names(agents):
+    """Stable name per agent from a hash of its id; a clash moves to the next free name."""
+    taken, names = set(), {}
+    for a in sorted(agents, key=lambda a: a["created_at"]):
+        i = int(hashlib.sha1(a["agent_id"].encode()).hexdigest(), 16) % len(MATHEMATICIANS)
+        while MATHEMATICIANS[i] in taken and len(taken) < len(MATHEMATICIANS):
+            i = (i + 1) % len(MATHEMATICIANS)
+        taken.add(MATHEMATICIANS[i])
+        names[a["agent_id"]] = MATHEMATICIANS[i]
+    return names
+
+try:
+    session = json.loads(sys.stdin.read() or "{}")
+except Exception:
+    session = {}
+# the directories this session counts as its own project
+here = {d for d in (session.get("cwd"), (session.get("workspace") or {}).get("project_dir"),
+                    (session.get("workspace") or {}).get("current_dir")) if d}
+
+# one live file per session (the mod writes <this dir>/subagent-strip/live/<session_id>.json), so sessions never overwrite each other
+LIVE_DIR = os.path.join(os.path.dirname(os.path.realpath(__file__)), "subagent-strip", "live")
+try:  # prune files of dead sessions (untouched for a day)
+    d = LIVE_DIR
+    for f in os.listdir(d):
+        fp = os.path.join(d, f)
+        if time.time() - os.path.getmtime(fp) > 86400:
+            os.remove(fp)
+except Exception:
+    pass
+
+try:
+    live = json.load(open(os.path.join(LIVE_DIR, session["session_id"] + ".json")))
+    if time.time() * 1000 - live["at"] > 10000:  # poller stopped; don't show ghosts
+        sys.exit(0)
+    agents = [a for a in live["agents"] if a.get("state") in LIVE]
+except Exception:
+    sys.exit(0)
+
+saved = {}
+for d in here:
+    try:
+        path = os.path.join(d, ".subagents", "memory", "sessions.json")
+        saved.update({x["id"]: x for x in json.load(open(path))["agents"]})
+    except Exception:
+        pass
+configs = {i: x.get("agentConfig", "") for i, x in saved.items()}
+agents = [a for a in agents if saved.get(a["agent_id"], {}).get("cwd") in here]
+
+# the server assigns each agent its name; hash only as a fallback for older servers
+fallback = assign_names([a for a in agents if not a.get("name")])
+sep = f" {DIM}-{RESET} "
+
+for a in agents:
+    backend = a.get("backend", "")
+    config = configs.get(a["agent_id"], "").removeprefix(backend + "-").replace("-", " ").title()
+    parts = [f"{HARNESS_COLORS.get(backend, '')}{backend.title()}{RESET}", a.get("model", "")]
+    if config:
+        parts.append(config)
+    parts.append(f"{BOLD}{a.get('name') or fallback[a['agent_id']]}{RESET}")
+    row = sep.join(parts)
+    if a["state"] == "needs_approval":
+        print(f"{BLUE}!{RESET} {row} {BLUE}needs approval{RESET}")
+    else:
+        print(f"{row} {DIM}{elapsed(a['created_at'])}{RESET}")

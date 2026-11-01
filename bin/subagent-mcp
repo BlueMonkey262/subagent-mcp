@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+# subagent-mcp: launch Claude Code with the subagent-mcp server's channel enabled and the
+# status-line mod loaded, so you don't have to pass --dangerously-load-development-channels.
+#
+#   subagent-mcp [any claude arguments]      e.g. subagent-mcp --agent orchestrator
+#   subagent-mcp nim set-key [KEY]           add the NVIDIA NIM endpoint with your API key
+#   subagent-mcp endpoint add NAME URL --model ID[=alias] [--key KEY]   add any OpenAI-compatible endpoint
+#   subagent-mcp endpoint list|remove NAME
+#   subagent-mcp status                      endpoints, litellm and proxy state
+set -euo pipefail
+
+SELF="$(readlink -f "${BASH_SOURCE[0]}")"
+ROOT="$(cd "$(dirname "$SELF")/.." && pwd)"
+PORT="${SUBAGENT_MCP_NIM_PORT:-4131}"
+
+case "${1:-}" in
+nim)
+    exec node "$ROOT/bin/endpoints.mjs" "$@"
+    ;;
+endpoint)
+    shift
+    exec node "$ROOT/bin/endpoints.mjs" "$@"
+    ;;
+status)
+    node "$ROOT/bin/endpoints.mjs" list
+    command -v litellm >/dev/null && echo "litellm: installed" || echo "litellm: missing (pip install 'litellm[proxy]')"
+    curl -s -o /dev/null "http://127.0.0.1:${PORT}/health/liveliness" \
+        && echo "proxy: running on :${PORT}" || echo "proxy: not running (starts with the MCP server)"
+    exit 0
+    ;;
+esac
+
+command -v claude >/dev/null || { echo "subagent-mcp: 'claude' not found on PATH" >&2; exit 1; }
+
+# Load the status-line mod (append to any existing plugin dirs).
+export CLAUDE_CODE_PLUGIN_DIRS="$ROOT/mod/subagent-strip${CLAUDE_CODE_PLUGIN_DIRS:+:$CLAUDE_CODE_PLUGIN_DIRS}"
+
+exec claude --dangerously-load-development-channels server:subagent-mcp "$@"
