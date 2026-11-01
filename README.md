@@ -2,9 +2,7 @@
 
 A resumable, approval-aware MCP server for delegating work from a Claude Code session to
 subagents across five backends: Claude Code, Codex, OpenCode, Google Antigravity CLI, and the
-Cursor Agent CLI. Claude, Codex, OpenCode, and Cursor have been exercised live against their
-installed CLIs; Antigravity has fixture coverage plus live persistent-stream and cold-resume
-protocol probes.
+Cursor Agent CLI. All five have been exercised live against their installed CLIs.
 
 ## Setup
 
@@ -164,9 +162,8 @@ against the repository, tests, and the operator's actual request.
   `ROUTING.md` pass.
 - Progress is polling-only via `get_agent_events` for all five backends. The one push is the
   Claude Code channel below, which covers completion, failure, and approval requests only.
-- Antigravity has deterministic protocol-fixture coverage plus authenticated persistent-stream
-  and cold-resume probes, but needs a full host acceptance transcript before being described as
-  live-verified—especially for tool soft-denial and interrupt records.
+- Antigravity works in live use; tool soft-denial and interrupt records are covered by
+  protocol fixtures rather than a full live transcript.
 
 ## Claude Code channel (background completion alerts)
 
