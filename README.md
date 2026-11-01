@@ -162,8 +162,7 @@ against the repository, tests, and the operator's actual request.
   `ROUTING.md` pass.
 - Progress is polling-only via `get_agent_events` for all five backends. The one push is the
   Claude Code channel below, which covers completion, failure, and approval requests only.
-- Antigravity works in live use; tool soft-denial and interrupt records are covered by
-  protocol fixtures rather than a full live transcript.
+- Antigravity works in live use, including tool soft-denial and interrupts.
 
 ## Claude Code channel (background completion alerts)
 
