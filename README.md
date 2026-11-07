@@ -58,7 +58,7 @@ uses the examples bundled in this repo's `.subagents/`. Memory and routing recor
 for details. A spawn blocks until the child completes or needs your approval; when it needs
 approval, call `resolve_approval` to continue.
 
-Every spawned agent has a human-memorable mathematician name, assigned automatically unless
+Every spawned agent has a human-memorable name (a mathematician, philosopher, or figure from Greek mythology), assigned automatically unless
 `spawn_agent.name` is supplied. Results and agent listings include it, and tools that accept an
 agent can use either that name or the agent ID; names persist across reconnects.
 

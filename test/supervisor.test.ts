@@ -3,7 +3,7 @@ import test from "node:test";
 
 import { AdapterRegistry } from "../src/adapters/adapter.js";
 import { FakeAdapter } from "../src/adapters/fake.js";
-import { MATHEMATICIAN_NAMES } from "../src/agent-names.js";
+import { AGENT_NAMES } from "../src/agent-names.js";
 import { ConfigRegistry } from "../src/config/registry.js";
 import type { AgentConfig, ModelRoster } from "../src/config/schema.js";
 import { EventBuffer } from "../src/events/buffer.js";
@@ -110,7 +110,7 @@ test("an explicit name is preserved and automatic names avoid it case-insensitiv
   assert.notEqual(String(automatic["name"]).toLowerCase(), "abel");
 });
 
-test("automatic names are reused randomly, with a note, after every mathematician name has been used", async () => {
+test("automatic names are reused randomly, with a note, after every name in the pool has been used", async () => {
   const adapter = new FakeAdapter("codex");
   const supervisor = new Supervisor({
     registry: testRegistry([codexAgentConfig()]),
@@ -118,7 +118,7 @@ test("automatic names are reused randomly, with a note, after every mathematicia
     cwd: "/work",
   });
 
-  for (const name of MATHEMATICIAN_NAMES) {
+  for (const name of AGENT_NAMES) {
     adapter.queueScript([{
       create: (context) => ({
         type: "turn.completed",
@@ -136,7 +136,7 @@ test("automatic names are reused randomly, with a note, after every mathematicia
     description: "name pool fallback",
     run_in_background: true,
   });
-  assert.ok(MATHEMATICIAN_NAMES.some((name) => name === fallback["name"]));
+  assert.ok(AGENT_NAMES.some((name) => name === fallback["name"]));
   assert.match(String(fallback["name_note"]), /already given to 1 earlier agent.*NEW, different agent/);
   assert.equal(fallback["name_note"] === undefined, false);
 });
@@ -747,4 +747,11 @@ test("restored automatic names persist and are not reassigned", async () => {
     run_in_background: true,
   });
   assert.notEqual(String(next["name"]).toLowerCase(), originalName.toLowerCase());
+});
+
+test("agent name pool is unique (case-insensitive) and includes philosophers and Greek mythology", () => {
+  const lowered = AGENT_NAMES.map((name) => name.toLowerCase());
+  assert.equal(new Set(lowered).size, lowered.length);
+  for (const name of ["Aristotle", "Kant", "Athena", "Odysseus"]) assert.ok(lowered.includes(name.toLowerCase()), name);
+  for (const name of AGENT_NAMES) assert.match(name, /^[A-Za-z][A-Za-z-]*$/);
 });

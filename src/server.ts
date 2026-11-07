@@ -73,7 +73,7 @@ async function main(): Promise<void> {
           "Overridable unless the agent config pins it.",
         ),
         backend: z.enum(BACKENDS).optional().describe("Overrides the agent config's backend"),
-        name: z.string().optional().describe("Optional explicit name; otherwise a memorable mathematician name is assigned"),
+        name: z.string().optional().describe("Optional explicit name; otherwise a memorable name (mathematician, philosopher, or Greek myth figure) is assigned"),
         run_in_background: z.boolean().optional().describe("Return immediately instead of blocking to completion"),
         isolation: z.enum(['none','worktree']).optional().describe('Managed Git worktree; does not enforce filesystem confinement. Starts from committed HEAD.'),
         group_id: z.string().optional(),

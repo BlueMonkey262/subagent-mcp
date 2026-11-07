@@ -33,7 +33,7 @@ import { dirname } from "node:path";
 import { AdapterRegistry, type BackendAdapter } from "./adapters/adapter.js";
 import { ApprovalCoordinator } from "./approval/coordinator.js";
 import type { ApprovalDecision } from "./approval/types.js";
-import { MATHEMATICIAN_NAMES } from "./agent-names.js";
+import { AGENT_NAMES } from "./agent-names.js";
 import type { AgentConfigSource } from "./config/registry.js";
 import type { Backend } from "./core/types.js";
 import type { ModelEntry } from "./config/schema.js";
@@ -1012,7 +1012,7 @@ export class Supervisor {
   }
 
   /**
-   * Random mathematician name. A name no agent has ever carried is preferred; once the pool is used up, a name held by
+   * Random name. A name no agent has ever carried is preferred; once the pool is used up, a name held by
    * no live agent is reused and the result carries a note, so the model does not confuse the new agent with an old one
    * of the same name (old agents stay addressable by agent_id; the name resolves to the newest).
    */
@@ -1024,9 +1024,9 @@ export class Supervisor {
     }
     const isLive = (record: AgentRecord) => record.state === "starting" || record.state === "running" || record.state === "needs_approval";
     const pick = <T>(items: readonly T[]): T => items[Math.floor(Math.random() * items.length)]!;
-    const fresh = MATHEMATICIAN_NAMES.filter((name) => !holders.has(name.toLowerCase()) && !reservedNames?.has(name.toLowerCase()));
+    const fresh = AGENT_NAMES.filter((name) => !holders.has(name.toLowerCase()) && !reservedNames?.has(name.toLowerCase()));
     if (fresh.length > 0) return { name: pick(fresh) };
-    const candidates = MATHEMATICIAN_NAMES.filter((name) => !(holders.get(name.toLowerCase()) ?? []).some(isLive));
+    const candidates = AGENT_NAMES.filter((name) => !(holders.get(name.toLowerCase()) ?? []).some(isLive));
     if (candidates.length > 0) {
       const name = pick(candidates);
       const previous = holders.get(name.toLowerCase()) ?? [];
@@ -1037,7 +1037,7 @@ export class Supervisor {
       };
     }
     for (let suffix = 2; ; suffix += 1) {
-      const candidate = `${MATHEMATICIAN_NAMES[0]}-${suffix}`;
+      const candidate = `${AGENT_NAMES[0]}-${suffix}`;
       if (!holders.has(candidate.toLowerCase())) return { name: candidate };
     }
   }
