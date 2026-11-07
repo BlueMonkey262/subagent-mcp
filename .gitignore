@@ -1,3 +1,6 @@
 node_modules/
 dist/
 .subagents/memory/
+.codex/config.toml
+.claude/agents/orchestrator.md
+.codex/agents/orchestrator.toml
