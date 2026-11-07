@@ -2,7 +2,7 @@
 # subagent-mcp: launch Claude Code with the subagent-mcp server's channel enabled and the
 # status-line mod loaded, so you don't have to pass --dangerously-load-development-channels.
 #
-#   subagent-mcp [any claude arguments]      e.g. subagent-mcp --agent orchestrator
+#   subagent-mcp [any claude arguments]      e.g. subagent-mcp --resume
 #   subagent-mcp nim set-key [KEY]           add the NVIDIA NIM endpoint with your API key
 #   subagent-mcp endpoint add NAME URL --model ID[=alias] [--key KEY]   add any OpenAI-compatible endpoint
 #   subagent-mcp endpoint list|remove NAME

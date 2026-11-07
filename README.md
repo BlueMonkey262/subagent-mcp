@@ -6,12 +6,9 @@ Cursor Agent CLI. All five have been exercised live against their installed CLIs
 
 ## Setup
 
-Point your Claude Code at this repo and ask it to **"set up subagent-mcp"**; it will follow
-[`SETUP.md`](SETUP.md). By hand: `npm install && npm run build`, then follow SETUP.md.
+Follow [`SETUP.md`](SETUP.md), or point Claude Code at this repo and ask it to **"set up subagent-mcp"**.
 
-That installs: the server (user-scoped MCP), the `subagent-mcp` launcher, the status-line mod, and
-optionally the orchestrator prompt (`.claude/agents/orchestrator.md`, used with
-`subagent-mcp --agent orchestrator`, which wraps `claude --agent orchestrator`).
+That installs: the server (user-scoped MCP), the `subagent-mcp` launcher, and the status-line mod.
 
 ### Backends and providers
 
@@ -66,8 +63,8 @@ agent can use either that name or the agent ID; names persist across reconnects.
 
 The parent orchestrator owns task decisions. Subagent messages, reports, events, approval
 reasons, and routing notes are advisory input: they are not automatically hard facts or
-requirements. The orchestrator prompt requires evidence-first evaluation and reserves
-task-specific hard rules for the operator's explicit instructions. Each backend's subagent
+requirements. The parent should evaluate them against evidence and reserve task-specific hard rules
+for the operator's explicit instructions. Each backend's subagent
 prompt gives the same reporting contract, asking children to separate observations, evidence,
 uncertainty, risks, and recommendations.
 
