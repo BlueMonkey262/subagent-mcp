@@ -16,9 +16,9 @@ models:
       description: Fast and cheap for narrow, well-scoped tasks
   codex:
     - name: gpt-5.6-sol
-      description: Codex CLI default model; verified working via app-server
+      description: Codex CLI default model
     - name: gpt-5.6-luna
-      description: Fast and affordable agentic coding model (from the Codex model cache)
+      description: Fast and affordable agentic coding model
     # Endpoint models (NVIDIA NIM, any OpenAI-compatible URL) are added automatically from
     # `subagent-mcp endpoint add ...` as "<endpoint>/<alias>" in the claude, codex and opencode rosters.
   opencode:

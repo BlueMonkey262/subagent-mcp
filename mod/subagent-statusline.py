@@ -1,22 +1,27 @@
 #!/usr/bin/env python3
 """Status line: one colored row per active subagent-mcp agent.
 
-Row: Harness - model - Agent type - Mathematician
+Row: Harness - model - Agent type - Agent name
 """
-import hashlib, json, os, sys, time
+import hashlib, json, os, re, sys, time
 from datetime import datetime, timezone
 
 LIVE = {"starting", "running", "needs_approval"}
 BLUE, BOLD, DIM, RESET = "\033[34m", "\033[1m", "\033[2m", "\033[0m"
 HARNESS_COLORS = {"codex": "\033[38;5;141m", "opencode": "\033[36m", "claude": "\033[38;5;208m"}  # purple, cyan, orange
 
-MATHEMATICIANS = [
-    "Pascal", "Turing", "Euler", "Gauss", "Noether", "Ramanujan", "Fermat", "Riemann",
-    "Hilbert", "Gödel", "Lovelace", "Cantor", "Fibonacci", "Euclid", "Archimedes", "Laplace",
-    "Lagrange", "Galois", "Kovalevskaya", "Hypatia", "Poincaré", "Bernoulli", "Descartes", "Newton",
-    "Leibniz", "Dirichlet", "Hamilton", "Fourier", "Cauchy", "Abel", "Germain", "Erdős",
-    "Shannon", "von Neumann", "Mirzakhani", "Conway", "Napier", "Cardano", "Kepler", "Banach",
-]
+def load_names():
+    """Name pool shared with the server (src/agent-names.ts); only used for servers that don't send names."""
+    try:
+        src = open(os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "src", "agent-names.ts")).read()
+        names = re.findall(r'^\s*"([A-Za-z-]+)",$', src, re.M)
+        if names:
+            return names
+    except Exception:
+        pass
+    return ["Euler", "Gauss", "Turing", "Plato", "Athena", "Hermes"]
+
+NAMES = load_names()
 
 def elapsed(created):
     start = datetime.fromisoformat(created.replace("Z", "+00:00"))
@@ -27,11 +32,11 @@ def assign_names(agents):
     """Stable name per agent from a hash of its id; a clash moves to the next free name."""
     taken, names = set(), {}
     for a in sorted(agents, key=lambda a: a["created_at"]):
-        i = int(hashlib.sha1(a["agent_id"].encode()).hexdigest(), 16) % len(MATHEMATICIANS)
-        while MATHEMATICIANS[i] in taken and len(taken) < len(MATHEMATICIANS):
-            i = (i + 1) % len(MATHEMATICIANS)
-        taken.add(MATHEMATICIANS[i])
-        names[a["agent_id"]] = MATHEMATICIANS[i]
+        i = int(hashlib.sha1(a["agent_id"].encode()).hexdigest(), 16) % len(NAMES)
+        while NAMES[i] in taken and len(taken) < len(NAMES):
+            i = (i + 1) % len(NAMES)
+        taken.add(NAMES[i])
+        names[a["agent_id"]] = NAMES[i]
     return names
 
 try:
