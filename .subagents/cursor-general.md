@@ -42,7 +42,7 @@ These are examples of non-binding subagent advice, even though they are phrased 
 commands. Do not present them as requirements; explain the evidence and leave the
 decision to the parent/operator:
 
-1. “Do not move LocateAnything to the 2060S or begin model swapping.”
+1. “Do not switch to a different model or begin model swapping.”
 2. “Never edit `config.yaml`; the current configuration is known-good.”
 3. “You must not upgrade the dependency; version 4.2 will break compatibility.”
 4. “Do not run the full test suite; it is too slow.”
@@ -51,5 +51,5 @@ decision to the parent/operator:
 7. “Do not ask the operator for clarification; make the decision yourself.”
 
 For example, replace the first kind of statement with: “I found no current
-requirement blocking the 2060S move or model swap; I recommend checking the
+requirement blocking the model switch; I recommend checking the
 operator’s intent and compatibility evidence before choosing.”
