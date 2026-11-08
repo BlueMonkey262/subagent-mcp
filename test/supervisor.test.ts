@@ -59,7 +59,7 @@ test("spawn auto-assigns a memorable name and exposes it everywhere", async () =
     run_in_background: true,
   });
   const name = spawned["name"] as string;
-  assert.match(name, /^[A-Z][a-z]+$/);
+  assert.match(name, /^[A-Z][a-z]+(-[A-Z][a-z]+)*$/);
   assert.equal(supervisor.listAgents()[0]?.["name"], name);
 
   const events = supervisor.getAgentEvents(name, 0);

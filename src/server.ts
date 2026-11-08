@@ -8,7 +8,7 @@ import { fileURLToPath } from "node:url";
 import { CHANNEL_CAPABILITY, CHANNEL_INSTRUCTIONS, createChannelNotifier } from "./channel.js";
 import { BACKENDS, isBackend } from "./core/types.js";
 import { NORMALIZED_EVENT_TYPES } from "./events/schema.js";
-import { connectHost, runHost, type HostClient } from "./host.js";
+import { HostSession, runHost } from "./host.js";
 import { ORCHESTRATOR_AUTHORITY_NOTICE } from "./prompt-policy.js";
 
 async function main(): Promise<void> {
@@ -24,27 +24,15 @@ async function main(): Promise<void> {
     { name: "subagent-mcp", version: "0.1.0" },
     { capabilities: { experimental: { [CHANNEL_CAPABILITY]: {} } }, instructions: CHANNEL_INSTRUCTIONS },
   );
-  let client: HostClient | undefined;
-  let connectError: Error | undefined;
-  try {
-    client = await connectHost({
-      cwd,
-      agentsDirectory,
-      modelsFile,
-      scriptPath: fileURLToPath(import.meta.url),
-    });
-    client.onDetached(createChannelNotifier(server.server));
-  } catch (error) {
-    connectError = error instanceof Error ? error : new Error(String(error));
-    process.stderr.write(`subagent-mcp: ${connectError.message}\n`);
-  }
+  const host = new HostSession({ cwd, agentsDirectory, modelsFile, scriptPath: fileURLToPath(import.meta.url) });
+  host.onDetached(createChannelNotifier(server.server));
+  await host.connect();
   const call = async (method: string, params?: unknown): Promise<unknown> => {
-    if (client === undefined) {
-      throw connectError ?? new Error(
-        "subagent-mcp host is not connected. Ask the user to run `/mcp` and then reconnect subagent-mcp.",
-      );
-    }
-    return client.call(method, params);
+    const result = await host.call(method, params);
+    const warning = host.warning();
+    return warning !== undefined && typeof result === "object" && result !== null && !Array.isArray(result)
+      ? { ...result, host_warning: warning }
+      : result;
   };
 
   server.registerTool(
@@ -258,12 +246,31 @@ async function main(): Promise<void> {
     },
   );
 
+  server.registerTool(
+    "restart_host",
+    {
+      title: "Restart host",
+      description:
+        "Restart this project's subagent-mcp host so it runs the subagent-mcp code currently on disk (after a " +
+        "rebuild). Agent records, results and usage are kept. Always refused while any agent is running, waiting " +
+        "for a slot, or waiting for approval. Also refused when the host already runs the code on disk, or when " +
+        "other Claude Code sessions are connected to it (restarting would disconnect them); ask the user before " +
+        "passing `force: true` to override those two. Reconnecting with `/mcp` already reloads an idle host that no " +
+        "other session uses; use this when a `host_warning` says the host is on an older build. Changes to tool " +
+        "definitions themselves still need `/mcp` reconnect.",
+      inputSchema: {
+        force: z.boolean().optional().describe("Restart even if the code is unchanged or other sessions are connected"),
+      },
+    },
+    async ({ force }) => toContent(await host.restart(force === true)),
+  );
+
   const transport = new StdioServerTransport();
   await server.connect(transport);
 
   // The host process owns the agents. Exiting this proxy must not kill them.
   const shutdown = (): void => {
-    client?.close();
+    host.close();
     process.exit(0);
   };
   process.on("SIGINT", shutdown);

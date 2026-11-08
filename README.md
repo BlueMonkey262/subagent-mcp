@@ -50,7 +50,7 @@ uses the examples bundled in this repo's `.subagents/`.
 ## Tools
 
 `spawn_agent`, `send_message`, `list_agents`, `stop_agent`, `resolve_approval`,
-`get_agent_events`, `list_models` — see each tool's description for details. A spawn blocks
+`get_agent_events`, `list_models`, `restart_host` — see each tool's description for details. A spawn blocks
 until the child completes or needs your approval; when it needs approval, call
 `resolve_approval` to continue.
 
@@ -169,6 +169,16 @@ against the repository, tests, and the operator's actual request.
   host for this working directory, so `/mcp` reconnect does not drop running agents, and edits
   to `.subagents/` are picked up without a restart. If no config is loaded, tool calls return
   the files to create and ask the user to run `/mcp` and then reconnect `subagent-mcp`.
+- **Picking up code changes.** After rebuilding subagent-mcp (`npm run build`), run `/mcp` and
+  reconnect. The host reports a fingerprint of the compiled code it loaded and when it was built;
+  the reconnecting proxy replaces the host only when it runs *older* code, is idle, and no other
+  Claude Code session is attached. Agent records, results and usage carry over. A host running
+  newer code than the proxy is never downgraded; tool responses then carry a `host_warning` to
+  reconnect. When agents are running or another session is attached, the old host is kept and the
+  `host_warning` says so; `restart_host` then reloads it once agents finish. `restart_host` is
+  always refused while agents are running or waiting, and also refused when the host already runs
+  the code on disk or other sessions are attached, unless called with `force: true`. Changes to
+  tool definitions need the `/mcp` reconnect either way.
 
 ## Known gaps
 
