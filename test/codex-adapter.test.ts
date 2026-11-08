@@ -314,6 +314,17 @@ test("turn usage is the turn's own tokens, not the thread's running total", asyn
   assert.deepEqual(live.map((event) => (event.data as { usage: unknown }).usage), [expected(100, 2, 0), expected(250, 5, 50)]);
 });
 
+/** The adapter's grace timers are unref'd (a real child process keeps the loop alive); a fake child
+ * does not, so hold the loop open while a test waits on them. */
+async function withLoopHeld<T>(body: () => Promise<T>): Promise<T> {
+  const held = setInterval(() => undefined, 25);
+  try {
+    return await body();
+  } finally {
+    clearInterval(held);
+  }
+}
+
 const tokenUpdate = (turnId: string, total?: Record<string, number>, last?: Record<string, number>) => ({
   method: "thread/tokenUsage/updated",
   params: { turnId, tokenUsage: { ...(total === undefined ? {} : { total }), ...(last === undefined ? {} : { last }) } },
@@ -336,6 +347,22 @@ test("a token update arriving after turn/completed does not reopen the turn", as
   const events = adapter.buffer.read(agentId).events;
   const completedAt = events.findIndex((event) => event.type === "turn.completed");
   assert.equal(events.slice(completedAt + 1).some((event) => event.type === "usage.updated"), false);
+});
+
+test("a late update after turn/completed still advances the thread baseline for the next turn's no-`last` fallback", async () => {
+  const server = fakeCodexServer({}, (turnId, turn) => turn === 1
+    ? [tokenUpdate(turnId, counts(100, 5, 0), counts(100, 5, 0))]
+    : [tokenUpdate(turnId, counts(230, 12, 0))]); // no `last`: charged against the previous total
+  const adapter = new CodexAdapter({ spawnProcess: () => server.child, initTimeoutMs: 2_000 });
+  const { agentId, turnId } = await adapter.spawn(spawnRequest());
+  await waitForTurnCompleted(adapter, agentId);
+  (server.child.stdout as PassThrough).write(`${JSON.stringify(tokenUpdate(turnId, counts(180, 9, 0), counts(80, 4, 0)))}\n`);
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  const since = adapter.buffer.read(agentId).currentSequence;
+  await adapter.resume({ agentId, prompt: "again", cwd: "/tmp", model: "gpt-5.6-luna", systemPrompt: "", env: {}, permission });
+  const second = await turnEvents(adapter, agentId, since);
+  assert.deepEqual((second.find((event) => event.type === "turn.completed")?.data as { usage?: unknown }).usage,
+    { ...counts(50, 3, 0), uncachedInputTokens: 50 }, "230 - 180, not 230 - 100");
 });
 
 test("without `last`, the previous total is the baseline; with neither, usage is left unreported", async () => {
@@ -365,6 +392,7 @@ test("a thread resumed in a new process counts only the new turn", async () => {
 });
 
 test("an interrupted turn keeps the usage observed before the interrupt", async () => {
+  await withLoopHeld(async () => {
   const server = fakeCodexServer({}, (turnId) => [tokenUpdate(turnId, counts(20, 2, 0), counts(20, 2, 0)), { hold: true }]);
   const adapter = new CodexAdapter({ spawnProcess: () => server.child, initTimeoutMs: 2_000, interruptGraceMs: 30 });
   const { agentId } = await adapter.spawn(spawnRequest());
@@ -373,9 +401,11 @@ test("an interrupted turn keeps the usage observed before the interrupt", async 
   const completed = adapter.buffer.read(agentId).events.find((event) => event.type === "turn.completed");
   assert.equal((completed?.data as { status: string }).status, "interrupted");
   assert.deepEqual((completed?.data as { usage?: unknown }).usage, { ...counts(20, 2, 0), uncachedInputTokens: 20 });
+  });
 });
 
 test("providerInfo: a hung section times out on its own and a child ignoring SIGTERM is killed", async () => {
+  await withLoopHeld(async () => {
   const server = fakeCodexServer({
     "model/list": () => ({ result: { data: [{ id: "gpt-6.1-sol", isDefault: true }] } }),
     "account/usage/read": () => ({ silent: true }), // never answers
@@ -386,4 +416,5 @@ test("providerInfo: a hung section times out on its own and a child ignoring SIG
   assert.deepEqual(info.models, [{ id: "gpt-6.1-sol", default: true }], "the other sections still come back");
   assert.match(String((info["errors"] as Record<string, string>)["account_usage"]), /timed out/);
   assert.deepEqual((server.child as unknown as { signals: string[] }).signals, ["SIGTERM", "SIGKILL"]);
+  });
 });

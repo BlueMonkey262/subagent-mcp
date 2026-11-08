@@ -8,7 +8,8 @@ from datetime import datetime, timezone
 
 LIVE = {"starting", "running", "needs_approval"}
 BLUE, BOLD, DIM, RESET = "\033[34m", "\033[1m", "\033[2m", "\033[0m"
-HARNESS_COLORS = {"codex": "\033[38;5;141m", "opencode": "\033[36m", "claude": "\033[38;5;208m"}  # purple, cyan, orange
+HARNESS_COLORS = {"codex": "\033[38;5;141m", "opencode": "\033[36m", "claude": "\033[38;5;208m",
+                  "cursor": "\033[38;5;75m", "antigravity": "\033[38;5;204m"}  # purple, cyan, orange, sky blue, pink
 
 def load_names():
     """Name pool shared with the server (src/agent-names.ts); only used for servers that don't send names."""
@@ -97,11 +98,20 @@ for d in here:
     except Exception:
         pass
 configs = {i: x.get("agentConfig", "") for i, x in saved.items()}
-agents = [a for a in agents if saved.get(a["agent_id"], {}).get("cwd") in here]
+def in_project(agent_id):
+    """An agent belongs here if it runs in this project, or in a managed worktree made from it."""
+    rec = saved.get(agent_id, {})
+    repo = ((rec.get("meta") or {}).get("worktree") or {}).get("repository")
+    return rec.get("cwd") in here or (repo is not None and repo in here)
+
+agents = [a for a in agents if in_project(a["agent_id"])]
 
 # the server assigns each agent its name; hash only as a fallback for older servers
 fallback = assign_names([a for a in agents if not a.get("name")])
 sep = f" {DIM}-{RESET} "
+
+# list_agents order isn't stable between polls; sort so rows never shuffle (oldest first, id breaks ties)
+agents.sort(key=lambda a: (a.get("created_at", ""), a["agent_id"]))
 
 for a in agents:
     backend = a.get("backend", "")

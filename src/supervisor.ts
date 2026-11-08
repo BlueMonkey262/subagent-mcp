@@ -16,13 +16,20 @@ interface ExecutionMeta {
   structured?: unknown;
   validation_errors?: unknown;
   group_id?: string;
+  /** Set when the agent was started from a queued task: the task's id and creation time, which fix its list position. */
+  queued_from?: string;
+  queued_at?: string;
 }
+type Row = Readonly<Record<string, unknown>>;
+/** Position of a listed row. An agent started from a queued task keeps that task's position, so the task turning into an agent never moves it between pages. */
+const listKey = (r: Row) => ({ at: String(r.queued_at ?? r.created_at), id: String(r.queued_from ?? r.agent_id) });
+const newestFirst = (a: Row, b: Row) => listKey(b).at.localeCompare(listKey(a).at) || listKey(b).id.localeCompare(listKey(a).id);
 export interface ListAgentsInput {
   states?: string[] | undefined; backend?: Backend | undefined; updated_since?: string | undefined;
   limit?: number | undefined; cursor?: string | undefined;
 }
 interface PendingTask {
-  id: string; created_at: string; input: SpawnAgentInput; dependencies: { agent: string; turn: number }[];
+  id: string; created_at: string; updated_at?: string; input: SpawnAgentInput; dependencies: { agent: string; turn: number }[];
   state: 'queued' | 'starting' | 'blocked' | 'interrupted' | 'completed'; result?: Record<string, unknown>;
 }
 
@@ -40,10 +47,12 @@ import type { ModelEntry } from "./config/schema.js";
 import { AgentCapacity, childDepthEnv } from "./core/limits.js";
 import { ConfigurationError, SubagentError } from "./core/errors.js";
 import { EventBuffer } from "./events/buffer.js";
+import type { EventReadOptions } from "./events/buffer.js";
 import type { AgentEvent } from "./events/schema.js";
 import { scanChildOutput } from "./safety/output.js";
-import { RoutingStore, projectRoutingPaths, ensureProjectMemoryIgnored, type MemoryScope } from "./storage/routing.js";
+import { describeToolInput } from "./tool-describe.js";
 import { remainingAllowances, UsageLedger } from "./usage.js";
+import { MAX_CONTENT_CHARS, truncateText } from "./truncate.js";
 
 /** Cap on one backend's live `providerInfo` query, so `list_models` never hangs on it. */
 const LIVE_INFO_TIMEOUT_MS = 30_000;
@@ -123,6 +132,7 @@ export interface SpawnAgentInput {
   readonly run_in_background?: boolean | undefined;
   readonly max_turns?: number | undefined;
   readonly timeout?: number | undefined;
+  readonly max_result_chars?: number | undefined;
 }
 
 export interface SendMessageInput {
@@ -137,13 +147,13 @@ export interface SendMessageInput {
    * Codex replays the whole thread with no prompt cache.
    */
   readonly allow_expensive_resume?: boolean | undefined;
+  readonly max_result_chars?: number | undefined;
 }
 
 export interface SupervisorOptions {
   readonly registry: AgentConfigSource;
   readonly adapters: AdapterRegistry;
   readonly cwd: string;
-  readonly routing?: RoutingStore;
   /** Called once when a turn whose caller did not block (run_in_background) settles or needs approval. */
   readonly onDetachedSettled?: (result: Readonly<Record<string, unknown>>) => void;
   /** Overrides the registry cap. Calls wait in FIFO order once this many agents are active. */
@@ -173,7 +183,6 @@ export class Supervisor {
   readonly #agents = new Map<string, AgentRecord>();
   readonly #names = new Map<string, string>();
   readonly #events = new EventBuffer();
-  readonly #routing: RoutingStore | undefined;
   readonly #onDetachedSettled: ((result: Readonly<Record<string, unknown>>) => void) | undefined;
   readonly #codexResumeIdleMs: number | undefined;
   readonly #usage: UsageLedger;
@@ -189,7 +198,6 @@ export class Supervisor {
     this.#registry = options.registry;
     this.#adapters = options.adapters;
     this.#cwd = options.cwd;
-    this.#routing = options.routing;
     this.#onDetachedSettled = options.onDetachedSettled;
     this.#codexResumeIdleMs = options.codexResumeIdleMs;
     this.#usage = options.usage ?? new UsageLedger();
@@ -278,28 +286,32 @@ export class Supervisor {
     const records = this.listAgents().filter(r =>
       (!input.states || input.states.includes(r.state as string)) &&
       (!input.backend || r.backend === input.backend) &&
-      (!input.updated_since || String(r.updated_at) >= input.updated_since));
-    let after: { time: string; id: string } | undefined;
+      (!input.updated_since || Date.parse(String(r.updated_at)) >= Date.parse(input.updated_since)));
+    let after: { created_at: string; agent_id: string } | undefined;
     if (input.cursor) {
       try { after = JSON.parse(Buffer.from(input.cursor, 'base64url').toString('utf8')); }
       catch { throw new SupervisorError('Invalid cursor'); }
-      if (!after || typeof after.time !== 'string' || typeof after.id !== 'string') throw new SupervisorError('Invalid cursor');
+      if (!after || typeof after.created_at !== 'string' || typeof after.agent_id !== 'string') throw new SupervisorError('Invalid cursor');
     }
-    const sorted = records.sort((a,b) => String(b.updated_at).localeCompare(String(a.updated_at)) || String(a.agent_id).localeCompare(String(b.agent_id)));
-    const filtered = after ? sorted.filter(r => String(r.updated_at) < after!.time || (r.updated_at === after!.time && String(r.agent_id) > after!.id)) : sorted;
+    // newest first on an immutable key (created_at never changes, unlike updated_at), so pages never skip or repeat
+    const sorted = records.sort(newestFirst);
+    const filtered = after ? sorted.filter(r => { const k = listKey(r); return k.at < after!.created_at || (k.at === after!.created_at && k.id < after!.agent_id); }) : sorted;
     const limit = Math.min(100, Math.max(1, input.limit ?? 25));
     const page = filtered.slice(0, limit);
     const last = page.at(-1);
     return { agents: page,
-      next_cursor: filtered.length > limit && last ? Buffer.from(JSON.stringify({ time: last.updated_at, id: last.agent_id })).toString('base64url') : null,
+      next_cursor: filtered.length > limit && last ? Buffer.from(JSON.stringify({ created_at: listKey(last).at, agent_id: listKey(last).id })).toString('base64url') : null,
       concurrency: this.concurrency(), config_warning: this.#registry.configWarning(), storage_error: this.#storageError };
   }
 
   listAgents(): readonly Readonly<Record<string, unknown>>[] {
-    return [...this.#agents.values()].sort((a,b) => b.updatedAt.localeCompare(a.updatedAt) || a.id.localeCompare(b.id))
-      .map(record => this.#publicRecord(record)).concat([...this.#pending.values()].filter(task => !task.result?.agent_id).map(task => ({
-        agent_id: task.id, state: task.state, backend: task.input.backend, updated_at: task.created_at, group_id: task.input.group_id,
-      })));
+    const started = new Set([...this.#agents.values()].map(record => record.meta.queued_from));
+    return [...this.#agents.values()].map(record => this.#publicRecord(record))
+      .concat([...this.#pending.values()].filter(task => !task.result?.agent_id && !started.has(task.id)).map(task => ({
+        agent_id: task.id, state: task.state, backend: task.input.backend, created_at: task.created_at,
+        updated_at: task.updated_at ?? task.created_at, group_id: task.input.group_id,
+      })))
+      .sort(newestFirst);
   }
 
   listAgentConfigs() {
@@ -308,11 +320,26 @@ export class Supervisor {
       config_warning: this.#registry.configWarning() };
   }
 
-  async waitForAgents(agents: readonly string[], mode: 'any' | 'all' = 'all', timeout = 60) {
+  async waitForAgents(agents: readonly string[], mode: 'any' | 'all' = 'all', timeout = 60, since?: string, maxResultChars?: number) {
     if (!agents.length) throw new SupervisorError('At least one agent is required');
-    const states = () => agents.map(agent => this.#pending.has(agent) ? this.#pending.get(agent)!.result?.agent_id ? this.#requireRecord(String(this.#pending.get(agent)!.result!.agent_id)).state : this.#pending.get(agent)!.state : this.#requireRecord(agent).state);
-    const ready = () => { const values = states(); return values.includes('needs_approval') ||
-      (mode === 'all' ? values.every(v => !['starting','running','queued'].includes(v)) : values.some(v => !['starting','running','queued'].includes(v))); };
+    const statuses = () => agents.map(identifier => {
+      const task = this.#pending.get(identifier);
+      if (task && !task.result?.agent_id) return { identifier, state: task.state, updated_at: task.updated_at ?? task.created_at };
+      const record = this.#requireRecord(identifier);
+      return { identifier, state: record.state, updated_at: record.updatedAt };
+    });
+    const isSettled = (state: string) => !['starting','running','queued'].includes(state);
+    // Compare as instants: `since` may be "…:00Z" while stored times carry milliseconds
+    const sinceMs = since === undefined ? undefined : Date.parse(since);
+    const newlySettled = () => statuses().filter(status =>
+      isSettled(status.state) && (sinceMs === undefined || Date.parse(status.updated_at) > sinceMs));
+    const ready = () => {
+      const fresh = newlySettled();
+      if (fresh.some(status => status.state === 'needs_approval')) return true;
+      if (mode === 'any') return fresh.length > 0;
+      // 'all': everything has settled; with `since`, at least one must have settled after it
+      return statuses().every(status => isSettled(status.state)) && (sinceMs === undefined || fresh.length > 0);
+    };
     let timed_out = false;
     await new Promise<void>((resolve, reject) => {
       let timer: NodeJS.Timeout;
@@ -323,7 +350,8 @@ export class Supervisor {
       check();
     });
     await this.#writes;
-    return { timed_out, agents: agents.map(agent => this.#pending.has(agent) && !this.#pending.get(agent)!.result?.agent_id ? this.#pending.get(agent) : this.#result(this.#requireRecord(agent))) };
+    return { timed_out, newly_settled: newlySettled().map(status => status.identifier),
+      agents: agents.map(agent => this.#pending.has(agent) && !this.#pending.get(agent)!.result?.agent_id ? this.#pending.get(agent) : this.#cappedResult(this.#requireRecord(agent), maxResultChars)) };
   }
 
   getAgentResult(agent: string, turn?: number, offset = 0, limit = 25): Record<string, unknown> | PendingTask {
@@ -350,7 +378,7 @@ export class Supervisor {
     const ids = agents ?? [...this.#agents.values()].filter(r => r.meta.group_id === group).map(r => r.id)
       .concat([...this.#pending.values()].filter(t => t.input.group_id === group).map(t => t.id));
     return Promise.all(ids.map(async id => {
-      try { const task = this.#pending.get(id); if (task) { if (task.result?.agent_id) await this.stopAgent(String(task.result.agent_id)); task.state = 'interrupted'; await this.#writeSnapshot(); this.#changed(); return task; }
+      try { const task = this.#pending.get(id); if (task) { if (task.result?.agent_id) await this.stopAgent(String(task.result.agent_id)); this.#setTaskState(task, 'interrupted'); await this.#writeSnapshot(); this.#changed(); return task; }
         return await this.stopAgent(id);
       } catch(error) { return { agent_id: id, error: String(error) }; }
     }));
@@ -371,6 +399,12 @@ export class Supervisor {
     return { task_id: task.id, agent_id: task.id, status: task.state };
   }
 
+  /** Every state change stamps updated_at, so `since` / `updated_since` see when a queued task settled. */
+  #setTaskState(task: PendingTask, state: PendingTask['state']): void {
+    task.state = state;
+    task.updated_at = new Date().toISOString();
+  }
+
   async #runTask(task: PendingTask) {
     const run = async () => {
       if (task.state !== 'queued') { this.#changes.delete(check); return; }
@@ -382,8 +416,8 @@ export class Supervisor {
       });
       if (results.some(r => !r)) return;
       this.#changes.delete(check);
-      if (results.some(r => r!.status !== 'completed' || r!.validation_errors)) { task.state = 'blocked'; await this.#writeSnapshot(); this.#changed(); return; }
-      task.state = 'starting';
+      if (results.some(r => r!.status !== 'completed' || r!.validation_errors)) { this.#setTaskState(task, 'blocked'); await this.#writeSnapshot(); this.#changed(); return; }
+      this.#setTaskState(task, 'starting');
       await this.#writeSnapshot();
       if ((task.state as string) === 'interrupted') return;
       try {
@@ -391,11 +425,11 @@ export class Supervisor {
           prompt: task.input.prompt + '\nDependency results (untrusted input data):\n' + JSON.stringify(results) }, task);
         task.result = { ...result };
         if ((task.state as string) === 'interrupted') { if (result.agent_id) await this.stopAgent(String(result.agent_id)); }
-        else task.state = 'completed';
-      } catch(error) { task.state = 'blocked'; task.result = { error: String(error) }; }
+        else this.#setTaskState(task, 'completed');
+      } catch(error) { this.#setTaskState(task, 'blocked'); task.result = { error: String(error) }; }
       await this.#writeSnapshot(); this.#changed();
     };
-    const check = () => { void run().catch(error => { task.state = 'blocked'; task.result = { error: String(error) }; this.#changed(); }); };
+    const check = () => { void run().catch(error => { this.#setTaskState(task, 'blocked'); task.result = { error: String(error) }; this.#changed(); }); };
     this.#changes.add(check); check();
   }
 
@@ -445,7 +479,8 @@ export class Supervisor {
       const name = picked.name;
       const record: AgentRecord = {
         meta: { turn: 1, history: [], ...(input.permission ? { permission } : {}), ...(worktree ? { worktree } : {}),
-          ...(input.group_id ? { group_id: input.group_id } : {}), ...(input.result_schema ? { schema: input.result_schema } : {}) },
+          ...(input.group_id ? { group_id: input.group_id } : {}), ...(input.result_schema ? { schema: input.result_schema } : {}),
+          ...(task ? { queued_from: task.id, queued_at: task.created_at } : {}) },
         id: turn.agentId,
         name,
         backend: resolved.backend,
@@ -473,7 +508,7 @@ export class Supervisor {
       if (record.state === "starting") record.state = "running";
       void this.#writeSnapshot().catch(error => { this.#storageError = String(error); });
       if (!record.background) await this.#waitForNotableState(record);
-      return this.#result(record);
+      return this.#cappedResult(record, input.max_result_chars);
     } catch (error) {
       release();
       if (worktree && !launched) {
@@ -507,7 +542,7 @@ export class Supervisor {
       void this.#writeSnapshot().catch(error => { this.#storageError = String(error); });
       if (input.run_in_background === true) record.detached = true;
       else await this.#waitForNotableState(record);
-      return this.#result(record);
+      return this.#cappedResult(record, input.max_result_chars);
     }
     if (record.state === "needs_approval") {
       throw new SupervisorError(`Agent ${record.id} has a pending approval; resolve it before sending a new message`, {
@@ -539,7 +574,7 @@ export class Supervisor {
       throw error;
     }
     if (input.run_in_background !== true) await this.#waitForNotableState(record);
-    return this.#result(record);
+    return this.#cappedResult(record, input.max_result_chars);
   }
 
   /** Shared by sendMessage() and the queued-message delivery inside #pump(). */
@@ -628,6 +663,7 @@ export class Supervisor {
     agent: string,
     since: number,
     limit?: number,
+    options?: EventReadOptions,
   ): {
     readonly agent_id: string;
     readonly name: string;
@@ -637,7 +673,7 @@ export class Supervisor {
     readonly hasMore?: boolean;
   } {
     const record = this.#requireRecord(agent);
-    const read = this.#events.read(record.id, since, limit);
+    const read = this.#events.read(record.id, since, limit, options);
     return {
       agent_id: record.id,
       name: record.name,
@@ -648,28 +684,67 @@ export class Supervisor {
     };
   }
 
-  async recordOutcome(agent: string, verdict: "success" | "partial" | "failure", score?: number, notes?: string): Promise<void> {
+  /**
+   * Compact digest of an agent's event log: counts, tool histogram, the last few tool calls and
+   * the tail of its latest message. Meant to replace reading the whole log just to see progress.
+   * `since`, when given, scopes the digest to events after that sequence (e.g. a previous call's
+   * `currentSequence`), so repeat polling only reports what's new; `currentSequence` is always
+   * returned so the caller can pass it back next time.
+   */
+  summarizeAgentEvents(agent: string, recent = 5, since = 0): Record<string, unknown> {
     const record = this.#requireRecord(agent);
-    if (!this.#routing) return;
-    await this.#routing.append({
-      kind: "outcome",
-      delegationId: record.id,
-      recordedAt: new Date().toISOString(),
-      scope: "project",
-      verdict,
-      ...(score === undefined ? {} : { score }),
-      ...(notes === undefined ? {} : { notes }),
-    });
-  }
-
-  async addNote(text: string, scope: MemoryScope = "project"): Promise<void> {
-    if (!this.#routing) return;
-    await this.#routing.append({
-      kind: "note",
-      recordedAt: new Date().toISOString(),
-      scope,
-      text,
-    });
+    const read = this.#events.read(record.id, since);
+    const tools: Record<string, number> = {};
+    type Call = { sequence: number; tool: string; status: string; target?: string; preview?: string };
+    const calls: Call[] = [];
+    const byId = new Map<string, Call>();
+    let message = "";
+    let messageClosed = false;
+    let errors = 0;
+    let turns = 0;
+    for (const event of read.events) {
+      if (event.type === "tool.start") {
+        tools[event.data.toolName] = (tools[event.data.toolName] ?? 0) + 1;
+        const call: Call = { sequence: event.sequence, tool: event.data.toolName, status: "running", ...describeToolInput(event.data.input) };
+        byId.set(event.data.toolCallId, call);
+        calls.push(call);
+      } else if (event.type === "tool.end") {
+        const call = byId.get(event.data.toolCallId);
+        if (call) call.status = event.data.status;
+        else {
+          // its tool.start was before `since`: still report that it ended
+          const ended: Call = { sequence: event.sequence, tool: event.data.toolName ?? "tool", status: event.data.status };
+          byId.set(event.data.toolCallId, ended);
+          calls.push(ended);
+          tools[ended.tool] = (tools[ended.tool] ?? 0) + 1;
+        }
+      } else if (event.type === "message.delta") {
+        if (messageClosed) { message = ""; messageClosed = false; }
+        message += event.data.text;
+        if (message.length > 4000) message = message.slice(-2000);
+      } else if (event.type === "turn.completed") {
+        turns += 1;
+        // keep the finished turn's text as the latest message; a later delta starts a new one
+        if (typeof event.data.finalText === "string" && event.data.finalText !== "") message = event.data.finalText;
+        messageClosed = true;
+      } else if (event.type === "error") {
+        errors += 1;
+      }
+    }
+    return {
+      agent_id: record.id,
+      name: record.name,
+      state: record.state,
+      events: read.events.length,
+      currentSequence: read.currentSequence,
+      turns_completed: turns,
+      errors,
+      tool_calls: calls.length,
+      tools,
+      recent_tools: calls.slice(-recent).map(c => ({ ...c, tool: scanChildOutput(c.tool).slice(0, 80) })),
+      current_activity: record.meta.activity ?? null,
+      latest_message: scanChildOutput(message.trim()).slice(-300),
+    };
   }
 
   #pump(record: AgentRecord, adapter: BackendAdapter): void {
@@ -681,7 +756,7 @@ export class Supervisor {
           const previousActivity = record.meta.checkpointAt;
           record.updatedAt = new Date().toISOString();
           record.meta.activityAt = record.updatedAt;
-          if (event.type === 'tool.start') record.meta.activity = scanChildOutput(event.data.toolName).slice(0,160);
+          if (event.type === 'tool.start') record.meta.activity = scanChildOutput([event.data.toolName, describeToolInput(event.data.input).target].filter(Boolean).join(' ')).slice(0,160);
           if (event.type === 'tool.end' || event.type === 'turn.completed') delete record.meta.activity;
           if (!previousActivity || Date.parse(record.updatedAt) - Date.parse(previousActivity) >= 5000 || event.type === 'tool.start' || event.type === 'tool.end') { record.meta.checkpointAt = record.updatedAt; void this.#writeSnapshot().catch(() => {}); }
           if (event.type === "approval.requested") {
@@ -852,6 +927,27 @@ export class Supervisor {
     };
   }
 
+  #cappedResult(record: AgentRecord, maxResultChars?: number): Readonly<Record<string, unknown>> {
+    const full = this.#result(record);
+    const cap = maxResultChars ?? MAX_CONTENT_CHARS;
+    let result = full;
+    // Parsed JSON is the point of result_schema, so it gets a roomier cap (4x); past that it is left out here.
+    const structured = full.structured_result === undefined ? undefined : JSON.stringify(full.structured_result);
+    if (structured !== undefined && structured.length > cap * 4) {
+      result = { ...result, structured_result: null, structured_result_truncated: true, structured_result_chars: structured.length,
+        result_hint: "Use get_agent_result to retrieve the full result." };
+    }
+    if (typeof result.result !== "string") return result;
+    const truncated = truncateText(result.result, cap);
+    if (truncated.truncatedChars === 0) return result;
+    return {
+      ...result,
+      result: `${truncated.text}\n[truncated ${truncated.truncatedChars} characters]`,
+      result_truncated: true,
+      result_hint: "Use get_agent_result to retrieve the full result.",
+    };
+  }
+
   /** Completed turns plus, while one is running, the live usage of the turn in progress. */
   #totalUsage(record: AgentRecord) {
     const totals: Record<string, number | null> = {};
@@ -910,6 +1006,7 @@ export class Supervisor {
       activity_source: record.meta.activity ? 'tool_event' : null,
       cumulative_usage: this.#totalUsage(record),
       created_at: record.createdAt,
+      ...(record.meta.queued_from === undefined ? {} : { queued_from: record.meta.queued_from, queued_at: record.meta.queued_at }),
       updated_at: record.updatedAt,
     };
   }
@@ -966,7 +1063,7 @@ export class Supervisor {
 
   restorePending(tasks: readonly PendingTask[]): void {
     for (const task of tasks) {
-      if (task.state === 'starting') task.state = 'interrupted';
+      if (task.state === 'starting') this.#setTaskState(task, 'interrupted');
       this.#pending.set(task.id, task);
     }
     for (const task of tasks) if (task.state === 'queued') void this.#runTask(task);
@@ -1124,10 +1221,4 @@ export class Supervisor {
 
 export function modelRosterList(entries: readonly ModelEntry[]): readonly string[] {
   return entries.map((entry) => entry.name);
-}
-
-export async function defaultProjectRouting(projectRoot: string): Promise<RoutingStore> {
-  const paths = projectRoutingPaths(projectRoot);
-  await ensureProjectMemoryIgnored(projectRoot);
-  return new RoutingStore(paths);
 }

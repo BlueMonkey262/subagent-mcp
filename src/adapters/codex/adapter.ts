@@ -520,8 +520,14 @@ export class CodexAdapter implements BackendAdapter {
         return;
       }
       case "thread/tokenUsage/updated": {
-        // A finished turn's usage is final; a late update must not reopen it.
-        if (session.currentTurn.terminal) return;
+        // A finished turn's usage is final; a late update must not reopen it. But `total` is the whole
+        // thread's running count, so keep the baseline current: the next turn's fallback (no `last`)
+        // subtracts it, and a stale baseline would charge that turn for this one's late calls.
+        if (session.currentTurn.terminal) {
+          const lateTotal = tokenCounts(get(params, "tokenUsage", "total"));
+          if (lateTotal !== undefined) session.threadTotal = lateTotal;
+          return;
+        }
         if (session.currentTurn.id !== undefined && params.turnId === session.currentTurn.id) {
           // `total` is cumulative for the whole thread and `last` is one model call, so a turn's usage
           // is the latest `total` minus the `total` before its first call (`total - last` on the first

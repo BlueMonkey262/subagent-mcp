@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile } from "node:fs/promises";
+import { mkdtemp, readFile, realpath } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -121,7 +121,7 @@ test("buildClaudeArguments maps reasoningEffort to --effort and rejects unknown 
 });
 
 test("persistent process normalizes results, preserves one session, and scans output", async () => {
-  const cwd = await mkdtemp(path.join(os.tmpdir(), "claude-adapter-normal-"));
+  const cwd = await realpath(await mkdtemp(path.join(os.tmpdir(), "claude-adapter-normal-")));
   const invocation = path.join(cwd, "invocation.json");
   const transcript = path.join(cwd, "stdin.jsonl");
   const adapter = await fixtureAdapter(cwd, {
@@ -168,7 +168,7 @@ test("persistent process normalizes results, preserves one session, and scans ou
 });
 
 test("approval uses full control envelope and keeps control/tool IDs distinct", async () => {
-  const cwd = await mkdtemp(path.join(os.tmpdir(), "claude-adapter-approval-"));
+  const cwd = await realpath(await mkdtemp(path.join(os.tmpdir(), "claude-adapter-approval-")));
   const transcript = path.join(cwd, "stdin.jsonl");
   const adapter = await fixtureAdapter(cwd, { CLAUDE_FIXTURE_TRANSCRIPT: transcript });
   try {
@@ -198,7 +198,7 @@ test("approval uses full control envelope and keeps control/tool IDs distinct", 
 });
 
 test("structured interrupt is idempotent and yields one interrupted terminal event", async () => {
-  const cwd = await mkdtemp(path.join(os.tmpdir(), "claude-adapter-interrupt-"));
+  const cwd = await realpath(await mkdtemp(path.join(os.tmpdir(), "claude-adapter-interrupt-")));
   const transcript = path.join(cwd, "stdin.jsonl");
   const adapter = await fixtureAdapter(cwd, { CLAUDE_FIXTURE_TRANSCRIPT: transcript });
   try {
@@ -232,7 +232,7 @@ test("malformed output and early process exit become bounded normalized failures
 });
 
 test("stopped-process resume passes exact session ID and preserves identity", async () => {
-  const cwd = await mkdtemp(path.join(os.tmpdir(), "claude-adapter-resume-"));
+  const cwd = await realpath(await mkdtemp(path.join(os.tmpdir(), "claude-adapter-resume-")));
   const invocation = path.join(cwd, "invocation.json");
   const adapter = await fixtureAdapter(cwd, { CLAUDE_FIXTURE_INVOCATION: invocation });
   const request = spawnRequest(cwd, "FIRST");
