@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { currentVersion } from "../src/update-check.js";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -1065,6 +1066,7 @@ test("list_models adds live backend info (default on for a named backend) and fl
 });
 
 test("list_models adds only an available cached update", async () => {
+  const running = currentVersion(); // the notice only counts for the version that is running
   const directory = await mkdtemp(join(tmpdir(), "subagent-model-update-"));
   const updateCachePath = join(directory, "update.json");
   const supervisor = new Supervisor({
@@ -1076,7 +1078,7 @@ test("list_models adds only an available cached update", async () => {
   try {
     await writeFile(updateCachePath, JSON.stringify({
       checked_at: "2026-11-08T00:00:00.000Z",
-      current: "0.1.0",
+      current: running,
       latest: null,
       url: null,
       available: false,
@@ -1085,14 +1087,18 @@ test("list_models adds only an available cached update", async () => {
 
     await writeFile(updateCachePath, JSON.stringify({
       checked_at: "2026-11-08T00:00:00.000Z",
-      current: "0.1.0",
-      latest: "0.2.0",
+      current: running,
+      latest: "99.0.0",
       url: "https://example.test/release",
       available: true,
     }));
     assert.deepEqual((await supervisor.listModels(undefined, false))["update"], {
-      current: "0.1.0", latest: "0.2.0", url: "https://example.test/release",
+      current: running, latest: "99.0.0", url: "https://example.test/release",
     });
+    await writeFile(updateCachePath, JSON.stringify({
+      checked_at: "2026-11-08T00:00:00.000Z", current: "0.0.1", latest: "99.0.0", url: "https://example.test/release", available: true,
+    }));
+    assert.equal((await supervisor.listModels(undefined, false))["update"], undefined, "cache made for another version");
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
