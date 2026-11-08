@@ -1,13 +1,18 @@
 import type { Register } from 'claude-code'
 
+import { declarePanelCommand, registerPanel } from './panel'
+
 const LIVE = ['starting', 'running', 'needs_approval']
 const ACTIVE_MS = 2000
 const DORMANT_MS = 60000
 const FAILURES_BEFORE_DORMANT = 3
 
 export const register: Register = on => {
+  registerPanel(on)
+
   on('session.start', async ($, e, next) => {
     $.ui.status(undefined)
+    await declarePanelCommand($)
     // /clear gives the session a new id without a new session.start, so the path is resolved on every write
     // one file per session under <mod>/live, next to the status line script, so sessions never overwrite each other
     const root = $.plugin.root.replace(/\/\.claude-plugin\/?$/, '')
