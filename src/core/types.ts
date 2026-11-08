@@ -14,8 +14,18 @@ export type AgentLifecycleState =
   | "failed";
 
 export interface Usage {
+  /**
+   * Input tokens as the backend reports them. Whether this includes cache reads differs: Codex
+   * includes them; Claude, OpenCode and Cursor do not. Use `uncachedInputTokens` to compare.
+   */
   readonly inputTokens?: number;
   readonly outputTokens?: number;
+  /** Input tokens served from the prompt cache. */
   readonly cachedInputTokens?: number;
+  /**
+   * Input tokens processed fresh (not cache reads; cache writes count as fresh). Set only by
+   * adapters whose `inputTokens` semantics are known, so new and cached input can be told apart.
+   */
+  readonly uncachedInputTokens?: number;
   readonly costUsd?: number;
 }

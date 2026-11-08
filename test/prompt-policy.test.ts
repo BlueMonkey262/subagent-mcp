@@ -49,5 +49,5 @@ test("the public delegation surface carries the same trust-boundary reminder", a
   assert.match(serverSource, /ORCHESTRATOR_AUTHORITY_NOTICE/);
 
   const readme = await readFile(join(root, "README.md"), "utf8");
-  assert.match(readme, /Subagent messages, reports, events, approval/);
+  assert.match(readme, /Subagent messages, reports, events, and approval/);
 });

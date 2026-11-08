@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile } from "node:fs/promises";
+import { mkdtemp, readFile, realpath } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -105,7 +105,7 @@ test("buildCursorArguments is one turn per process, maps permission to force/pla
 });
 
 test("a turn stores the session_id, maps text/tools/result/usage, and exits after result", async () => {
-  const cwd = await mkdtemp(path.join(os.tmpdir(), "cursor-adapter-normal-"));
+  const cwd = await realpath(await mkdtemp(path.join(os.tmpdir(), "cursor-adapter-normal-")));
   const invocation = path.join(cwd, "invocation.json");
   const adapter = fixtureAdapter({ CURSOR_FIXTURE_INVOCATION: invocation });
   try {
@@ -127,7 +127,7 @@ test("a turn stores the session_id, maps text/tools/result/usage, and exits afte
     const completed = events.find((event) => event.type === "turn.completed")?.data as unknown as { status: string; finalText?: string; usage?: Record<string, number> };
     assert.equal(completed.status, "completed");
     assert.equal(completed.finalText, "final 1");
-    assert.deepEqual(completed.usage, { inputTokens: 10, outputTokens: 4, cachedInputTokens: 2 });
+    assert.deepEqual(completed.usage, { inputTokens: 10, outputTokens: 4, cachedInputTokens: 2, uncachedInputTokens: 13 }, "new input = input + cache writes");
 
     const data = JSON.parse(await readFile(invocation, "utf8"));
     assert.equal(data.cwd, cwd);
@@ -144,7 +144,7 @@ test("a turn stores the session_id, maps text/tools/result/usage, and exits afte
 });
 
 test("resume launches a fresh process with --resume and preserves the session id", async () => {
-  const cwd = await mkdtemp(path.join(os.tmpdir(), "cursor-adapter-resume-"));
+  const cwd = await realpath(await mkdtemp(path.join(os.tmpdir(), "cursor-adapter-resume-")));
   const invocation = path.join(cwd, "invocation.json");
   const adapter = fixtureAdapter({ CURSOR_FIXTURE_INVOCATION: invocation });
   const request = spawnRequest(cwd, "FIRST");
@@ -169,7 +169,7 @@ test("resume launches a fresh process with --resume and preserves the session id
 });
 
 test("stop_agent interrupts the process group once, without reporting a process fault", async () => {
-  const cwd = await mkdtemp(path.join(os.tmpdir(), "cursor-adapter-interrupt-"));
+  const cwd = await realpath(await mkdtemp(path.join(os.tmpdir(), "cursor-adapter-interrupt-")));
   const adapter = fixtureAdapter();
   try {
     const turn = await adapter.spawn(spawnRequest(cwd, "HANG"));
@@ -184,7 +184,7 @@ test("stop_agent interrupts the process group once, without reporting a process 
 });
 
 test("a timeout emits a fatal error and fails the turn", async () => {
-  const cwd = await mkdtemp(path.join(os.tmpdir(), "cursor-adapter-timeout-"));
+  const cwd = await realpath(await mkdtemp(path.join(os.tmpdir(), "cursor-adapter-timeout-")));
   const adapter = fixtureAdapter();
   try {
     const turn = await adapter.spawn(spawnRequest(cwd, "HANG", { timeoutMs: 300 }));
@@ -199,7 +199,7 @@ test("a timeout emits a fatal error and fails the turn", async () => {
 });
 
 test("a result with is_error is a failed turn with its text as finalText", async () => {
-  const cwd = await mkdtemp(path.join(os.tmpdir(), "cursor-adapter-fail-"));
+  const cwd = await realpath(await mkdtemp(path.join(os.tmpdir(), "cursor-adapter-fail-")));
   const adapter = fixtureAdapter();
   try {
     const turn = await adapter.spawn(spawnRequest(cwd, "FAIL"));
@@ -217,7 +217,7 @@ test("a result with is_error is a failed turn with its text as finalText", async
 
 test("early exit and malformed output become bounded normalized failures", async (t) => {
   await t.test("early exit", async () => {
-    const cwd = await mkdtemp(path.join(os.tmpdir(), "cursor-adapter-exit-"));
+    const cwd = await realpath(await mkdtemp(path.join(os.tmpdir(), "cursor-adapter-exit-")));
     const adapter = fixtureAdapter();
     try {
       const turn = await adapter.spawn(spawnRequest(cwd, "EXIT_EARLY"));
@@ -230,7 +230,7 @@ test("early exit and malformed output become bounded normalized failures", async
   });
 
   await t.test("malformed", async () => {
-    const cwd = await mkdtemp(path.join(os.tmpdir(), "cursor-adapter-malformed-"));
+    const cwd = await realpath(await mkdtemp(path.join(os.tmpdir(), "cursor-adapter-malformed-")));
     const adapter = fixtureAdapter();
     try {
       const turn = await adapter.spawn(spawnRequest(cwd, "MALFORMED"));
@@ -244,7 +244,7 @@ test("early exit and malformed output become bounded normalized failures", async
 });
 
 test("a background Cursor turn pushes the settled channel event on completion, failure, and interrupt", async (t) => {
-  const cwd = await mkdtemp(path.join(os.tmpdir(), "cursor-adapter-settled-"));
+  const cwd = await realpath(await mkdtemp(path.join(os.tmpdir(), "cursor-adapter-settled-")));
   const agentConfig: AgentConfig = {
     name: "cursor-general",
     backend: "cursor",

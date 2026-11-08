@@ -126,7 +126,7 @@ if (prompt.includes("MALFORMED")) {
     is_error: false,
     result: prompt.includes("SECOND") ? "final 2" : "final 1",
     session_id: sessionId,
-    usage: { inputTokens: 10, outputTokens: 4, cacheReadTokens: 2, cacheWriteTokens: 0 },
+    usage: { inputTokens: 10, outputTokens: 4, cacheReadTokens: 2, cacheWriteTokens: 3 },
   });
   finish(0);
 }

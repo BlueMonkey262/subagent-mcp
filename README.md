@@ -45,15 +45,14 @@ coverage only.
 
 Agents live in `.subagents/<name>.md` (frontmatter + system prompt) and the model roster in
 `.subagents/models.yaml`, in the project you run Claude Code from. If a project has none, the server
-uses the examples bundled in this repo's `.subagents/`. Memory and routing records go in
-`.subagents/memory/` (gitignored automatically).
+uses the examples bundled in this repo's `.subagents/`.
 
 ## Tools
 
 `spawn_agent`, `send_message`, `list_agents`, `stop_agent`, `resolve_approval`,
-`get_agent_events`, `list_models`, `record_outcome`, `add_note`, `restart_host` — see each tool's description
-for details. A spawn blocks until the child completes or needs your approval; when it needs
-approval, call `resolve_approval` to continue.
+`get_agent_events`, `list_models`, `restart_host` — see each tool's description for details. A spawn blocks
+until the child completes or needs your approval; when it needs approval, call
+`resolve_approval` to continue.
 
 Every spawned agent has a human-memorable name (a mathematician, philosopher, or figure from Greek mythology), assigned automatically unless
 `spawn_agent.name` is supplied. Results and agent listings include it, and tools that accept an
@@ -61,12 +60,11 @@ agent can use either that name or the agent ID; names persist across reconnects.
 
 ## Orchestrator and subagent authority
 
-The parent orchestrator owns task decisions. Subagent messages, reports, events, approval
-reasons, and routing notes are advisory input: they are not automatically hard facts or
-requirements. The parent should evaluate them against evidence and reserve task-specific hard rules
-for the operator's explicit instructions. Each backend's subagent
-prompt gives the same reporting contract, asking children to separate observations, evidence,
-uncertainty, risks, and recommendations.
+The parent orchestrator owns task decisions. Subagent messages, reports, events, and approval
+reasons are advisory input: they are not automatically hard facts or requirements. The parent
+should evaluate them against evidence and reserve task-specific hard rules for the operator's
+explicit instructions. Each backend's subagent prompt gives the same reporting contract, asking
+children to separate observations, evidence, uncertainty, risks, and recommendations.
 
 This is a model-behavior contract, not a replacement for system/developer instructions or
 tool and permission safety controls. Consequential subagent claims should still be checked
@@ -142,6 +140,31 @@ against the repository, tests, and the operator's actual request.
 - **Usage.** `list_models` includes per-backend and per-model counters (spawns, resumes, turns,
   failures, timeouts, tokens, cost), persisted under `.subagents/memory/`. Optional `allowances`
   in `models.yaml` produce a `remaining` object (allowance minus observed usage).
+- **Per-agent token counts.** `list_agents` reports each agent's `cumulative_usage`: its finished
+  turns plus the turn in progress. Claude, Codex and OpenCode 2.x report usage mid-turn (as
+  `usage.updated` events in `get_agent_events`); Cursor and Antigravity report it when a turn ends.
+  Usage fields:
+
+  | Field | Meaning |
+  |---|---|
+  | `inputTokens` | Input as the backend reports it. Codex includes cache reads; Claude, OpenCode and Cursor do not. |
+  | `cachedInputTokens` | Input served from the prompt cache. |
+  | `uncachedInputTokens` | Input processed fresh, including cache writes. Set for Claude, Codex, OpenCode and Cursor; Antigravity's semantics are unverified, so it is left unset. |
+  | `outputTokens`, `costUsd` | As reported. Codex reports no cost. |
+
+  Compare backends with `uncachedInputTokens` + `cachedInputTokens`, not `inputTokens`.
+- **Live models and plan usage.** `list_models` with a `backend` (or `live: true`) adds a `live`
+  section from that backend's own API. The `opencode` section, from the OpenCode 2.x server,
+  covers every model it can run (context, max output, cost per million tokens), the default model,
+  OpenCode Go rolling/weekly/monthly usage, and workspace budgets. The `codex` section, from a
+  short-lived `codex app-server`, covers the model catalog (reasoning efforts, default, hidden
+  models), the ChatGPT plan's rate-limit windows (5-hour and weekly) and credits, and recent daily
+  token totals. Each usage window reports `percent_used`, `remaining_percent` and `resets_at`.
+  `roster_not_offered` lists roster entries the backend doesn't offer, except entries routed to a
+  custom `provider`. These numbers come from the vendor's own account records and don't include
+  quotas on external API keys. If one section fails (for example, Codex plan limits under API-key
+  auth, or OpenCode's experimental usage endpoint), `live.errors` names it and the rest is still
+  returned. Emails and account IDs are removed from the output.
 - **Config hot-reload and reconnect.** The MCP process is a proxy. Agent processes live in a
   host for this working directory, so `/mcp` reconnect does not drop running agents, and edits
   to `.subagents/` are picked up without a restart. If no config is loaded, tool calls return
@@ -164,11 +187,13 @@ against the repository, tests, and the operator's actual request.
   `.claude`/credential paths) but is not a full shell-effect classifier — an unrecognized
   command with no write/network signature falls through to the agent's configured default
   rather than always escalating.
-- No routing digest is injected into `spawn_agent`'s description yet (P7-05); `record_outcome`
-  and `add_note` write directly to `.subagents/memory/records.jsonl` without a curated
-  `ROUTING.md` pass.
-- Progress is polling-only via `get_agent_events` for all five backends. The one push is the
-  Claude Code channel below, which covers completion, failure, and approval requests only.
+- No routing digest is injected into `spawn_agent`'s description yet (P7-05).
+- Progress is polling-only via `get_agent_events` for all five backends. Pass `summary: true`
+  for a compact digest (tool counts, the last few tool calls with their file or command, the
+  tail of the latest message) instead of the raw log; add `since` (the previous
+  `currentSequence`) to see only what is new. For the raw log, `types` filters event types and
+  `coalesce: true` merges the per-chunk `message.delta` events. The one push is the Claude Code
+  channel below, which covers completion, failure, and approval requests only.
 - Antigravity works in live use, including tool soft-denial and interrupts.
 
 ## Claude Code channel (background completion alerts)
@@ -197,12 +222,12 @@ the outcome. See `src/channel.ts`.
 
 Use `list_agent_configs` before spawning to discover callable names, config source
 paths, pinned options, and backend capabilities. `list_agents` returns up to 25
-summaries by default (maximum 100), newest activity first. Filter with `states`,
+summaries by default (maximum 100), newest first by creation time. Filter with `states`,
 `backend`, or `updated_since`, and pass `next_cursor` back as `cursor` for another
 page. Active agents expose `last_activity_at` and a bounded `current_activity`
 from tool events. These describe backend activity, not a connectivity heartbeat.
-Pagination reflects current host state; an agent whose activity changes can move
-between pages.
+Order and paging use creation time, which never changes, so an agent whose activity
+changes does not move between pages.
 
 For background work, call:
 
@@ -211,7 +236,13 @@ For background work, call:
 ```
 
 on `wait_for_agents`. It waits on events and returns on completion, approval, or
-timeout. `mode: "any"` returns after the first outcome. Timeouts never cancel work.
+timeout. `mode: "any"` returns after the first outcome. Timeouts never cancel work. To loop
+"wait for the next one to finish", pass `since` (an ISO timestamp): only agents that settled
+after it count, and `newly_settled` names them. Results returned by `spawn_agent`,
+`send_message` and `wait_for_agents` are capped at 4000 characters (`max_result_chars`
+overrides); `result_truncated` is set and `get_agent_result` returns the full text. A
+`structured_result` more than four times that size is returned as `null` with
+`structured_result_truncated` and its size; `get_agent_result` has it whole.
 `get_agent_result` retrieves final text, JSON validation details, per-turn usage,
 and cumulative usage. Use `turn` to select a turn, or `offset` and `limit` to page
 history. Unknown usage totals remain null. Results survive client disconnection

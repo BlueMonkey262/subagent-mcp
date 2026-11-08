@@ -644,6 +644,10 @@ function extractUsage(message: Readonly<Record<string, unknown>>): Usage | undef
     ...(typeof usage.inputTokens === "number" ? { inputTokens: usage.inputTokens } : {}),
     ...(typeof usage.outputTokens === "number" ? { outputTokens: usage.outputTokens } : {}),
     ...(typeof usage.cacheReadTokens === "number" ? { cachedInputTokens: usage.cacheReadTokens } : {}),
+    // inputTokens excludes cache reads (recorded turns show cacheReadTokens far above it); writes were fresh.
+    ...(typeof usage.inputTokens === "number"
+      ? { uncachedInputTokens: usage.inputTokens + (typeof usage.cacheWriteTokens === "number" ? usage.cacheWriteTokens : 0) }
+      : {}),
   };
   return Object.keys(result).length === 0 ? undefined : result;
 }

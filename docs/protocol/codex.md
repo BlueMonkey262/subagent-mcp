@@ -173,7 +173,42 @@ Relevant server notifications are:
 {"method":"turn/completed","params":{"threadId":"019...","turn":{"id":"019...","items":[],"itemsView":"<view>","status":"completed","error":null,"startedAt":0,"completedAt":0,"durationMs":0}}}
 ```
 
+Token usage arrives as `thread/tokenUsage/updated` with `params.turnId` and
+`params.tokenUsage: {total, last, modelContextWindow}`. Verified against codex-cli 0.159.2 on
+2026-11-08: `total` is cumulative for the whole **thread**, not the turn, and `last` is the most
+recent model call. In a two-turn thread, turn 2 reported `total.inputTokens` 37,113 with `last`
+18,566. The adapter therefore reports a turn's usage as the latest `total` minus the `total` before
+the turn's first call (`total - last` on the turn's first update). That needs no state from earlier
+turns, so a thread resumed in a new process is not double-counted. Without `last`, the previous
+`total` seen in this process is the baseline; with neither, the turn's usage is left unreported
+rather than guessed. Updates that arrive after the turn has ended are ignored, and a turn ended by
+an interrupt, timeout or process exit keeps the usage observed so far. `inputTokens` includes
+`cachedInputTokens`; fresh input is the difference. Each update is also emitted as `usage.updated`.
+
 Treat `turn/completed` as the terminal event even if expected item notifications were absent. For failed turns, `turn.error` is populated; the server may also emit `error` with `{error, willRetry, threadId, turnId}`. Exact delta segmentation and notification ordering are **unverified**. The adapter should append deltas by `(threadId, turnId, itemId)`, deduplicate terminal events, and retain the completed item's canonical content where available.
+
+### Models, rate limits and account usage
+
+`list_models` with `backend: "codex"` starts a short-lived app-server (no thread) and calls, after
+`initialize`:
+
+- `model/list` `{includeHidden: true, cursor?}`: the catalog (`id`, `displayName`, `description`,
+  `isDefault`, `hidden`, `supportedReasoningEfforts`, `defaultReasoningEffort`), paged by
+  `nextCursor`. It has no prices or context sizes.
+- `account/rateLimits/read`: `rateLimitsByLimitId` (and a single-bucket `rateLimits`) with
+  `primary`/`secondary` windows `{usedPercent, windowDurationMins, resetsAt}` (`resetsAt` in epoch
+  **seconds**; observed 300-minute and 10,080-minute windows on a Plus plan), `credits`,
+  `planType`, `rateLimitReachedType`, plus `ordinaryUsageAllowed` and `rateLimitResetCredits`.
+- `account/usage/read`: lifetime summary and `dailyUsageBuckets` `{startDate, tokens}`. With
+  `{threadId}` it can return `threadUsage.estimatedUsageUsdMicros`, but on a ChatGPT Plus login it
+  returned `null` before, right after and 3 seconds after a turn, so the adapter does not use it
+  for cost.
+- `account/read`: `account.type` (auth mode) and `planType`. The response also includes the email
+  address and workspace routing IDs, which the adapter drops.
+
+Each call fails on its own, with its own 10-second limit; under API-key auth the rate-limit read
+fails and the catalog still returns. The app-server is stopped with SIGTERM, then SIGKILL after a
+2-second grace, and stays tracked until it has exited.
 
 ### Interrupt
 

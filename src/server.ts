@@ -7,6 +7,7 @@ import { fileURLToPath } from "node:url";
 
 import { CHANNEL_CAPABILITY, CHANNEL_INSTRUCTIONS, createChannelNotifier } from "./channel.js";
 import { BACKENDS, isBackend } from "./core/types.js";
+import { NORMALIZED_EVENT_TYPES } from "./events/schema.js";
 import { HostSession, runHost } from "./host.js";
 import { ORCHESTRATOR_AUTHORITY_NOTICE } from "./prompt-policy.js";
 
@@ -48,6 +49,7 @@ async function main(): Promise<void> {
         "spawn. When the concurrency cap is full the call waits for a free slot instead of failing. `model` is " +
         "required unless the named agent config pins one; there is no default model at any layer. Implementation " +
         "work that requires search, iteration, or verification should go to a subagent rather than being done inline. " +
+        "Results are capped at 4000 characters by default; set `max_result_chars` to override the cap. " +
         ORCHESTRATOR_AUTHORITY_NOTICE,
       inputSchema: {
         agent: z.string().describe("Name of a configured agent in .subagents/<name>.md"),
@@ -72,6 +74,7 @@ async function main(): Promise<void> {
         timeout: z.number().int().positive().optional().describe(
           "Turn cap in seconds. Overrides the agent config for this spawn. Echoed back as timeout_seconds.",
         ),
+        max_result_chars: z.number().int().positive().optional().describe("Maximum result characters returned by this call"),
       },
     },
     async (input) => toContent(await call("spawn_agent", input)),
@@ -87,7 +90,8 @@ async function main(): Promise<void> {
         "after a long idle (default 30 minutes, codexResumeIdleSeconds in models.yaml) is refused unless " +
         "allow_expensive_resume is true. `timeout` is the turn cap in seconds and is echoed as timeout_seconds. " +
         "If the agent is still mid-turn, this queues the message (one slot) for delivery the moment the current turn " +
-        "ends, rather than failing — call list_agents/get_agent_events if you need to know when it lands.",
+        "ends, rather than failing — call list_agents/get_agent_events if you need to know when it lands. Results " +
+        "are capped at 4000 characters by default; set `max_result_chars` to override the cap.",
       inputSchema: {
         agent: z.string().describe("Agent ID or name"),
         prompt: z.string(),
@@ -102,6 +106,7 @@ async function main(): Promise<void> {
           "Resume a Codex agent even though it has been idle past the uncached-replay limit.",
         ),
         run_in_background: z.boolean().optional(),
+        max_result_chars: z.number().int().positive().optional().describe("Maximum result characters returned by this call"),
       },
     },
     async (input) => toContent(await call("send_message", input)),
@@ -114,7 +119,8 @@ async function main(): Promise<void> {
       description:
         "List agents tracked by this host, including ones restored after a reconnect, with their lifecycle state " +
         "and human-memorable name. Refer to agents by name in later tool calls. Also reports timeout_seconds, the " +
-        "concurrency cap, how many agents are active, and how many spawns are waiting.",
+        "concurrency cap, how many agents are active, and how many spawns are waiting. Newest first by creation " +
+        "time; order and cursors are stable while agents run, so pages never skip or repeat an agent.",
       inputSchema: {
         states: z.array(z.enum(['starting','running','needs_approval','completed','interrupted','failed','queued','blocked'])).optional(),
         backend: z.enum(BACKENDS).optional(), updated_since: z.iso.datetime().optional(),
@@ -126,8 +132,10 @@ async function main(): Promise<void> {
 
   server.registerTool('list_agent_configs', { description: 'Discover callable configs, source files, pinned options and backend capabilities', inputSchema: {} },
     async () => toContent(await call('list_agent_configs')));
-  server.registerTool('wait_for_agents', { description: 'Event-driven join; returns on any/all completion, approval, or timeout without stopping agents. Maximum 60 seconds.',
-    inputSchema: { agents: z.array(z.string()).min(1), mode: z.enum(['any','all']).optional(), timeout_seconds: z.number().min(0).max(60).optional() } },
+  server.registerTool('wait_for_agents', { description: 'Event-driven join; returns on any/all completion, approval, or timeout without stopping agents. Pass since to wait only for agents that settle after that timestamp; newly_settled identifies them. Results are capped at 4000 characters by default; set max_result_chars to override. Maximum 60 seconds.',
+    inputSchema: { agents: z.array(z.string()).min(1), mode: z.enum(['any','all']).optional(), timeout_seconds: z.number().min(0).max(60).optional(),
+      since: z.iso.datetime().optional().describe('Only agents settled after this timestamp count toward readiness.'),
+      max_result_chars: z.number().int().positive().optional() } },
     async input => toContent(await call('wait_for_agents', input)));
   server.registerTool('get_agent_result', { description: 'Retrieve persisted results and paginated turn history after reconnect or resume',
     inputSchema: { agent: z.string(), turn: z.number().int().positive().optional(), offset: z.number().int().min(0).optional(), limit: z.number().int().min(1).max(100).optional() } },
@@ -179,17 +187,33 @@ async function main(): Promise<void> {
         "The response identifies the agent by both `name` and `agent_id`; prefer the name in conversation. " +
         "The response always includes `currentSequence` (the true latest sequence for this agent, even when " +
         "`events` is empty) so you can seek straight to \"now\" instead of bisecting `since`. Pass `limit` to " +
-        "cap how many events come back in one call; `hasMore` says whether more remain past `nextSequence`.",
+        "cap how many events come back in one call (applied after `types` filtering); `hasMore` says whether " +
+        "more remain past `nextSequence`. `types` keeps only the listed event types — raw logs are mostly tiny " +
+        "`message.delta` text chunks, so filtering to e.g. `tool.start`/`tool.end` cuts the noise. `coalesce` " +
+        "(default false) merges consecutive `message.delta` events into one on read, without changing storage. " +
+        "`summary: true` returns a compact digest (state, tool counts, last few tool calls, tail of the latest " +
+        "message) instead of the raw log — prefer it for progress checks; pass `since` with it to scope the " +
+        "digest to events after a previous `currentSequence`, so repeat calls only report what's new.",
       inputSchema: {
         agent: z.string(),
         since: z.number().int().nonnegative().optional(),
         limit: z.number().int().positive().optional().describe("Caps events returned in this call"),
+        types: z.array(z.enum(NORMALIZED_EVENT_TYPES)).optional().describe("Keep only events of these types"),
+        coalesce: z.boolean().optional().describe(
+          "Merge consecutive message.delta events into one on read (default false; does not change what's stored)",
+        ),
+        summary: z.boolean().optional().describe(
+          "Return a compact digest (state, tool counts, last few tool calls, tail of the latest message) instead of the raw log. Prefer this for progress checks.",
+        ),
       },
     },
-    async ({ agent, since, limit }) => toContent(await call("get_agent_events", {
+    async ({ agent, since, limit, types, coalesce, summary }) => toContent(await call("get_agent_events", {
       agent,
+      ...(summary === undefined ? {} : { summary }),
       ...(since === undefined ? {} : { since }),
       ...(limit === undefined ? {} : { limit }),
+      ...(types === undefined ? {} : { types }),
+      ...(coalesce === undefined ? {} : { coalesce }),
     })),
   );
 
@@ -200,12 +224,25 @@ async function main(): Promise<void> {
       description:
         "Config-sourced model roster plus per-backend usage counters (spawns, resumes, turns, failures, timeouts, " +
         "tokens, and cost) and, when models.yaml sets allowances, how much of each allowance is left. Also reports " +
-        "the concurrency cap, the number of active agents, and how many spawns are waiting for a slot.",
-      inputSchema: { backend: z.enum(BACKENDS).optional() },
+        "the concurrency cap, the number of active agents, and how many spawns are waiting for a slot. " +
+        "With `live` (on by default when one `backend` is named), adds a `live` section from the backend's own API. " +
+        "OpenCode >= 2: every model the server can run (context, max output, USD cost per million tokens), its default " +
+        "model, OpenCode Go rolling/weekly/monthly usage and workspace budgets. Codex: the model catalog (reasoning " +
+        "efforts, default), the ChatGPT plan's rate-limit windows and credits, and recent account token totals. Usage " +
+        "windows report `percent_used`, `remaining_percent` and `resets_at`. `roster_not_offered` lists roster entries " +
+        "the backend does not offer; `errors` names any section that failed. Live usage is what the vendor's own " +
+        "account tracks, not quotas of external API keys. It may start `opencode serve` or a short-lived `codex app-server`.",
+      inputSchema: {
+        backend: z.enum(BACKENDS).optional(),
+        live: z.boolean().optional().describe("Query live model lists and plan usage (default: true when backend is set)"),
+      },
     },
-    async ({ backend }) => {
+    async ({ backend, live }) => {
       if (backend !== undefined && !isBackend(backend)) throw new Error(`Invalid backend: ${String(backend)}`);
-      return toContent(await call("list_models", backend === undefined ? {} : { backend }));
+      return toContent(await call("list_models", {
+        ...(backend === undefined ? {} : { backend }),
+        ...(live === undefined ? {} : { live }),
+      }));
     },
   );
 
@@ -226,42 +263,6 @@ async function main(): Promise<void> {
       },
     },
     async ({ force }) => toContent(await host.restart(force === true)),
-  );
-
-  server.registerTool(
-    "record_outcome",
-    {
-      title: "Record outcome",
-      description: "Record your subjective verdict on a completed delegation, for future routing decisions.",
-      inputSchema: {
-        agent: z.string(),
-        verdict: z.enum(["success", "partial", "failure"]),
-        score: z.number().min(0).max(1).optional(),
-        notes: z.string().optional(),
-      },
-    },
-    async ({ agent, verdict, score, notes }) => {
-      await call("record_outcome", {
-        agent,
-        verdict,
-        ...(score === undefined ? {} : { score }),
-        ...(notes === undefined ? {} : { notes }),
-      });
-      return toContent({ recorded: true });
-    },
-  );
-
-  server.registerTool(
-    "add_note",
-    {
-      title: "Add routing note",
-      description: "Append a free-form delegation note to project or user routing memory.",
-      inputSchema: { text: z.string(), scope: z.enum(["project", "user"]).optional() },
-    },
-    async ({ text, scope }) => {
-      await call("add_note", { text, ...(scope === undefined ? {} : { scope }) });
-      return toContent({ recorded: true });
-    },
   );
 
   const transport = new StdioServerTransport();

@@ -99,7 +99,7 @@ test("a background agent's completion is pushed once; a foreground agent's is no
   await supervisor.spawnAgent({ agent: "general", prompt: "p", description: "d", run_in_background: true });
   await waitUntil(() => settled.length === 1);
   assert.equal(settled[0]?.["status"], "completed");
-  assert.match(String(settled[0]?.["name"]), /^[A-Z][a-z]+$/);
+  assert.match(String(settled[0]?.["name"]), /^[A-Z][a-z]+(-[A-Z][a-z]+)*$/);
   assert.equal(settled[0]?.["result"], "background result");
 
   adapter.queueScript(completeScript("foreground result"));

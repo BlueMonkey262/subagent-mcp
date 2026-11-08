@@ -1,3 +1,4 @@
+import { execFileSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import type { ChildProcess } from "node:child_process";
 
@@ -42,18 +43,31 @@ export function signalDescendants(child: ChildProcess, signal: NodeJS.Signals): 
 }
 
 function descendantPids(pid: number): number[] {
-  let text = "";
+  let children: number[];
   try {
-    text = readFileSync(`/proc/${pid}/task/${pid}/children`, "utf8");
+    children = parsePids(readFileSync(`/proc/${pid}/task/${pid}/children`, "utf8"));
   } catch {
+    // No /proc (macOS, BSD): ask pgrep for direct children instead.
+    children = pgrepChildren(pid);
+  }
+  // Deepest first so a parent is not reaped before its children are visited.
+  return children.flatMap((childPid) => [...descendantPids(childPid), childPid]);
+}
+
+function pgrepChildren(pid: number): number[] {
+  try {
+    return parsePids(execFileSync("pgrep", ["-P", String(pid)], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }));
+  } catch {
+    // pgrep exits 1 when there are no matches.
     return [];
   }
-  const children = text
+}
+
+function parsePids(text: string): number[] {
+  return text
     .trim()
     .split(/\s+/)
     .filter((value) => value !== "")
     .map((value) => Number(value))
     .filter((value) => Number.isInteger(value) && value > 0);
-  // Deepest first so a parent is not reaped before its children are visited.
-  return children.flatMap((childPid) => [...descendantPids(childPid), childPid]);
 }

@@ -50,7 +50,9 @@ The live probe produced this sequence:
 
 The adapter maps `SUCCESS` to a completed turn, `CANCELED`/`INTERRUPTED` to interrupted, and
 all other terminal statuses to failed. It maps `input_tokens`, `output_tokens`, and
-`cache_read_tokens` to the bridge's normalized usage fields. `agent_response.text_delta` is a
+`cache_read_tokens` to the bridge's normalized usage fields. Whether `input_tokens` includes
+`cache_read_tokens` is unverified, so the adapter leaves `uncachedInputTokens` unset and status
+rows show a single input count. `agent_response.text_delta` is a
 display delta, while `result.response` is the final result.
 
 Tool `step_update` records are normalized by their turn-local `step_index`; `tool_info.name`,

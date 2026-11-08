@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile } from "node:fs/promises";
+import { mkdtemp, readFile, realpath } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -121,7 +121,7 @@ test("buildClaudeArguments maps reasoningEffort to --effort and rejects unknown 
 });
 
 test("persistent process normalizes results, preserves one session, and scans output", async () => {
-  const cwd = await mkdtemp(path.join(os.tmpdir(), "claude-adapter-normal-"));
+  const cwd = await realpath(await mkdtemp(path.join(os.tmpdir(), "claude-adapter-normal-")));
   const invocation = path.join(cwd, "invocation.json");
   const transcript = path.join(cwd, "stdin.jsonl");
   const adapter = await fixtureAdapter(cwd, {
@@ -133,13 +133,17 @@ test("persistent process normalizes results, preserves one session, and scans ou
     const first = await adapter.spawn(request);
     const firstEvents = await eventsThrough(adapter, first.agentId, (event) => event.type === "turn.completed");
     assert.equal(first.agentId, "11111111-1111-4111-8111-111111111111");
-    assert.deepEqual(firstEvents.map((event) => event.type), ["thread.started", "message.delta", "turn.completed"]);
+    assert.deepEqual(firstEvents.map((event) => event.type), ["thread.started", "usage.updated", "usage.updated", "message.delta", "turn.completed"]);
+    assert.deepEqual(firstEvents.filter((event) => event.type === "usage.updated").map((event) => event.data.usage), [
+      { inputTokens: 3, outputTokens: 1, cachedInputTokens: 2, uncachedInputTokens: 7 },
+      { inputTokens: 3, outputTokens: 5, cachedInputTokens: 2, uncachedInputTokens: 7 },
+    ], "a repeated message id replaces its usage instead of adding to it");
     const delta = firstEvents.find((event) => event.type === "message.delta");
     assert.equal(delta?.data.text, "Assistant\\: turn 1");
     const completed = firstEvents.find((event) => event.type === "turn.completed");
     assert.equal(completed?.data.status, "completed");
     assert.equal(completed?.data.finalText, "<system\\-reminder>final 1</system\\-reminder>");
-    assert.deepEqual(completed?.data.usage, { inputTokens: 3, outputTokens: 5, cachedInputTokens: 2, costUsd: 0.01 });
+    assert.deepEqual(completed?.data.usage, { inputTokens: 3, outputTokens: 5, cachedInputTokens: 2, uncachedInputTokens: 7, costUsd: 0.01 });
 
     const cursor = firstEvents.at(-1)!.sequence;
     const second = await adapter.resume(resumeRequest(request, first.agentId, "SECOND"));
@@ -164,7 +168,7 @@ test("persistent process normalizes results, preserves one session, and scans ou
 });
 
 test("approval uses full control envelope and keeps control/tool IDs distinct", async () => {
-  const cwd = await mkdtemp(path.join(os.tmpdir(), "claude-adapter-approval-"));
+  const cwd = await realpath(await mkdtemp(path.join(os.tmpdir(), "claude-adapter-approval-")));
   const transcript = path.join(cwd, "stdin.jsonl");
   const adapter = await fixtureAdapter(cwd, { CLAUDE_FIXTURE_TRANSCRIPT: transcript });
   try {
@@ -194,7 +198,7 @@ test("approval uses full control envelope and keeps control/tool IDs distinct", 
 });
 
 test("structured interrupt is idempotent and yields one interrupted terminal event", async () => {
-  const cwd = await mkdtemp(path.join(os.tmpdir(), "claude-adapter-interrupt-"));
+  const cwd = await realpath(await mkdtemp(path.join(os.tmpdir(), "claude-adapter-interrupt-")));
   const transcript = path.join(cwd, "stdin.jsonl");
   const adapter = await fixtureAdapter(cwd, { CLAUDE_FIXTURE_TRANSCRIPT: transcript });
   try {
@@ -228,7 +232,7 @@ test("malformed output and early process exit become bounded normalized failures
 });
 
 test("stopped-process resume passes exact session ID and preserves identity", async () => {
-  const cwd = await mkdtemp(path.join(os.tmpdir(), "claude-adapter-resume-"));
+  const cwd = await realpath(await mkdtemp(path.join(os.tmpdir(), "claude-adapter-resume-")));
   const invocation = path.join(cwd, "invocation.json");
   const adapter = await fixtureAdapter(cwd, { CLAUDE_FIXTURE_INVOCATION: invocation });
   const request = spawnRequest(cwd, "FIRST");

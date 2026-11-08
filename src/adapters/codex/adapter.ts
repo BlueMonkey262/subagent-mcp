@@ -8,7 +8,7 @@ import type { Usage } from "../../core/types.js";
 import { EventBuffer } from "../../events/buffer.js";
 import type { AgentEvent, NewAgentEvent, NormalizedEventData, NormalizedEventType } from "../../events/schema.js";
 import { scanChildOutput } from "../../safety/output.js";
-import type { AdapterTurn, BackendAdapter, EventOptions, ResumeRequest, SpawnRequest } from "../adapter.js";
+import type { AdapterTurn, BackendAdapter, EventOptions, ProviderInfo, ProviderModel, ResumeRequest, SpawnRequest } from "../adapter.js";
 
 /**
  * Verified live against the installed `codex-cli 0.153.3` app-server (see the probe transcripts
@@ -30,6 +30,14 @@ import type { AdapterTurn, BackendAdapter, EventOptions, ResumeRequest, SpawnReq
 const DEFAULT_INIT_TIMEOUT_MS = 15_000;
 const DEFAULT_INTERRUPT_GRACE_MS = 5_000;
 const DEFAULT_STDERR_LIMIT_BYTES = 32 * 1024;
+/** `model/list` pages followed per `providerInfo` call; the catalog is a handful of models. */
+const MAX_MODEL_PAGES = 10;
+/** Most recent `account/usage/read` daily buckets kept in `providerInfo`. */
+const DAILY_USAGE_DAYS = 7;
+/** Each `providerInfo` section gets this long, so one hung request cannot sink the others. */
+const DEFAULT_LIVE_SECTION_TIMEOUT_MS = 10_000;
+/** After SIGTERM, how long the `providerInfo` app-server gets to exit before SIGKILL. */
+const DEFAULT_PROBE_REAP_GRACE_MS = 2_000;
 
 type SpawnProcess = (
   command: string,
@@ -46,6 +54,10 @@ export interface CodexAdapterOptions {
   readonly env?: Readonly<Record<string, string>>;
   readonly buffer?: EventBuffer;
   readonly spawnProcess?: SpawnProcess;
+  /** Per-section limit for `providerInfo` (default 10s). */
+  readonly liveSectionTimeoutMs?: number;
+  /** SIGTERM-to-SIGKILL grace for the `providerInfo` app-server (default 2s). */
+  readonly probeReapGraceMs?: number;
 }
 
 export class CodexAdapterError extends SubagentError {
@@ -90,6 +102,12 @@ interface CodexSession {
   readonly completedToolIds: Set<string>;
   currentTurn: CodexTurn;
   lastUsage?: Usage;
+  /** Thread-cumulative token totals just before this turn's first model call; see `turnUsage`. */
+  turnUsageBase?: TokenCounts;
+  /** True when this turn's starting point could not be determined, so its usage is not reported. */
+  turnUsageUnknown?: boolean;
+  /** The latest thread-cumulative `total` seen in this process, a fallback baseline when `last` is missing. */
+  threadTotal?: TokenCounts;
   stdoutBuffer: string;
   stderr: string;
   exited: boolean;
@@ -230,6 +248,86 @@ export class CodexAdapter implements BackendAdapter {
     this.#terminate(session);
   }
 
+  /**
+   * Live view from a short-lived `codex app-server` (Codex runs one per thread, so none is shared):
+   * the model catalog (`model/list`, hidden models included and marked), the signed-in plan's rate
+   * limits (`account/rateLimits/read`), account token activity (`account/usage/read`), and the auth
+   * mode (`account/read`). Each section fails on its own: with API-key auth there are no plan limits,
+   * and that shows up under `errors` while the model list still comes back.
+   */
+  async providerInfo(signal?: AbortSignal): Promise<ProviderInfo> {
+    signal?.throwIfAborted();
+    const session = this.#launch({ cwd: process.cwd(), model: "" });
+    const abort = (): void => this.#terminate(session);
+    signal?.addEventListener("abort", abort, { once: true });
+    try {
+      await this.#handshake(session);
+      const section = <T>(name: string, work: Promise<T>) => withTimeout(work, this.#options.liveSectionTimeoutMs ?? DEFAULT_LIVE_SECTION_TIMEOUT_MS, `Codex ${name}`);
+      const [models, limits, usage, account] = await Promise.allSettled([
+        section("model/list", this.#listModels(session)),
+        section("account/rateLimits/read", this.#request(session, "account/rateLimits/read", {})),
+        section("account/usage/read", this.#request(session, "account/usage/read", {})),
+        section("account/read", this.#request(session, "account/read", {})),
+      ]);
+      const errors: Record<string, string> = {};
+      const settled = <T>(name: string, result: PromiseSettledResult<unknown>, map: (value: unknown) => T): T | undefined => {
+        if (result.status === "fulfilled") return map(result.value);
+        errors[name] = describeError(result.reason);
+        return undefined;
+      };
+      const catalog = settled("models", models, (value) => value as readonly Readonly<Record<string, unknown>>[]);
+      const auth = settled("auth", account, summarizeAccount);
+      const usageLimits = settled("usage_limits", limits, summarizeRateLimits);
+      const accountUsage = settled("account_usage", usage, summarizeAccountUsage);
+      const defaultModel = catalog?.find((model) => model.isDefault === true);
+      return {
+        ...(auth === undefined ? {} : { auth }),
+        ...(typeof defaultModel?.id === "string" ? { default_model: defaultModel.id } : {}),
+        ...(usageLimits === undefined ? {} : { usage_limits: usageLimits }),
+        ...(accountUsage === undefined ? {} : { account_usage: accountUsage }),
+        ...(catalog === undefined ? {} : { models: catalog.flatMap(summarizeCodexModel) }),
+        ...(Object.keys(errors).length === 0 ? {} : { errors }),
+      };
+    } catch (error) {
+      if (signal?.aborted) throw new CodexAdapterError("Codex live query was aborted", { reason: describeError(signal.reason) });
+      throw error;
+    } finally {
+      signal?.removeEventListener("abort", abort);
+      await this.#reap(session);
+    }
+  }
+
+  /**
+   * Stop a `providerInfo` app-server: SIGTERM, a short grace, then SIGKILL the process group. It
+   * stays tracked (so `closeAll` still reaches it) until its exit is observed.
+   */
+  async #reap(session: CodexSession): Promise<void> {
+    const exited = new Promise<void>((resolve) => {
+      if (session.exited) resolve();
+      else session.child.once("exit", () => resolve());
+    });
+    for (const signal of ["SIGTERM", "SIGKILL"] as const) {
+      if (session.exited) break;
+      this.#signalGroup(session, signal);
+      await Promise.race([exited, delay(this.#options.probeReapGraceMs ?? DEFAULT_PROBE_REAP_GRACE_MS)]);
+    }
+    if (session.exited) this.#launches.delete(session);
+    else session.child.once("exit", () => this.#launches.delete(session));
+  }
+
+  /** Every `model/list` page, following `nextCursor`. */
+  async #listModels(session: CodexSession): Promise<readonly Readonly<Record<string, unknown>>[]> {
+    const models: Readonly<Record<string, unknown>>[] = [];
+    let cursor: string | undefined;
+    for (let page = 0; page < MAX_MODEL_PAGES; page += 1) {
+      const response = await this.#request(session, "model/list", { includeHidden: true, ...(cursor === undefined ? {} : { cursor }) });
+      if (Array.isArray(response.data)) models.push(...response.data.filter(isRecord));
+      cursor = typeof response.nextCursor === "string" && response.nextCursor !== "" ? response.nextCursor : undefined;
+      if (cursor === undefined) break;
+    }
+    return models;
+  }
+
   async closeAll(): Promise<void> {
     for (const session of this.#sessions.values()) this.#terminate(session);
     for (const launch of this.#launches) this.#terminate(launch);
@@ -288,6 +386,9 @@ export class CodexAdapter implements BackendAdapter {
   async #startTurn(session: CodexSession, prompt: string, timeoutMs?: number, reasoningEffort?: string): Promise<void> {
     if (!session.threadId) throw new CodexAdapterError("Cannot start a Codex turn before thread/start resolves");
     session.currentTurn = { terminal: false, interruptRequested: false, timedOut: false };
+    delete session.lastUsage;
+    delete session.turnUsageBase;
+    delete session.turnUsageUnknown;
     const started = await this.#request(session, "turn/start", {
       threadId: session.threadId,
       input: [{ type: "text", text: prompt }],
@@ -419,9 +520,44 @@ export class CodexAdapter implements BackendAdapter {
         return;
       }
       case "thread/tokenUsage/updated": {
+        // A finished turn's usage is final; a late update must not reopen it, and an update for another
+        // turn (e.g. a straggler that lands after resume() began the next one) is not this turn's usage.
+        // But `total` is the whole thread's running count, so keep the baseline current from either:
+        // the next turn's fallback (no `last`) subtracts it, and a stale baseline would charge that turn
+        // for these calls. Totals only grow, so an older notification never moves the baseline back.
+        if (session.currentTurn.terminal || params.turnId !== session.currentTurn.id) {
+          const lateTotal = tokenCounts(get(params, "tokenUsage", "total"));
+          const known = session.threadTotal;
+          if (lateTotal !== undefined && (known === undefined || lateTotal.inputTokens + lateTotal.outputTokens >= known.inputTokens + known.outputTokens)) {
+            session.threadTotal = lateTotal;
+          }
+          return;
+        }
         if (session.currentTurn.id !== undefined && params.turnId === session.currentTurn.id) {
-          const usage = extractUsage(params);
-          if (usage !== undefined) session.lastUsage = usage;
+          // `total` is cumulative for the whole thread and `last` is one model call, so a turn's usage
+          // is the latest `total` minus the `total` before its first call (`total - last` on the first
+          // update). That needs no cross-turn state, so a thread resumed in a new process is not
+          // double-counted. Without `last`, the previous `total` seen here is the baseline; with
+          // neither, the turn's usage is unknown and is left unreported rather than guessed.
+          const total = tokenCounts(get(params, "tokenUsage", "total"));
+          if (total === undefined) return;
+          const previousTotal = session.threadTotal;
+          session.threadTotal = total;
+          if (session.turnUsageUnknown) return;
+          if (session.turnUsageBase === undefined) {
+            const last = tokenCounts(get(params, "tokenUsage", "last"));
+            const base = last !== undefined ? subtractCounts(total, last) : previousTotal;
+            if (base === undefined) {
+              session.turnUsageUnknown = true;
+              return;
+            }
+            session.turnUsageBase = base;
+          }
+          session.lastUsage = toUsage(subtractCounts(total, session.turnUsageBase));
+          if (session.threadId !== undefined) {
+            const turnId = session.currentTurn.id;
+            this.#emit(session, "usage.updated", { ...(turnId === undefined ? {} : { turnId }), usage: session.lastUsage });
+          }
         }
         return;
       }
@@ -460,7 +596,7 @@ export class CodexAdapter implements BackendAdapter {
     this.#completeTurn(session, status, finalText, session.lastUsage);
   }
 
-  #completeTurn(session: CodexSession, status: NormalizedEventData["turn.completed"]["status"], finalText?: string, usage?: Usage): void {
+  #completeTurn(session: CodexSession, status: NormalizedEventData["turn.completed"]["status"], finalText?: string, usage: Usage | undefined = session.lastUsage): void {
     if (session.currentTurn.terminal) return;
     session.currentTurn.terminal = true;
     if (session.currentTurn.timeout) clearTimeout(session.currentTurn.timeout);
@@ -616,15 +752,155 @@ function extractPathsFromItem(item: Readonly<Record<string, unknown>> | undefine
   return [...paths];
 }
 
-function extractUsage(tokenUsageNotification: Readonly<Record<string, unknown>>): Usage | undefined {
-  const total = get(tokenUsageNotification, "tokenUsage", "total");
-  if (!isRecord(total)) return undefined;
-  const result: Usage = {
-    ...(typeof total.inputTokens === "number" ? { inputTokens: total.inputTokens } : {}),
-    ...(typeof total.outputTokens === "number" ? { outputTokens: total.outputTokens } : {}),
-    ...(typeof total.cachedInputTokens === "number" ? { cachedInputTokens: total.cachedInputTokens } : {}),
+interface TokenCounts {
+  readonly inputTokens: number;
+  readonly outputTokens: number;
+  readonly cachedInputTokens: number;
+}
+
+/** A `TokenUsageBreakdown` (`thread/tokenUsage/updated`'s `total` or `last`), or undefined when it has no counts. */
+function tokenCounts(breakdown: unknown): TokenCounts | undefined {
+  if (!isRecord(breakdown)) return undefined;
+  const count = (key: string): number | undefined => (typeof breakdown[key] === "number" ? breakdown[key] as number : undefined);
+  const counts = [count("inputTokens"), count("outputTokens"), count("cachedInputTokens")];
+  if (counts.every((value) => value === undefined)) return undefined;
+  return { inputTokens: counts[0] ?? 0, outputTokens: counts[1] ?? 0, cachedInputTokens: counts[2] ?? 0 };
+}
+
+function subtractCounts(a: TokenCounts, b: TokenCounts): TokenCounts {
+  return {
+    inputTokens: Math.max(0, a.inputTokens - b.inputTokens),
+    outputTokens: Math.max(0, a.outputTokens - b.outputTokens),
+    cachedInputTokens: Math.max(0, a.cachedInputTokens - b.cachedInputTokens),
   };
-  return Object.keys(result).length === 0 ? undefined : result;
+}
+
+function toUsage(counts: TokenCounts): Usage {
+  return {
+    inputTokens: counts.inputTokens,
+    outputTokens: counts.outputTokens,
+    cachedInputTokens: counts.cachedInputTokens,
+    // Codex's inputTokens already includes the cached part.
+    uncachedInputTokens: Math.max(0, counts.inputTokens - counts.cachedInputTokens),
+  };
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms).unref());
+}
+
+/** Reject with a timeout error if `work` has not settled within `ms`. */
+function withTimeout<T>(work: Promise<T>, ms: number, label: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new CodexAdapterError(`${label} timed out after ${ms}ms`)), ms);
+    timer.unref();
+    work.then(
+      (value) => { clearTimeout(timer); resolve(value); },
+      (error: unknown) => { clearTimeout(timer); reject(error); },
+    );
+  });
+}
+
+function describeError(error: unknown): string {
+  if (error instanceof CodexAdapterError && isRecord(error.details?.error) && typeof error.details.error.message === "string") {
+    return `${error.message}: ${error.details.error.message}`;
+  }
+  return error instanceof Error ? error.message : String(error);
+}
+
+/** One `model/list` entry, reduced to what routing needs. Codex does not report prices or context sizes here. */
+function summarizeCodexModel(model: Readonly<Record<string, unknown>>): ProviderModel[] {
+  const id = typeof model.id === "string" ? model.id : typeof model.model === "string" ? model.model : undefined;
+  if (id === undefined) return [];
+  const efforts = Array.isArray(model.supportedReasoningEfforts)
+    ? model.supportedReasoningEfforts.flatMap((option: unknown) =>
+      (isRecord(option) && typeof option.reasoningEffort === "string" ? [option.reasoningEffort] : []))
+    : [];
+  return [{
+    id,
+    ...(typeof model.displayName === "string" ? { name: model.displayName } : {}),
+    ...(typeof model.description === "string" && model.description !== "" ? { description: model.description } : {}),
+    ...(model.isDefault === true ? { default: true } : {}),
+    ...(model.hidden === true ? { hidden: true } : {}),
+    ...(efforts.length === 0 ? {} : { reasoning_efforts: efforts }),
+    ...(typeof model.defaultReasoningEffort === "string" ? { default_effort: model.defaultReasoningEffort } : {}),
+  }];
+}
+
+/** `account/read`, without the email address or account/workspace identifiers. */
+function summarizeAccount(value: unknown): Readonly<Record<string, unknown>> {
+  const account = isRecord(value) && isRecord(value.account) ? value.account : undefined;
+  return {
+    mode: typeof account?.type === "string" ? account.type : "none",
+    ...(typeof account?.planType === "string" ? { plan: account.planType } : {}),
+  };
+}
+
+/**
+ * `account/rateLimits/read`: each metered bucket's windows (`usedPercent`, `resetsAt` epoch
+ * seconds) become `percent_used`/`remaining_percent`/ISO `resets_at`, matching OpenCode's shape.
+ */
+function summarizeRateLimits(value: unknown): Readonly<Record<string, unknown>> {
+  if (!isRecord(value)) return {};
+  const byId = isRecord(value.rateLimitsByLimitId) ? value.rateLimitsByLimitId : undefined;
+  const single = isRecord(value.rateLimits) ? value.rateLimits : undefined;
+  const buckets: [string, Readonly<Record<string, unknown>>][] = byId !== undefined
+    ? Object.entries(byId).flatMap(([id, snapshot]) => (isRecord(snapshot) ? [[id, snapshot]] : []))
+    : single === undefined ? [] : [[typeof single.limitId === "string" ? single.limitId : "codex", single]];
+  const plan = buckets.map(([, snapshot]) => snapshot.planType).find((planType) => typeof planType === "string");
+  const resetCredits = isRecord(value.rateLimitResetCredits) ? value.rateLimitResetCredits : undefined;
+  return {
+    ...(typeof plan === "string" ? { plan } : {}),
+    ...(typeof value.ordinaryUsageAllowed === "boolean" ? { usage_allowed: value.ordinaryUsageAllowed } : {}),
+    limits: Object.fromEntries(buckets.map(([id, snapshot]) => [id, summarizeRateLimitSnapshot(snapshot)])),
+    ...(typeof resetCredits?.availableCount === "number" ? { reset_credits_available: resetCredits.availableCount } : {}),
+  };
+}
+
+function summarizeRateLimitSnapshot(snapshot: Readonly<Record<string, unknown>>): Readonly<Record<string, unknown>> {
+  const credits = isRecord(snapshot.credits) ? snapshot.credits : undefined;
+  return {
+    ...(typeof snapshot.limitName === "string" ? { name: snapshot.limitName } : {}),
+    ...(isRecord(snapshot.primary) ? { primary: summarizeWindow(snapshot.primary) } : {}),
+    ...(isRecord(snapshot.secondary) ? { secondary: summarizeWindow(snapshot.secondary) } : {}),
+    limited: typeof snapshot.rateLimitReachedType === "string" || snapshot.spendControlReached === true,
+    ...(typeof snapshot.rateLimitReachedType === "string" ? { limit_reached: snapshot.rateLimitReachedType } : {}),
+    ...(credits === undefined
+      ? {}
+      : {
+        credits: {
+          ...(typeof credits.hasCredits === "boolean" ? { has_credits: credits.hasCredits } : {}),
+          ...(typeof credits.unlimited === "boolean" ? { unlimited: credits.unlimited } : {}),
+          ...(typeof credits.balance === "string" ? { balance: credits.balance } : {}),
+        },
+      }),
+  };
+}
+
+function summarizeWindow(window: Readonly<Record<string, unknown>>): Readonly<Record<string, unknown>> {
+  const percent = typeof window.usedPercent === "number" ? window.usedPercent : undefined;
+  return {
+    ...(percent === undefined ? {} : { percent_used: percent, remaining_percent: Math.max(0, 100 - percent) }),
+    ...(typeof window.windowDurationMins === "number" ? { window_minutes: window.windowDurationMins } : {}),
+    ...(typeof window.resetsAt === "number" ? { resets_at: new Date(window.resetsAt * 1000).toISOString() } : {}),
+  };
+}
+
+/** `account/usage/read`: lifetime summary plus the last week of daily token totals. */
+function summarizeAccountUsage(value: unknown): Readonly<Record<string, unknown>> {
+  if (!isRecord(value)) return {};
+  const summary = isRecord(value.summary) ? value.summary : {};
+  const daily = Array.isArray(value.dailyUsageBuckets)
+    ? value.dailyUsageBuckets.flatMap((bucket: unknown) =>
+      (isRecord(bucket) && typeof bucket.startDate === "string" && typeof bucket.tokens === "number"
+        ? [{ date: bucket.startDate, tokens: bucket.tokens }]
+        : []))
+    : [];
+  return {
+    ...(typeof summary.lifetimeTokens === "number" ? { lifetime_tokens: summary.lifetimeTokens } : {}),
+    ...(typeof summary.peakDailyTokens === "number" ? { peak_daily_tokens: summary.peakDailyTokens } : {}),
+    ...(daily.length === 0 ? {} : { recent_daily_tokens: daily.slice(-DAILY_USAGE_DAYS) }),
+  };
 }
 
 function boundedAppend(current: string, chunk: string, limit: number): string {

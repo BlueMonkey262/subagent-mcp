@@ -1,6 +1,6 @@
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
-import { readdirSync, readFileSync, statSync } from "node:fs";
+import { readdirSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { createConnection, createServer, type Server, type Socket } from "node:net";
 import { tmpdir } from "node:os";
@@ -15,8 +15,11 @@ import { CursorAdapter } from "./adapters/cursor/adapter.js";
 import { OpenCodeAdapter } from "./adapters/opencode/adapter.js";
 import { LiveConfig } from "./config/live.js";
 import { isBackend } from "./core/types.js";
+import type { EventReadOptions } from "./events/buffer.js";
+import type { NormalizedEventType } from "./events/schema.js";
 import type { ListAgentsInput, AgentSnapshot, SendMessageInput, SpawnAgentInput, Supervisor } from "./supervisor.js";
-import { Supervisor as SupervisorClass, defaultProjectRouting } from "./supervisor.js";
+import { Supervisor as SupervisorClass } from "./supervisor.js";
+import { ensureProjectMemoryIgnored } from "./storage/routing.js";
 import { UsageLedger } from "./usage.js";
 
 export const HOST_PROTOCOL = 2;
@@ -117,7 +120,9 @@ export interface HostPaths {
 
 export function hostPaths(cwd: string): HostPaths {
   const directory = join(resolve(cwd), ".subagents", "memory");
-  const hash = createHash("sha256").update(resolve(cwd)).digest("hex").slice(0, 16);
+  // Hash the canonical path: on macOS /tmp and /var are symlinks into /private, and a spawned
+  // host's process.cwd() reports the resolved path, so the client must hash the same string.
+  const hash = createHash("sha256").update(canonicalPath(cwd)).digest("hex").slice(0, 16);
   return {
     socketPath: join(tmpdir(), `subagent-mcp-${hash}.sock`),
     directory,
@@ -127,6 +132,14 @@ export function hostPaths(cwd: string): HostPaths {
     lockPath: join(directory, "host.lock"),
     logPath: join(directory, "host.log"),
   };
+}
+
+function canonicalPath(path: string): string {
+  try {
+    return realpathSync(path);
+  } catch {
+    return resolve(path);
+  }
 }
 
 export interface RunningHost {
@@ -255,6 +268,8 @@ export class HostSession {
     try {
       this.#attach(await connectHost(this.options));
     } catch (error) {
+      // Startup failures used to reach stderr (visible in Claude Code's MCP log); keep that.
+      process.stderr.write(`subagent-mcp: ${error instanceof Error ? error.message : String(error)}\n`);
       this.#fail(error);
     }
   }
@@ -377,9 +392,10 @@ export async function runHost(): Promise<void> {
 
   const live = new LiveConfig({ agentsDirectory, modelsFile });
   await live.reload();
+  // Sessions, the lock and the usage ledger live in .subagents/memory; keep it out of the user's git.
+  await ensureProjectMemoryIgnored(cwd).catch(() => undefined);
   const usage = new UsageLedger(paths.usagePath);
   await usage.load();
-  const routing = await defaultProjectRouting(cwd).catch(() => undefined);
   const claude = new ClaudeAdapter();
   const codex = new CodexAdapter();
   const opencode = new OpenCodeAdapter();
@@ -392,7 +408,6 @@ export async function runHost(): Promise<void> {
     cwd,
     usage,
     maxConcurrent: live.maxConcurrent(),
-    ...(routing === undefined ? {} : { routing }),
     onDetachedSettled: (result) => endpoint?.notify({ event: "detached", data: result }),
   });
   live.watch(() => supervisor.setMaxConcurrent(live.maxConcurrent()));
@@ -621,7 +636,8 @@ async function dispatch(supervisor: Supervisor, method: string, params: unknown,
     case "list_agents":
       return supervisor.sessionView(input as ListAgentsInput);
     case "list_agent_configs": return supervisor.listAgentConfigs();
-    case "wait_for_agents": return supervisor.waitForAgents(input.agents as string[], input.mode as 'all' | 'any' | undefined, input.timeout_seconds as number | undefined);
+    case "wait_for_agents": return supervisor.waitForAgents(input.agents as string[], input.mode as 'all' | 'any' | undefined,
+      input.timeout_seconds as number | undefined, input.since as string | undefined, input.max_result_chars as number | undefined);
     case "get_agent_result": return supervisor.getAgentResult(requiredString(input, 'agent'), input.turn as number | undefined, input.offset as number | undefined, input.limit as number | undefined);
     case "cleanup_worktree": return supervisor.cleanupWorktree(requiredString(input, 'agent'));
     case "stop_agents": return supervisor.stopAgents(input.agents as string[] | undefined, input.group_id as string | undefined);
@@ -638,28 +654,20 @@ async function dispatch(supervisor: Supervisor, method: string, params: unknown,
     case "get_agent_events": {
       const agent = requiredString(input, "agent");
       const since = typeof input["since"] === "number" ? input["since"] : 0;
+      if (input["summary"] === true) return supervisor.summarizeAgentEvents(agent, 5, since);
+      const types = Array.isArray(input["types"]) ? (input["types"] as NormalizedEventType[]) : undefined;
+      const coalesce = input["coalesce"] === true;
+      const options: EventReadOptions | undefined =
+        types !== undefined || coalesce ? { ...(types !== undefined ? { types } : {}), ...(coalesce ? { coalesce } : {}) } : undefined;
       return typeof input["limit"] === "number"
-        ? supervisor.getAgentEvents(agent, since, input["limit"])
-        : supervisor.getAgentEvents(agent, since);
+        ? supervisor.getAgentEvents(agent, since, input["limit"], options)
+        : supervisor.getAgentEvents(agent, since, undefined, options);
     }
     case "list_models":
-      return supervisor.listModels(isBackend(input["backend"]) ? input["backend"] : undefined);
-    case "record_outcome": {
-      const agent = requiredString(input, "agent");
-      const verdict = requiredVerdict(input["verdict"]);
-      const score = input["score"];
-      const notes = input["notes"];
-      if (typeof score === "number" && typeof notes === "string") await supervisor.recordOutcome(agent, verdict, score, notes);
-      else if (typeof score === "number") await supervisor.recordOutcome(agent, verdict, score);
-      else if (typeof notes === "string") await supervisor.recordOutcome(agent, verdict, undefined, notes);
-      else await supervisor.recordOutcome(agent, verdict);
-      return { recorded: true };
-    }
-    case "add_note": {
-      const scope = input["scope"];
-      await supervisor.addNote(requiredString(input, "text"), scope === "user" ? "user" : "project");
-      return { recorded: true };
-    }
+      return supervisor.listModels(
+        isBackend(input["backend"]) ? input["backend"] : undefined,
+        ...(typeof input["live"] === "boolean" ? [input["live"]] : []),
+      );
     case "shutdown": {
       const { active, waiting } = supervisor.concurrency();
       if (active > 0 || waiting > 0) {
@@ -908,11 +916,6 @@ function requiredString(record: Readonly<Record<string, unknown>>, key: string):
 function requiredDecision(value: unknown): "allow" | "allow_for_session" | "deny" {
   if (value === "allow" || value === "allow_for_session" || value === "deny") return value;
   throw new Error("decision must be allow, allow_for_session, or deny");
-}
-
-function requiredVerdict(value: unknown): "success" | "partial" | "failure" {
-  if (value === "success" || value === "partial" || value === "failure") return value;
-  throw new Error("verdict must be success, partial, or failure");
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
