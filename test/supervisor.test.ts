@@ -107,7 +107,7 @@ test("listAgents order and pagination remain stable when an agent is updated", a
   const third = String((await supervisor.spawnAgent({ agent: "general", prompt: "third", description: "third", run_in_background: true }))["agent_id"]);
   const queued = await supervisor.spawnAgent({ agent: "general", prompt: "queued", description: "queued", depends_on: [third] });
   const queuedId = String(queued["task_id"]);
-  const expected = [first, second, third, queuedId];
+  const expected = [queuedId, third, second, first]; // newest first
 
   await waitUntil(() => supervisor.listAgents().length === expected.length);
   assert.deepEqual(supervisor.listAgents().map((agent) => agent["agent_id"]), expected);
@@ -116,14 +116,15 @@ test("listAgents order and pagination remain stable when an agent is updated", a
   assert.equal(pending?.["updated_at"], pending?.["created_at"]);
 
   const firstPage = supervisor.sessionView({ limit: 1 });
-  assert.equal((firstPage.agents as Record<string, unknown>[])[0]?.["agent_id"], first);
-  const previousUpdatedAt = supervisor.listAgents()[0]?.["updated_at"];
+  assert.equal((firstPage.agents as Record<string, unknown>[])[0]?.["agent_id"], queuedId);
+  const updatedAtOf = (id: string) => supervisor.listAgents().find((agent) => agent["agent_id"] === id)?.["updated_at"];
+  const previousUpdatedAt = updatedAtOf(first);
   await new Promise((resolve) => setTimeout(resolve, 10));
   adapter.emit(first, "tool.start", { toolCallId: "busy", toolName: "Bash", input: { command: "npm test" } });
-  await waitUntil(() => supervisor.listAgents()[0]?.["updated_at"] !== previousUpdatedAt);
+  await waitUntil(() => updatedAtOf(first) !== previousUpdatedAt);
   assert.deepEqual(supervisor.listAgents().map((agent) => agent["agent_id"]), expected);
 
-  const paged = [first];
+  const paged = [queuedId];
   let cursor = firstPage.next_cursor as string | null;
   while (cursor) {
     const page = supervisor.sessionView({ limit: 1, cursor });

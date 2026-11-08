@@ -237,8 +237,9 @@ export class Supervisor {
       catch { throw new SupervisorError('Invalid cursor'); }
       if (!after || typeof after.created_at !== 'string' || typeof after.agent_id !== 'string') throw new SupervisorError('Invalid cursor');
     }
-    const sorted = records.sort((a,b) => String(a.created_at).localeCompare(String(b.created_at)) || String(a.agent_id).localeCompare(String(b.agent_id)));
-    const filtered = after ? sorted.filter(r => String(r.created_at) > after!.created_at || (r.created_at === after!.created_at && String(r.agent_id) > after!.agent_id)) : sorted;
+    // newest first on an immutable key (created_at never changes, unlike updated_at), so pages never skip or repeat
+    const sorted = records.sort((a,b) => String(b.created_at).localeCompare(String(a.created_at)) || String(b.agent_id).localeCompare(String(a.agent_id)));
+    const filtered = after ? sorted.filter(r => String(r.created_at) < after!.created_at || (r.created_at === after!.created_at && String(r.agent_id) < after!.agent_id)) : sorted;
     const limit = Math.min(100, Math.max(1, input.limit ?? 25));
     const page = filtered.slice(0, limit);
     const last = page.at(-1);
@@ -253,7 +254,7 @@ export class Supervisor {
         agent_id: task.id, state: task.state, backend: task.input.backend, created_at: task.created_at,
         updated_at: task.created_at, group_id: task.input.group_id,
       })))
-      .sort((a,b) => String(a.created_at).localeCompare(String(b.created_at)) || String(a.agent_id).localeCompare(String(b.agent_id)));
+      .sort((a,b) => String(b.created_at).localeCompare(String(a.created_at)) || String(b.agent_id).localeCompare(String(a.agent_id)));
   }
 
   listAgentConfigs() {
