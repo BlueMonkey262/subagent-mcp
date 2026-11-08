@@ -9,6 +9,7 @@ import { AdapterRegistry } from "../src/adapters/adapter.js";
 import { FakeAdapter } from "../src/adapters/fake.js";
 import { AGENT_NAMES } from "../src/agent-names.js";
 import { ConfigRegistry, defaultServerLimits } from "../src/config/registry.js";
+import { withEndpointModels } from "../src/config/endpoints.js";
 import type { AgentConfig, ModelRoster } from "../src/config/schema.js";
 import { EventBuffer } from "../src/events/buffer.js";
 import type { Backend } from "../src/core/types.js";
@@ -1066,6 +1067,28 @@ test("list_models adds live backend info (default on for a named backend) and fl
   assert.ok(failed["models"], "a live failure keeps the local roster");
 });
 
+test("list_models marks blocked models in the live backend catalog", async () => {
+  const adapter = new FakeAdapter("codex");
+  Object.assign(adapter, {
+    providerInfo: async () => ({ models: [{ id: "gpt-5.6-sol" }, { id: "gpt-5.6-luna" }] }),
+  });
+  const limits = {
+    ...defaultServerLimits(),
+    modelPolicy: { blockClaudeModels: false, disabledBackends: [] as Backend[], blockModels: ["codex:*sol"] },
+  };
+  const supervisor = new Supervisor({
+    registry: new ConfigRegistry([codexAgentConfig()], { claude: [], codex: [{ name: "fake-model" }], opencode: [], antigravity: [], cursor: [] }, limits),
+    adapters: new AdapterRegistry([adapter]),
+    cwd: "/work",
+  });
+
+  const live = (await supervisor.listModels("codex"))["live"] as { models: { id: string; blocked?: boolean; blocked_by?: string }[] };
+  assert.deepEqual(live.models, [
+    { id: "gpt-5.6-sol", blocked: true, blocked_by: "blockModels: codex:*sol" },
+    { id: "gpt-5.6-luna" },
+  ]);
+});
+
 test("list_models adds only an available cached update", async () => {
   const running = currentVersion(); // the notice only counts for the version that is running
   const directory = await mkdtemp(join(tmpdir(), "subagent-model-update-"));
@@ -1201,6 +1224,55 @@ test("blockClaudeModels refuses Claude spawns and resumes, allows endpoint model
   assert.equal(configs.find((config) => config.name === "claude-general")?.blocked, undefined, "an unpinned config is judged per spawn");
   assert.deepEqual(await blocked.listModels("codex"), { ...(await blocked.listModels("codex", false)), live: { disabled: true } },
     "a disabled backend's live API is not queried");
+});
+
+test("endpoint policy checks aliases and structured upstream model ids", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "subagent-endpoint-policy-"));
+  const endpoints = join(directory, "endpoints.json");
+  await writeFile(endpoints, JSON.stringify({ endpoints: {
+    openrouter: { models: [{ alias: "fast", id: "anthropic/claude-sonnet-4" }] },
+    proxy: { models: [{ alias: "claude-helper", id: "meta/llama-4" }] },
+    claude: { models: [{ alias: "neutral", id: "meta/llama-4" }] },
+  } }));
+  try {
+    const roster = await withEndpointModels({ claude: [], codex: [], opencode: [], antigravity: [], cursor: [] }, endpoints);
+    assert.equal(roster.codex.find((entry) => entry.name === "openrouter/fast")?.upstreamModel, "anthropic/claude-sonnet-4");
+    const { model: _pinned, ...unpinned } = codexAgentConfig();
+    const limits = {
+      ...defaultServerLimits(),
+      modelPolicy: { blockClaudeModels: true, disabledBackends: [] as Backend[], blockModels: [] as string[] },
+    };
+    const adapter = new FakeAdapter("codex");
+    const supervisor = new Supervisor({
+      registry: new ConfigRegistry([unpinned], roster, limits),
+      adapters: new AdapterRegistry([adapter]),
+      cwd: "/work",
+    });
+
+    await assert.rejects(
+      supervisor.spawnAgent({ agent: "general", model: "openrouter/fast", prompt: "x", description: "upstream Claude" }),
+      (error: Error & { code?: string }) => error.code === "CLAUDE_MODEL_BLOCKED",
+    );
+    assert.ok((await supervisor.spawnAgent({ agent: "general", model: "proxy/claude-helper", prompt: "x", description: "alias only", run_in_background: true }))["agent_id"]);
+    assert.ok((await supervisor.spawnAgent({ agent: "general", model: "claude/neutral", prompt: "x", description: "endpoint name only", run_in_background: true }))["agent_id"]);
+
+    const listed = (await supervisor.listModels("codex", false))["models"] as { name: string; blocked?: boolean }[];
+    assert.equal(listed.find((entry) => entry.name === "openrouter/fast")?.blocked, true);
+    assert.equal(listed.find((entry) => entry.name === "proxy/claude-helper")?.blocked, undefined);
+    assert.equal(listed.find((entry) => entry.name === "claude/neutral")?.blocked, undefined);
+
+    limits.modelPolicy = { blockClaudeModels: false, disabledBackends: [], blockModels: ["*claude*"] };
+    await assert.rejects(
+      supervisor.spawnAgent({ agent: "general", model: "openrouter/fast", prompt: "x", description: "upstream pattern" }),
+      (error: Error & { code?: string }) => error.code === "MODEL_BLOCKED",
+    );
+    await assert.rejects(
+      supervisor.spawnAgent({ agent: "general", model: "proxy/claude-helper", prompt: "x", description: "alias pattern" }),
+      (error: Error & { code?: string }) => error.code === "MODEL_BLOCKED",
+    );
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
 });
 
 test("the block is re-checked when a queued message is delivered and when a spawn gets its slot", async () => {

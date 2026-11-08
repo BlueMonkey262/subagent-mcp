@@ -57,7 +57,8 @@ export function missingConfigMessage(input: {
 
 /**
  * Config viewed by the supervisor. Reloads when the roster or agent files change so a roster
- * edit does not require an MCP reconnect. A failed reload keeps the last good registry.
+ * edit does not require an MCP reconnect. A failed reload keeps the last good registry for
+ * listing, while the supervisor refuses execution until a valid reload clears the warning.
  */
 export class LiveConfig implements AgentConfigSource {
   #registry: ConfigRegistry | undefined;

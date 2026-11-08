@@ -45,6 +45,8 @@ export interface AgentConfig {
 export interface ModelEntry {
   /** Exact value accepted by a spawn call and passed to the backend. */
   readonly name: string;
+  /** Actual model id behind an endpoint alias; absent for ordinary roster entries. */
+  readonly upstreamModel?: string;
   /** Provider/backend version identifier for non-stationary routing records. */
   readonly version?: string;
   readonly description?: string;

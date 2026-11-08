@@ -56,6 +56,17 @@ test("blockReason: disabled backends, then the Claude block, then model patterns
   assert.equal(blockReason(OPEN_POLICY, "claude", "claude-sonnet-5"), undefined);
 });
 
+test("blockReason handles pathological wildcard patterns without regex backtracking", () => {
+  const policy = {
+    blockClaudeModels: false,
+    disabledBackends: [],
+    blockModels: ["*a*a*a*a*a*a*b"],
+  };
+  const started = performance.now();
+  assert.equal(blockReason(policy, "codex", "a".repeat(64)), undefined);
+  assert.ok(performance.now() - started < 100, "pathological wildcard match should finish promptly");
+});
+
 test("refusals carry a code per kind and tell the caller what to do instead", () => {
   const backend = new ModelBlockedError({ kind: "backend" }, "cursor", "auto");
   assert.equal(backend.code, "BACKEND_DISABLED");

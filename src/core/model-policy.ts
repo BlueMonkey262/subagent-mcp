@@ -29,44 +29,86 @@ export type BlockReason =
  * - "claude" in the model name, i.e. after the first `/` when there is one (Cursor `claude-opus-5-5-high`,
  *   OpenCode `opencode/claude-sonnet-5-5`). The part before the first `/` is a provider or endpoint
  *   name, so an endpoint called `claude-proxy` serving another vendor's model is not caught;
- * - any bare id on the Claude CLI (`sonnet`, `opus`), which sends it to Anthropic. Its
- *   `<endpoint>/<alias>` models go elsewhere through the local proxy, so those stay allowed.
+ * - any bare id on the Claude CLI (`sonnet`, `opus`), which sends it to Anthropic. For an endpoint
+ *   entry, callers pass its upstream id and set `endpointBacked`, so a bare non-Claude upstream
+ *   stays allowed while an Anthropic / Claude upstream is caught.
  */
-export function isClaudeModel(backend: Backend, model: string): boolean {
+export function isClaudeModel(backend: Backend, model: string, endpointBacked = false): boolean {
   const id = model.trim().toLowerCase();
   if (id.split(/[/:.]/).includes("anthropic")) return true;
   const slash = id.indexOf("/");
   if ((slash < 0 ? id : id.slice(slash + 1)).includes("claude")) return true;
-  return backend === "claude" && slash < 0;
+  return !endpointBacked && backend === "claude" && slash < 0;
 }
 
 interface CompiledPattern {
   readonly backend?: Backend;
-  readonly regex: RegExp;
+  readonly glob: string;
 }
+
+const compiledPatterns = new Map<string, CompiledPattern>();
 
 /**
  * `codex:gpt-5*` applies only to Codex; anything else applies to every backend. The prefix must
  * name a backend, so model ids that contain a colon (`ollama-cloud/gpt-oss:20b`) stay plain patterns.
  */
 function compilePattern(raw: string): CompiledPattern {
+  const cached = compiledPatterns.get(raw);
+  if (cached !== undefined) return cached;
   const colon = raw.indexOf(":");
   const prefix = colon > 0 ? raw.slice(0, colon).trim().toLowerCase() : "";
   const scoped = isBackend(prefix);
-  const glob = (scoped ? raw.slice(colon + 1) : raw).trim();
-  const source = glob.split("").map((char) =>
-    char === "*" ? ".*" : char === "?" ? "." : char.replace(/[.+^${}()|[\]\\/]/g, "\\$&")).join("");
-  return { ...(scoped ? { backend: prefix } : {}), regex: new RegExp(`^${source}$`, "i") };
+  const compiled = {
+    ...(scoped ? { backend: prefix } : {}),
+    glob: (scoped ? raw.slice(colon + 1) : raw).trim().toLowerCase(),
+  };
+  compiledPatterns.set(raw, compiled);
+  return compiled;
+}
+
+/** Iterative wildcard matching, backtracking only to the most recent `*`. */
+function matchesGlob(value: string, glob: string): boolean {
+  const input = value.toLowerCase();
+  let inputIndex = 0;
+  let globIndex = 0;
+  let starIndex = -1;
+  let starInputIndex = 0;
+  while (inputIndex < input.length) {
+    if (globIndex < glob.length && (glob[globIndex] === "?" || glob[globIndex] === input[inputIndex])) {
+      inputIndex += 1;
+      globIndex += 1;
+    } else if (globIndex < glob.length && glob[globIndex] === "*") {
+      starIndex = globIndex;
+      starInputIndex = inputIndex;
+      globIndex += 1;
+    } else if (starIndex >= 0) {
+      globIndex = starIndex + 1;
+      starInputIndex += 1;
+      inputIndex = starInputIndex;
+    } else {
+      return false;
+    }
+  }
+  while (globIndex < glob.length && glob[globIndex] === "*") globIndex += 1;
+  return globIndex === glob.length;
 }
 
 /** Why `policy` refuses `model` on `backend`, or undefined when it may run. */
-export function blockReason(policy: ModelPolicy, backend: Backend, model: string): BlockReason | undefined {
+export function blockReason(
+  policy: ModelPolicy,
+  backend: Backend,
+  model: string,
+  upstreamModel?: string,
+): BlockReason | undefined {
   if (policy.disabledBackends.includes(backend)) return { kind: "backend" };
-  if (policy.blockClaudeModels && isClaudeModel(backend, model)) return { kind: "claude" };
-  const id = model.trim();
+  if (policy.blockClaudeModels && isClaudeModel(backend, upstreamModel ?? model, upstreamModel !== undefined)) {
+    return { kind: "claude" };
+  }
+  const ids = upstreamModel === undefined ? [model.trim()] : [model.trim(), upstreamModel.trim()];
   for (const pattern of policy.blockModels) {
     const compiled = compilePattern(pattern);
-    if ((compiled.backend === undefined || compiled.backend === backend) && compiled.regex.test(id)) {
+    if ((compiled.backend === undefined || compiled.backend === backend)
+        && ids.some((id) => matchesGlob(id, compiled.glob))) {
       return { kind: "pattern", pattern };
     }
   }
