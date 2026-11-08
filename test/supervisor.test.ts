@@ -936,3 +936,18 @@ test("waitForAgents 'all' with since needs one fresh settle but counts earlier o
   assert.equal(result.timed_out, false);
   assert.deepEqual(result.newly_settled, [second]);
 });
+
+test("updated_since compares instants, so a whole-second timestamp includes later milliseconds in the same second", async () => {
+  const adapter = new FakeAdapter("codex");
+  const supervisor = new Supervisor({
+    registry: testRegistry([codexAgentConfig()]),
+    adapters: new AdapterRegistry([adapter]),
+    cwd: "/work",
+  });
+  adapter.queueScript([]);
+  const id = String((await supervisor.spawnAgent({ agent: "general", prompt: "x", description: "x", run_in_background: true }))["agent_id"]);
+  const updated = String(supervisor.listAgents().find((a) => a["agent_id"] === id)?.["updated_at"]);
+  const wholeSecond = updated.replace(/\.\d+Z$/, "Z"); // same second, earlier than `updated` unless ms are 000
+  const page = supervisor.sessionView({ updated_since: wholeSecond });
+  assert.ok((page.agents as Record<string, unknown>[]).some((a) => a["agent_id"] === id));
+});

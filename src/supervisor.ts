@@ -230,7 +230,7 @@ export class Supervisor {
     const records = this.listAgents().filter(r =>
       (!input.states || input.states.includes(r.state as string)) &&
       (!input.backend || r.backend === input.backend) &&
-      (!input.updated_since || String(r.updated_at) >= input.updated_since));
+      (!input.updated_since || Date.parse(String(r.updated_at)) >= Date.parse(input.updated_since)));
     let after: { created_at: string; agent_id: string } | undefined;
     if (input.cursor) {
       try { after = JSON.parse(Buffer.from(input.cursor, 'base64url').toString('utf8')); }

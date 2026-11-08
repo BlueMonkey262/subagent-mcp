@@ -131,7 +131,8 @@ async function main(): Promise<void> {
       description:
         "List agents tracked by this host, including ones restored after a reconnect, with their lifecycle state " +
         "and human-memorable name. Refer to agents by name in later tool calls. Also reports timeout_seconds, the " +
-        "concurrency cap, how many agents are active, and how many spawns are waiting.",
+        "concurrency cap, how many agents are active, and how many spawns are waiting. Newest first by creation " +
+        "time; order and cursors are stable while agents run, so pages never skip or repeat an agent.",
       inputSchema: {
         states: z.array(z.enum(['starting','running','needs_approval','completed','interrupted','failed','queued','blocked'])).optional(),
         backend: z.enum(BACKENDS).optional(), updated_since: z.iso.datetime().optional(),
