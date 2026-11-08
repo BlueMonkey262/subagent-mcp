@@ -15,6 +15,7 @@ Shows the active subagent-mcp agents in the status line under the prompt, one co
   single `in`, as do turns recorded before the split existed. Claude, Codex and OpenCode 2.x update
   mid-turn; Cursor and Antigravity update when a turn ends.
 - Colors: Codex purple, OpenCode cyan, Claude orange; approvals in blue.
+- If `<project>/.subagents/memory/update.json` reports an available release, one dim update row is printed after the agent rows.
 - Dormant when no subagent-mcp server answers `list_agents` three polls in a row; it then probes once a minute.
 
 The `subagent-mcp` launcher loads this mod automatically (`CLAUDE_CODE_PLUGIN_DIRS`). The status line
