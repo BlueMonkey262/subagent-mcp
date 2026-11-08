@@ -75,7 +75,13 @@ for d in here:
     except Exception:
         pass
 configs = {i: x.get("agentConfig", "") for i, x in saved.items()}
-agents = [a for a in agents if saved.get(a["agent_id"], {}).get("cwd") in here]
+def in_project(agent_id):
+    """An agent belongs here if it runs in this project, or in a managed worktree made from it."""
+    rec = saved.get(agent_id, {})
+    repo = ((rec.get("meta") or {}).get("worktree") or {}).get("repository")
+    return rec.get("cwd") in here or (repo is not None and repo in here)
+
+agents = [a for a in agents if in_project(a["agent_id"])]
 
 # the server assigns each agent its name; hash only as a fallback for older servers
 fallback = assign_names([a for a in agents if not a.get("name")])
