@@ -46,6 +46,7 @@ import { scanChildOutput } from "./safety/output.js";
 import { describeToolInput } from "./tool-describe.js";
 import { RoutingStore, projectRoutingPaths, ensureProjectMemoryIgnored, type MemoryScope } from "./storage/routing.js";
 import { remainingAllowances, UsageLedger } from "./usage.js";
+import { MAX_CONTENT_CHARS, truncateText } from "./truncate.js";
 
 export type ToolAgentState = "starting" | "running" | "needs_approval" | "completed" | "interrupted" | "failed";
 
@@ -120,6 +121,7 @@ export interface SpawnAgentInput {
   readonly run_in_background?: boolean | undefined;
   readonly max_turns?: number | undefined;
   readonly timeout?: number | undefined;
+  readonly max_result_chars?: number | undefined;
 }
 
 export interface SendMessageInput {
@@ -134,6 +136,7 @@ export interface SendMessageInput {
    * Codex replays the whole thread with no prompt cache.
    */
   readonly allow_expensive_resume?: boolean | undefined;
+  readonly max_result_chars?: number | undefined;
 }
 
 export interface SupervisorOptions {
@@ -263,7 +266,7 @@ export class Supervisor {
       config_warning: this.#registry.configWarning() };
   }
 
-  async waitForAgents(agents: readonly string[], mode: 'any' | 'all' = 'all', timeout = 60, since?: string) {
+  async waitForAgents(agents: readonly string[], mode: 'any' | 'all' = 'all', timeout = 60, since?: string, maxResultChars?: number) {
     if (!agents.length) throw new SupervisorError('At least one agent is required');
     const statuses = () => agents.map(identifier => {
       const task = this.#pending.get(identifier);
@@ -294,7 +297,7 @@ export class Supervisor {
     });
     await this.#writes;
     return { timed_out, newly_settled: newlySettled().map(status => status.identifier),
-      agents: agents.map(agent => this.#pending.has(agent) && !this.#pending.get(agent)!.result?.agent_id ? this.#pending.get(agent) : this.#result(this.#requireRecord(agent))) };
+      agents: agents.map(agent => this.#pending.has(agent) && !this.#pending.get(agent)!.result?.agent_id ? this.#pending.get(agent) : this.#cappedResult(this.#requireRecord(agent), maxResultChars)) };
   }
 
   getAgentResult(agent: string, turn?: number, offset = 0, limit = 25): Record<string, unknown> | PendingTask {
@@ -444,7 +447,7 @@ export class Supervisor {
       if (record.state === "starting") record.state = "running";
       void this.#writeSnapshot().catch(error => { this.#storageError = String(error); });
       if (!record.background) await this.#waitForNotableState(record);
-      return this.#result(record);
+      return this.#cappedResult(record, input.max_result_chars);
     } catch (error) {
       release();
       if (worktree && !launched) {
@@ -478,7 +481,7 @@ export class Supervisor {
       void this.#writeSnapshot().catch(error => { this.#storageError = String(error); });
       if (input.run_in_background === true) record.detached = true;
       else await this.#waitForNotableState(record);
-      return this.#result(record);
+      return this.#cappedResult(record, input.max_result_chars);
     }
     if (record.state === "needs_approval") {
       throw new SupervisorError(`Agent ${record.id} has a pending approval; resolve it before sending a new message`, {
@@ -510,7 +513,7 @@ export class Supervisor {
       throw error;
     }
     if (input.run_in_background !== true) await this.#waitForNotableState(record);
-    return this.#result(record);
+    return this.#cappedResult(record, input.max_result_chars);
   }
 
   /** Shared by sendMessage() and the queued-message delivery inside #pump(). */
@@ -861,6 +864,19 @@ export class Supervisor {
       cumulative_usage: this.#totalUsage(record),
       ...(record.timedOut ? { timed_out: true } : {}),
       ...(record.lastError === undefined ? {} : { error: record.lastError }),
+    };
+  }
+
+  #cappedResult(record: AgentRecord, maxResultChars?: number): Readonly<Record<string, unknown>> {
+    const result = this.#result(record);
+    if (typeof result.result !== "string") return result;
+    const truncated = truncateText(result.result, maxResultChars ?? MAX_CONTENT_CHARS);
+    if (truncated.truncatedChars === 0) return result;
+    return {
+      ...result,
+      result: `${truncated.text}\n[truncated ${truncated.truncatedChars} characters]`,
+      result_truncated: true,
+      result_hint: "Use get_agent_result to retrieve the full result.",
     };
   }
 

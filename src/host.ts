@@ -414,7 +414,7 @@ async function dispatch(supervisor: Supervisor, method: string, params: unknown)
       return supervisor.sessionView(input as ListAgentsInput);
     case "list_agent_configs": return supervisor.listAgentConfigs();
     case "wait_for_agents": return supervisor.waitForAgents(input.agents as string[], input.mode as 'all' | 'any' | undefined,
-      input.timeout_seconds as number | undefined, input.since as string | undefined);
+      input.timeout_seconds as number | undefined, input.since as string | undefined, input.max_result_chars as number | undefined);
     case "get_agent_result": return supervisor.getAgentResult(requiredString(input, 'agent'), input.turn as number | undefined, input.offset as number | undefined, input.limit as number | undefined);
     case "cleanup_worktree": return supervisor.cleanupWorktree(requiredString(input, 'agent'));
     case "stop_agents": return supervisor.stopAgents(input.agents as string[] | undefined, input.group_id as string | undefined);
