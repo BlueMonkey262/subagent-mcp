@@ -11,7 +11,7 @@ import { FakeAdapter } from "../src/adapters/fake.js";
 import { LiveConfig } from "../src/config/live.js";
 import { ConfigRegistry } from "../src/config/registry.js";
 import type { AgentConfig, ModelRoster } from "../src/config/schema.js";
-import { connectHost, hostPaths, HostClient, serveHost } from "../src/host.js";
+import { buildId, connectHost, HOST_PROTOCOL, hostDisposition, hostPaths, HostClient, restartHost, serveHost } from "../src/host.js";
 import { Supervisor } from "../src/supervisor.js";
 
 const permission = { allow: [], deny: [], default: "escalate" as const };
@@ -301,4 +301,67 @@ test("connectHost refuses to duplicate a live recorded pid with a missing socket
   );
   await assert.rejects(readFile(join(paths.lockPath, "pid"), "utf8"));
   assert.equal(JSON.parse(await readFile(paths.pidPath, "utf8")).pid, process.pid);
+});
+
+test("hostDisposition replaces idle hosts on another build or protocol and never touches busy ones", () => {
+  const build = "new";
+  assert.equal(hostDisposition({ protocol: HOST_PROTOCOL, build }, build), "keep");
+  assert.equal(hostDisposition({ protocol: HOST_PROTOCOL, build, active: 2 }, build), "keep");
+  assert.equal(hostDisposition({ protocol: HOST_PROTOCOL, build: "old" }, build), "replace");
+  assert.equal(hostDisposition({ protocol: HOST_PROTOCOL }, build), "replace", "a host from before builds were reported is stale");
+  assert.equal(hostDisposition({ protocol: HOST_PROTOCOL, build: "old", active: 1 }, build), "stale");
+  assert.equal(hostDisposition({ protocol: HOST_PROTOCOL, build: "old", waiting: 1 }, build), "stale");
+  assert.equal(hostDisposition({ protocol: HOST_PROTOCOL - 1 }, build), "replace");
+  assert.equal(hostDisposition({ protocol: HOST_PROTOCOL - 1, active: 1 }, build), "refuse");
+  assert.match(buildId(), /^[0-9a-f]{16}$|^unknown$/);
+});
+
+test("reconnecting replaces an idle host running another build", { timeout: 20_000 }, async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "subagent-host-rebuild-"));
+  const options = daemonOptions(cwd);
+  await mkdir(options.agentsDirectory, { recursive: true });
+  const saved = process.env.SUBAGENT_MCP_BUILD_ID;
+  let first: HostClient | undefined;
+  let second: HostClient | undefined;
+  try {
+    process.env.SUBAGENT_MCP_BUILD_ID = "build-a";
+    first = await connectHost(options);
+    const before = await first.call("hello") as { pid: number; build: string };
+    assert.equal(before.build, "build-a");
+    first.close();
+    first = undefined;
+
+    process.env.SUBAGENT_MCP_BUILD_ID = "build-b";
+    second = await connectHost(options);
+    const after = await second.call("hello") as { pid: number; build: string };
+    assert.equal(after.build, "build-b");
+    assert.notEqual(after.pid, before.pid);
+    assert.equal(second.hostBuild, "build-b");
+    await waitForPidExit(before.pid);
+  } finally {
+    if (saved === undefined) delete process.env.SUBAGENT_MCP_BUILD_ID;
+    else process.env.SUBAGENT_MCP_BUILD_ID = saved;
+    first?.close();
+    second?.close();
+    await stopDaemon(cwd);
+  }
+});
+
+test("restartHost refuses while an agent is running and leaves the host up", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "subagent-host-busy-"));
+  const adapter = new FakeAdapter("codex"); // no script: the turn stays running
+  const supervisor = new Supervisor({ registry: registry(), adapters: new AdapterRegistry([adapter]), cwd });
+  const paths = hostPaths(cwd);
+  const endpoint = await serveHost({ socketPath: paths.socketPath, supervisor });
+  const client = await HostClient.connect(paths.socketPath);
+  try {
+    await client.call("spawn_agent", { agent: "general", prompt: "work", description: "busy", run_in_background: true });
+    await assert.rejects(restartHost(client, daemonOptions(cwd)), /running agents/);
+    const hello = await client.call("hello") as { active: number };
+    assert.equal(hello.active, 1, "the busy host is still serving");
+  } finally {
+    client.close();
+    await endpoint.close();
+    await rm(paths.socketPath, { force: true });
+  }
 });

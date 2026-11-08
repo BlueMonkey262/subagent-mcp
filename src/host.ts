@@ -1,9 +1,11 @@
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
+import { readdirSync, readFileSync } from "node:fs";
 import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { createConnection, createServer, type Server, type Socket } from "node:net";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 
 import { AdapterRegistry } from "./adapters/adapter.js";
 import { AntigravityAdapter } from "./adapters/antigravity/adapter.js";
@@ -18,6 +20,53 @@ import { Supervisor as SupervisorClass, defaultProjectRouting } from "./supervis
 import { UsageLedger } from "./usage.js";
 
 export const HOST_PROTOCOL = 2;
+
+/**
+ * Fingerprint of the compiled code this process loaded: a hash of every `.js` file next to this
+ * module, taken at import time so a later rebuild on disk does not change it. A proxy that finds an
+ * idle host with a different build replaces it, so rebuilding and reconnecting picks up new code.
+ */
+const LOADED_BUILD = hashBuild(dirname(fileURLToPath(import.meta.url)));
+
+function hashBuild(directory: string): string {
+  const hash = createHash("sha256");
+  try {
+    const files = readdirSync(directory, { recursive: true, encoding: "utf8" })
+      .filter((file) => file.endsWith(".js"))
+      .sort();
+    for (const file of files) {
+      hash.update(file).update("\0").update(readFileSync(join(directory, file))).update("\0");
+    }
+  } catch {
+    return "unknown";
+  }
+  return hash.digest("hex").slice(0, 16);
+}
+
+/** This process's build. `SUBAGENT_MCP_BUILD_ID` overrides it (tests). */
+export function buildId(): string {
+  return process.env.SUBAGENT_MCP_BUILD_ID ?? LOADED_BUILD;
+}
+
+export interface HostHello {
+  readonly protocol?: number;
+  readonly pid?: number;
+  readonly build?: string;
+  readonly active?: number;
+  readonly waiting?: number;
+}
+
+/**
+ * What a connecting proxy does with a host: keep it, or replace it because it speaks another
+ * protocol or runs an older build. A host with agents running or waiting is never replaced; with
+ * a mismatched build it is kept and reported stale, with a mismatched protocol it is refused.
+ */
+export function hostDisposition(hello: HostHello, build: string): "keep" | "stale" | "replace" | "refuse" {
+  const busy = (hello.active ?? 0) > 0 || (hello.waiting ?? 0) > 0;
+  if (hello.protocol !== HOST_PROTOCOL) return busy ? "refuse" : "replace";
+  if (hello.build === build) return "keep";
+  return busy ? "stale" : "replace";
+}
 const IDLE_EXIT_MS = 60_000;
 const CONNECT_WAIT_MS = 8_000;
 const RECORDED_HOST_WAIT_MS = 2_000;
@@ -155,6 +204,28 @@ export async function connectHost(options: {
   return waitForHost(paths.socketPath);
 }
 
+/**
+ * Replace the project host with one running the code now on disk, keeping agent records (they are
+ * restored from the snapshot). Refuses while agents are running or waiting, like `shutdown`.
+ */
+export async function restartHost(client: HostClient | undefined, options: Parameters<typeof connectHost>[0]): Promise<{
+  readonly client: HostClient;
+  readonly previousPid?: number;
+}> {
+  let previousPid: number | undefined;
+  if (client !== undefined) {
+    const hello = await client.call("hello", undefined, 2_000).catch(() => undefined) as HostHello | undefined;
+    previousPid = positiveInteger(hello?.pid);
+    if (hello !== undefined) {
+      await client.call("shutdown", undefined, 5_000);
+      client.close();
+      if (previousPid !== undefined) await waitForExit(previousPid, RECORDED_HOST_WAIT_MS);
+    }
+  }
+  const next = await connectHost(options);
+  return { client: next, ...(previousPid === undefined ? {} : { previousPid }) };
+}
+
 export async function runHost(): Promise<void> {
   const cwd = process.cwd();
   const agentsDirectory = process.env.SUBAGENT_MCP_AGENTS_DIR ?? join(cwd, ".subagents");
@@ -272,6 +343,8 @@ export class HostClient {
   #buffer = "";
   #nextId = 1;
   #closed = false;
+  /** The build the connected host reported in `hello`; differs from `buildId()` when the host is stale. */
+  hostBuild: string | undefined;
 
   static connect(socketPath: string, timeoutMs = 5_000): Promise<HostClient> {
     return new Promise((resolve, reject) => {
@@ -399,11 +472,14 @@ async function handleLine(
   }
 }
 
+/** The build this host process started with (see `buildId`); fixed for the life of the process. */
+const HOST_BUILD = buildId();
+
 async function dispatch(supervisor: Supervisor, method: string, params: unknown): Promise<unknown> {
   const input = isRecord(params) ? params : {};
   switch (method) {
     case "hello":
-      return { protocol: HOST_PROTOCOL, pid: process.pid, ...supervisor.concurrency() };
+      return { protocol: HOST_PROTOCOL, pid: process.pid, build: HOST_BUILD, ...supervisor.concurrency() };
     case "spawn_agent":
       return supervisor.spawnAgent(input as unknown as SpawnAgentInput);
     case "send_message":
@@ -519,17 +595,15 @@ async function connectCompatibleHost(socketPath: string): Promise<{
   if (client === undefined) return {};
   let keep = false;
   try {
-    const hello = await client.call("hello", undefined, 2_000) as {
-      protocol?: number;
-      active?: number;
-      pid?: number;
-    };
-    if (hello.protocol === HOST_PROTOCOL) {
+    const hello = await client.call("hello", undefined, 2_000) as HostHello;
+    const disposition = hostDisposition(hello, buildId());
+    if (disposition === "keep" || disposition === "stale") {
       keep = true;
+      client.hostBuild = hello.build;
       const pid = positiveInteger(hello.pid);
       return { client, ...(pid === undefined ? {} : { pid }) };
     }
-    if ((hello.active ?? 0) > 0) {
+    if (disposition === "refuse") {
       throw new Error(
         `subagent-mcp host speaks protocol ${String(hello.protocol)} and still has running agents. ` +
           "Stop those agents, then ask the user to run `/mcp` and then reconnect subagent-mcp.",
@@ -626,11 +700,12 @@ async function waitForHost(socketPath: string): Promise<HostClient> {
   while (Date.now() < deadline) {
     try {
       const client = await HostClient.connect(socketPath, 300);
-      const hello = await client.call("hello", undefined, 2_000) as { protocol?: number };
+      const hello = await client.call("hello", undefined, 2_000) as HostHello;
       if (hello.protocol !== HOST_PROTOCOL) {
         client.close();
         throw new Error(`subagent-mcp host protocol is ${String(hello.protocol)}, this client speaks ${HOST_PROTOCOL}`);
       }
+      client.hostBuild = hello.build;
       return client;
     } catch (error) {
       lastError = error;

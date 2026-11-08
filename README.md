@@ -51,7 +51,7 @@ uses the examples bundled in this repo's `.subagents/`. Memory and routing recor
 ## Tools
 
 `spawn_agent`, `send_message`, `list_agents`, `stop_agent`, `resolve_approval`,
-`get_agent_events`, `list_models`, `record_outcome`, `add_note` — see each tool's description
+`get_agent_events`, `list_models`, `record_outcome`, `add_note`, `restart_host` — see each tool's description
 for details. A spawn blocks until the child completes or needs your approval; when it needs
 approval, call `resolve_approval` to continue.
 
@@ -146,6 +146,12 @@ against the repository, tests, and the operator's actual request.
   host for this working directory, so `/mcp` reconnect does not drop running agents, and edits
   to `.subagents/` are picked up without a restart. If no config is loaded, tool calls return
   the files to create and ask the user to run `/mcp` and then reconnect `subagent-mcp`.
+- **Picking up code changes.** After rebuilding subagent-mcp (`npm run build`), run `/mcp` and
+  reconnect. The proxy compares a hash of the compiled code with the host's, and replaces an idle
+  host that runs an older build; agent records, results and usage carry over. If agents are
+  running, the host is left alone and tool responses carry a `host_warning`; once they finish,
+  `restart_host` loads the new code without another reconnect. Changes to tool definitions need
+  the `/mcp` reconnect either way.
 
 ## Known gaps
 

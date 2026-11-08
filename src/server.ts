@@ -7,7 +7,7 @@ import { fileURLToPath } from "node:url";
 
 import { CHANNEL_CAPABILITY, CHANNEL_INSTRUCTIONS, createChannelNotifier } from "./channel.js";
 import { BACKENDS, isBackend } from "./core/types.js";
-import { connectHost, runHost, type HostClient } from "./host.js";
+import { buildId, connectHost, restartHost, runHost, type HostClient } from "./host.js";
 import { ORCHESTRATOR_AUTHORITY_NOTICE } from "./prompt-policy.js";
 
 async function main(): Promise<void> {
@@ -23,27 +23,40 @@ async function main(): Promise<void> {
     { name: "subagent-mcp", version: "0.1.0" },
     { capabilities: { experimental: { [CHANNEL_CAPABILITY]: {} } }, instructions: CHANNEL_INSTRUCTIONS },
   );
+  const hostOptions = { cwd, agentsDirectory, modelsFile, scriptPath: fileURLToPath(import.meta.url) };
+  const notifier = createChannelNotifier(server.server);
   let client: HostClient | undefined;
   let connectError: Error | undefined;
   try {
-    client = await connectHost({
-      cwd,
-      agentsDirectory,
-      modelsFile,
-      scriptPath: fileURLToPath(import.meta.url),
-    });
-    client.onDetached(createChannelNotifier(server.server));
+    client = await connectHost(hostOptions);
+    client.onDetached(notifier);
   } catch (error) {
     connectError = error instanceof Error ? error : new Error(String(error));
     process.stderr.write(`subagent-mcp: ${connectError.message}\n`);
   }
+  // True once restart_host has started a host from code newer than this proxy loaded.
+  let proxyOutdated = false;
+  // A build mismatch means either the host kept an older build because agents were running when this
+  // proxy connected (see hostDisposition), or restart_host loaded newer code than this proxy has.
+  const staleWarning = (): string | undefined => {
+    if (client === undefined || client.hostBuild === buildId()) return undefined;
+    return proxyOutdated
+      ? "The subagent-mcp host runs newer code than this MCP connection. Ask the user to run `/mcp` and " +
+        "reconnect subagent-mcp to load updated tool definitions."
+      : "The subagent-mcp host is running an older build than this MCP connection because agents were " +
+        "running when it connected. Once they finish, call restart_host to load the new code.";
+  };
   const call = async (method: string, params?: unknown): Promise<unknown> => {
     if (client === undefined) {
       throw connectError ?? new Error(
         "subagent-mcp host is not connected. Ask the user to run `/mcp` and then reconnect subagent-mcp.",
       );
     }
-    return client.call(method, params);
+    const result = await client.call(method, params);
+    const warning = staleWarning();
+    return warning !== undefined && typeof result === "object" && result !== null && !Array.isArray(result)
+      ? { ...result, host_warning: warning }
+      : result;
   };
 
   server.registerTool(
@@ -218,6 +231,37 @@ async function main(): Promise<void> {
     async ({ backend }) => {
       if (backend !== undefined && !isBackend(backend)) throw new Error(`Invalid backend: ${String(backend)}`);
       return toContent(await call("list_models", backend === undefined ? {} : { backend }));
+    },
+  );
+
+  server.registerTool(
+    "restart_host",
+    {
+      title: "Restart host",
+      description:
+        "Restart this project's subagent-mcp host so it runs the subagent-mcp code currently on disk (after a " +
+        "rebuild). Agent records, results and usage are kept. Refused while any agent is running, waiting for a " +
+        "slot, or waiting for approval. Reconnecting with `/mcp` already does this when no agents are running; use " +
+        "this when a `host_warning` says the host is on an older build. Changes to tool definitions themselves " +
+        "still need `/mcp` reconnect.",
+      inputSchema: {},
+    },
+    async () => {
+      const before = client?.hostBuild;
+      const restarted = await restartHost(client, hostOptions);
+      client = restarted.client;
+      connectError = undefined;
+      client.onDetached(notifier);
+      proxyOutdated = client.hostBuild !== buildId();
+      const hello = await client.call("hello") as { pid?: number };
+      return toContent({
+        restarted: true,
+        ...(restarted.previousPid === undefined ? {} : { previous_pid: restarted.previousPid }),
+        pid: hello.pid,
+        build: client.hostBuild,
+        build_changed: before !== client.hostBuild,
+        ...(staleWarning() === undefined ? {} : { host_warning: staleWarning() }),
+      });
     },
   );
 
