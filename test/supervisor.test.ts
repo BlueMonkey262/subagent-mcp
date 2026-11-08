@@ -807,3 +807,26 @@ test("list_agents cumulative_usage includes the turn in progress, then the compl
   await waitUntil(() => supervisor.listAgents().some((agent) => agent["agent_id"] === agentId && agent["state"] === "completed"));
   assert.deepEqual(usageOf(), { inputTokens: 120, outputTokens: 9, cachedInputTokens: 40, uncachedInputTokens: 80, costUsd: null }, "live usage is replaced, not added");
 });
+
+test("live usage: a late update for a finished turn is ignored, and an interrupted turn keeps what was observed", async () => {
+  const adapter = new FakeAdapter("codex");
+  const supervisor = new Supervisor({ registry: testRegistry([codexAgentConfig()]), adapters: new AdapterRegistry([adapter]), cwd: "/work" });
+  const spawned = await supervisor.spawnAgent({ agent: "general", prompt: "work", description: "late usage", run_in_background: true });
+  const agentId = spawned["agent_id"] as string;
+  const agent = () => supervisor.listAgents().find((entry) => entry["agent_id"] === agentId)!;
+  const usageOf = () => agent()["cumulative_usage"] as Record<string, number | null>;
+
+  adapter.emit(agentId, "turn.completed", { turnId: "t1", status: "completed", usage: { inputTokens: 100, outputTokens: 5 } });
+  await waitUntil(() => agent()["state"] === "completed");
+  adapter.emit(agentId, "usage.updated", { turnId: "t1", usage: { inputTokens: 150, outputTokens: 8 } });
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.equal(usageOf()["inputTokens"], 100, "the late update is not added on top of the finished turn");
+
+  await supervisor.sendMessage({ agent: agentId, prompt: "more", run_in_background: true });
+  adapter.emit(agentId, "usage.updated", { turnId: "t2", usage: { inputTokens: 20, outputTokens: 2 } });
+  await waitUntil(() => usageOf()["inputTokens"] === 120);
+  adapter.emit(agentId, "turn.completed", { turnId: "t2", status: "interrupted" }); // no final usage
+  await waitUntil(() => agent()["state"] === "interrupted");
+  assert.equal(usageOf()["inputTokens"], 120, "the interrupted turn keeps its 20 observed tokens");
+  assert.equal(usageOf()["outputTokens"], 7);
+});

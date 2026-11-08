@@ -17,8 +17,11 @@ interface FakeCodexServer {
   readonly received: Record<string, Readonly<Record<string, unknown>>[]>;
 }
 
-/** A canned reply: `{ result }` or a JSON-RPC `{ error }`. */
-type FakeResponse = { readonly result: Readonly<Record<string, unknown>> } | { readonly error: Readonly<Record<string, unknown>> };
+/** A canned reply: `{ result }`, a JSON-RPC `{ error }`, or `{ silent: true }` to never answer. */
+type FakeResponse =
+  | { readonly result: Readonly<Record<string, unknown>> }
+  | { readonly error: Readonly<Record<string, unknown>> }
+  | { readonly silent: true };
 
 /**
  * Minimal fake `codex app-server`: answers `initialize`, `thread/start`, `thread/resume`, and
@@ -27,14 +30,32 @@ type FakeResponse = { readonly result: Readonly<Record<string, unknown>> } | { r
  */
 function fakeCodexServer(
   responses: Readonly<Record<string, (params: Readonly<Record<string, unknown>>) => FakeResponse>> = {},
-  /** Notifications sent before each turn's `turn/completed`, by 1-based turn number. */
+  /**
+   * Notifications sent before each turn's `turn/completed`, by 1-based turn number. An entry
+   * `{ hold: true }` is not sent; it keeps the turn open (no `turn/completed`).
+   */
   turnNotifications: (turnId: string, turnNumber: number) => readonly Readonly<Record<string, unknown>>[] = () => [],
+  /** Signals that make the fake process exit (default: none, so it ignores kill like a hung child). */
+  exitOn: readonly NodeJS.Signals[] = [],
 ): FakeCodexServer {
   const stdin = new PassThrough();
   const stdout = new PassThrough();
   const stderr = new PassThrough();
   const child = new EventEmitter() as unknown as ChildProcessWithoutNullStreams;
-  Object.assign(child, { stdin, stdout, stderr, exitCode: null, signalCode: null, killed: false, kill: () => { (child as unknown as { killed: boolean }).killed = true; } });
+  const signals: NodeJS.Signals[] = [];
+  Object.assign(child, {
+    stdin, stdout, stderr, exitCode: null, signalCode: null, killed: false, signals,
+    kill: (signal: NodeJS.Signals = "SIGTERM") => {
+      const state = child as unknown as { killed: boolean; signalCode: NodeJS.Signals | null };
+      state.killed = true;
+      signals.push(signal);
+      if (exitOn.includes(signal) && state.signalCode === null) {
+        state.signalCode = signal;
+        setImmediate(() => child.emit("exit", null, signal));
+      }
+      return true;
+    },
+  });
 
   const received: Record<string, Readonly<Record<string, unknown>>[]> = {};
   let threadIdCounter = 0;
@@ -57,7 +78,7 @@ function fakeCodexServer(
       };
       const canned = responses[message.method]?.(params);
       if (canned !== undefined) {
-        stdout.write(`${JSON.stringify({ id: message.id, ...canned })}\n`);
+        if (!("silent" in canned)) stdout.write(`${JSON.stringify({ id: message.id, ...canned })}\n`);
         continue;
       }
       switch (message.method) {
@@ -79,9 +100,12 @@ function fakeCodexServer(
           // internal (deliberately unref'd) timers to observe a terminal state. Deferred to a
           // macrotask so the client has processed turn/start's own response (and recorded
           // currentTurn.id) before the completion notification arrives.
-          const notifications = turnNotifications(turnId, ++turnCounter);
+          const planned = turnNotifications(turnId, ++turnCounter);
+          const hold = planned.some((notification) => notification.hold === true);
+          const notifications = planned.filter((notification) => notification.hold !== true);
           setImmediate(() => {
             for (const notification of notifications) stdout.write(`${JSON.stringify(notification)}\n`);
+            if (hold) return;
             stdout.write(`${JSON.stringify({
               method: "turn/completed",
               params: { turn: { id: turnId, status: "completed", items: [] } },
@@ -202,7 +226,7 @@ test("providerInfo summarizes the catalog, plan rate limits and account usage wi
     } }),
     "account/read": () => ({ result: { account: { type: "chatgpt", email: "someone@example.com", planType: "plus" },
       workspaceRouting: { chatgptAccountId: "acct_secret" } } }),
-  });
+  }, () => [], ["SIGTERM"]);
   const adapter = new CodexAdapter({ spawnProcess: () => server.child, initTimeoutMs: 2_000 });
   const info = await adapter.providerInfo();
 
@@ -240,7 +264,7 @@ test("providerInfo keeps the catalog when plan limits are unavailable (API-key a
     "model/list": () => ({ result: { data: [{ id: "gpt-6.1-sol", isDefault: true }] } }),
     "account/rateLimits/read": () => ({ error: { code: -32600, message: "codex account authentication required to read rate limits" } }),
     "account/read": () => ({ result: { account: null } }),
-  });
+  }, () => [], ["SIGTERM"]);
   const adapter = new CodexAdapter({ spawnProcess: () => server.child, initTimeoutMs: 2_000 });
   const info = await adapter.providerInfo();
   assert.deepEqual(info.models, [{ id: "gpt-6.1-sol", default: true }]);
@@ -288,4 +312,78 @@ test("turn usage is the turn's own tokens, not the thread's running total", asyn
   assert.deepEqual(await usageOf(agentId, since), expected(250, 5, 50), "both model calls of turn 3, nothing from earlier turns");
   const live = adapter.buffer.read(agentId, since).events.filter((event) => event.type === "usage.updated");
   assert.deepEqual(live.map((event) => (event.data as { usage: unknown }).usage), [expected(100, 2, 0), expected(250, 5, 50)]);
+});
+
+const tokenUpdate = (turnId: string, total?: Record<string, number>, last?: Record<string, number>) => ({
+  method: "thread/tokenUsage/updated",
+  params: { turnId, tokenUsage: { ...(total === undefined ? {} : { total }), ...(last === undefined ? {} : { last }) } },
+});
+const counts = (input: number, output: number, cached: number) => ({ inputTokens: input, outputTokens: output, cachedInputTokens: cached });
+
+async function turnEvents(adapter: CodexAdapter, agentId: string, since: number): Promise<readonly AgentEvent[]> {
+  await waitForTurnCompleted(adapter, agentId);
+  await new Promise((resolve) => setImmediate(resolve)); // let any trailing notifications land
+  return adapter.buffer.read(agentId, since).events;
+}
+
+test("a token update arriving after turn/completed does not reopen the turn", async () => {
+  const server = fakeCodexServer({}, (turnId) => [tokenUpdate(turnId, counts(100, 5, 0), counts(100, 5, 0))]);
+  const adapter = new CodexAdapter({ spawnProcess: () => server.child, initTimeoutMs: 2_000 });
+  const { agentId, turnId } = await adapter.spawn(spawnRequest());
+  await waitForTurnCompleted(adapter, agentId);
+  (server.child.stdout as PassThrough).write(`${JSON.stringify(tokenUpdate(turnId, counts(180, 9, 0), counts(80, 4, 0)))}\n`);
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  const events = adapter.buffer.read(agentId).events;
+  const completedAt = events.findIndex((event) => event.type === "turn.completed");
+  assert.equal(events.slice(completedAt + 1).some((event) => event.type === "usage.updated"), false);
+});
+
+test("without `last`, the previous total is the baseline; with neither, usage is left unreported", async () => {
+  const server = fakeCodexServer({}, (turnId, turn) => turn === 1
+    ? [tokenUpdate(turnId, counts(100, 5, 0))] // no `last`, nothing seen before: unknown
+    : [tokenUpdate(turnId, counts(160, 8, 10))]); // no `last`, but turn 1's total was seen
+  const adapter = new CodexAdapter({ spawnProcess: () => server.child, initTimeoutMs: 2_000 });
+  const { agentId } = await adapter.spawn(spawnRequest());
+  const first = await turnEvents(adapter, agentId, 0);
+  assert.equal(first.some((event) => event.type === "usage.updated"), false, "no misleading zero");
+  assert.equal((first.find((event) => event.type === "turn.completed")?.data as { usage?: unknown }).usage, undefined);
+  const since = adapter.buffer.read(agentId).currentSequence;
+  await adapter.resume({ agentId, prompt: "again", cwd: "/tmp", model: "gpt-5.6-luna", systemPrompt: "", env: {}, permission });
+  const second = await turnEvents(adapter, agentId, since);
+  assert.deepEqual((second.find((event) => event.type === "turn.completed")?.data as { usage?: unknown }).usage,
+    { ...counts(60, 3, 10), uncachedInputTokens: 50 });
+});
+
+test("a thread resumed in a new process counts only the new turn", async () => {
+  // A fresh adapter has seen nothing of the thread; the first update's total includes earlier turns.
+  const server = fakeCodexServer({}, (turnId) => [tokenUpdate(turnId, counts(37_113, 10, 29_696), counts(18_566, 5, 18_432))]);
+  const adapter = new CodexAdapter({ spawnProcess: () => server.child, initTimeoutMs: 2_000 });
+  const { agentId } = await adapter.resume({ agentId: "thread-old", prompt: "again", cwd: "/tmp", model: "gpt-5.6-luna", systemPrompt: "", env: {}, permission });
+  const events = await turnEvents(adapter, agentId, 0);
+  assert.deepEqual((events.find((event) => event.type === "turn.completed")?.data as { usage?: unknown }).usage,
+    { ...counts(18_566, 5, 18_432), uncachedInputTokens: 134 });
+});
+
+test("an interrupted turn keeps the usage observed before the interrupt", async () => {
+  const server = fakeCodexServer({}, (turnId) => [tokenUpdate(turnId, counts(20, 2, 0), counts(20, 2, 0)), { hold: true }]);
+  const adapter = new CodexAdapter({ spawnProcess: () => server.child, initTimeoutMs: 2_000, interruptGraceMs: 30 });
+  const { agentId } = await adapter.spawn(spawnRequest());
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  await adapter.interrupt(agentId);
+  const completed = adapter.buffer.read(agentId).events.find((event) => event.type === "turn.completed");
+  assert.equal((completed?.data as { status: string }).status, "interrupted");
+  assert.deepEqual((completed?.data as { usage?: unknown }).usage, { ...counts(20, 2, 0), uncachedInputTokens: 20 });
+});
+
+test("providerInfo: a hung section times out on its own and a child ignoring SIGTERM is killed", async () => {
+  const server = fakeCodexServer({
+    "model/list": () => ({ result: { data: [{ id: "gpt-6.1-sol", isDefault: true }] } }),
+    "account/usage/read": () => ({ silent: true }), // never answers
+    "account/read": () => ({ result: { account: { type: "chatgpt", planType: "plus" } } }),
+  }, () => [], ["SIGKILL"]);
+  const adapter = new CodexAdapter({ spawnProcess: () => server.child, initTimeoutMs: 2_000, liveSectionTimeoutMs: 50, probeReapGraceMs: 30 });
+  const info = await adapter.providerInfo();
+  assert.deepEqual(info.models, [{ id: "gpt-6.1-sol", default: true }], "the other sections still come back");
+  assert.match(String((info["errors"] as Record<string, string>)["account_usage"]), /timed out/);
+  assert.deepEqual((server.child as unknown as { signals: string[] }).signals, ["SIGTERM", "SIGKILL"]);
 });

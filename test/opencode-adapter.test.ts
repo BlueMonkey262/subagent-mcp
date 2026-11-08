@@ -45,6 +45,8 @@ class FakeV2 {
   models: Record<string, unknown>[] = [];
   /** `GET /api/experimental/usage/limits` data; undefined makes the endpoint fail with 500. */
   usageLimits: Record<string, unknown> | undefined;
+  /** When true, `/api/experimental/usage/limits` never answers. */
+  hangUsageLimits = false;
   private nextMessage = 1;
 
   constructor() {
@@ -88,6 +90,7 @@ class FakeV2 {
     if (req.method === "GET" && path === "/api/model") return json({ data: this.models });
     if (req.method === "GET" && path === "/api/model/default") return json({ data: this.models[0] });
     if (req.method === "GET" && path === "/api/experimental/usage/limits") {
+      if (this.hangUsageLimits) return;
       return this.usageLimits === undefined ? json({ error: "gone" }, 500) : json({ data: this.usageLimits });
     }
     if (req.method === "POST" && path === "/api/session") return json({ data: { id: "ses_fake1", location: { directory: "/tmp" } } });
@@ -357,9 +360,13 @@ test("v2: providerInfo summarizes models, the default, and Go usage without leak
     limit: { context: 1048576, output: 65536 },
   }];
   fake.usageLimits = {
-    workspace: { id: "org_secret", name: "Personal", usageURL: "https://opencode.ai/console/x" },
+    workspace: { id: "org_secret", name: "Personal", usageURL: "https://opencode.ai/console/org_secret/activity/overview" },
     go: { weekly: { percent: 41, limited: false, resetsAt: Date.UTC(2026, 10, 15) } },
-    budgets: [],
+    budgets: [{
+      id: "bud_secret", limit: 20, spent: 7.5, scope: "combined", per: "set", coverage: "models",
+      models: [{ providerID: "opencode-go", modelID: "hy4", name: "Hy4", spent: 7.5 }],
+      vendors: ["opencode"], picked: true, shared: false, resetsAt: Date.UTC(2026, 11, 1), unexpected: "org_secret",
+    }],
   };
   const adapter = new OpenCodeAdapter({ baseUrl, protocol: "v2", password: PASSWORD, ...fast });
   try {
@@ -370,11 +377,16 @@ test("v2: providerInfo summarizes models, the default, and Go usage without leak
       cost_per_mtok: { input: 0.834, output: 2.501, cache_read: 0.042 }, variants: ["none", "high"],
     }]);
     assert.deepEqual(info["usage_limits"], {
-      workspace: { name: "Personal", usage_url: "https://opencode.ai/console/x" },
+      workspace: { name: "Personal" },
       go: { weekly: { percent_used: 41, remaining_percent: 59, limited: false, resets_at: "2026-11-15T00:00:00.000Z" } },
-      budgets: [],
+      budgets: [{
+        limit_usd: 20, spent_usd: 7.5, remaining_usd: 12.5, scope: "combined", per: "set", coverage: "models",
+        models: [{ model: "opencode-go/hy4", name: "Hy4", spent_usd: 7.5 }],
+        vendors: ["opencode"], picked: true, shared: false, resets_at: "2026-12-01T00:00:00.000Z",
+      }],
     });
-    assert.equal(JSON.stringify(info).includes("org_secret"), false);
+    const text = JSON.stringify(info);
+    assert.equal(text.includes("org_secret") || text.includes("bud_secret"), false, "no workspace or budget ids, even inside URLs or unknown fields");
     assert.equal(info["errors"], undefined);
 
     fake.usageLimits = undefined;
@@ -412,6 +424,22 @@ test("v2: reports running usage mid-turn, once per change", async () => {
     await nextEvent(iterator, "turn.completed");
     const updates = adapter.buffer.read(turn.agentId).events.filter((event) => event.type === "usage.updated");
     assert.equal(updates.length, 2, "an unchanged poll does not repeat the event");
+  } finally {
+    await adapter.closeAll();
+    fake.close();
+  }
+});
+
+test("v2: a hung usage endpoint times out on its own and the model list still comes back", async () => {
+  const fake = new FakeV2();
+  const baseUrl = await fake.listen();
+  fake.models = [{ id: "hy4", modelID: "hy4", providerID: "opencode-go" }];
+  fake.hangUsageLimits = true;
+  const adapter = new OpenCodeAdapter({ baseUrl, protocol: "v2", password: PASSWORD, ...fast, liveSectionTimeoutMs: 50 });
+  try {
+    const info = await adapter.providerInfo();
+    assert.deepEqual(info.models, [{ id: "opencode-go/hy4" }]);
+    assert.ok((info["errors"] as Record<string, string>)["usage_limits"], "the hung section is reported, not awaited");
   } finally {
     await adapter.closeAll();
     fake.close();

@@ -216,10 +216,13 @@ Verified against opencode 2.2.5 on 2026-11-08.
 - `GET /api/experimental/usage/limits` returns `workspace {name, usageURL}`, OpenCode Go meters
   `go.rolling|weekly|monthly {percent, limited, resetsAt}` (`percent` is the share used;
   `resetsAt` is epoch **milliseconds**), and workspace `budgets`. It covers only what OpenCode's
-  console knows, not quotas of external provider keys, and it is marked experimental.
+  console knows, not quotas of external provider keys, and it is marked experimental. The adapter
+  keeps only the workspace name (`usageURL` embeds the workspace ID) and maps each budget through
+  an allowlist (`UsageLimits.Budget` in `GET /openapi.json`) without its `id`.
 
 All responses are wrapped as `{location, data}`. `list_models` with `backend: "opencode"` reads
-these through the adapter's own server; a failure in one shows up under `live.errors`.
+these through the adapter's own server, each with a 10-second limit; a failure or timeout in one
+shows up under `live.errors`.
 
 ## Version pin recommendation
 

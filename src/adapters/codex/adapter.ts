@@ -34,6 +34,10 @@ const DEFAULT_STDERR_LIMIT_BYTES = 32 * 1024;
 const MAX_MODEL_PAGES = 10;
 /** Most recent `account/usage/read` daily buckets kept in `providerInfo`. */
 const DAILY_USAGE_DAYS = 7;
+/** Each `providerInfo` section gets this long, so one hung request cannot sink the others. */
+const DEFAULT_LIVE_SECTION_TIMEOUT_MS = 10_000;
+/** After SIGTERM, how long the `providerInfo` app-server gets to exit before SIGKILL. */
+const DEFAULT_PROBE_REAP_GRACE_MS = 2_000;
 
 type SpawnProcess = (
   command: string,
@@ -50,6 +54,10 @@ export interface CodexAdapterOptions {
   readonly env?: Readonly<Record<string, string>>;
   readonly buffer?: EventBuffer;
   readonly spawnProcess?: SpawnProcess;
+  /** Per-section limit for `providerInfo` (default 10s). */
+  readonly liveSectionTimeoutMs?: number;
+  /** SIGTERM-to-SIGKILL grace for the `providerInfo` app-server (default 2s). */
+  readonly probeReapGraceMs?: number;
 }
 
 export class CodexAdapterError extends SubagentError {
@@ -96,6 +104,10 @@ interface CodexSession {
   lastUsage?: Usage;
   /** Thread-cumulative token totals just before this turn's first model call; see `turnUsage`. */
   turnUsageBase?: TokenCounts;
+  /** True when this turn's starting point could not be determined, so its usage is not reported. */
+  turnUsageUnknown?: boolean;
+  /** The latest thread-cumulative `total` seen in this process, a fallback baseline when `last` is missing. */
+  threadTotal?: TokenCounts;
   stdoutBuffer: string;
   stderr: string;
   exited: boolean;
@@ -250,11 +262,12 @@ export class CodexAdapter implements BackendAdapter {
     signal?.addEventListener("abort", abort, { once: true });
     try {
       await this.#handshake(session);
+      const section = <T>(name: string, work: Promise<T>) => withTimeout(work, this.#options.liveSectionTimeoutMs ?? DEFAULT_LIVE_SECTION_TIMEOUT_MS, `Codex ${name}`);
       const [models, limits, usage, account] = await Promise.allSettled([
-        this.#listModels(session),
-        this.#request(session, "account/rateLimits/read", {}),
-        this.#request(session, "account/usage/read", {}),
-        this.#request(session, "account/read", {}),
+        section("model/list", this.#listModels(session)),
+        section("account/rateLimits/read", this.#request(session, "account/rateLimits/read", {})),
+        section("account/usage/read", this.#request(session, "account/usage/read", {})),
+        section("account/read", this.#request(session, "account/read", {})),
       ]);
       const errors: Record<string, string> = {};
       const settled = <T>(name: string, result: PromiseSettledResult<unknown>, map: (value: unknown) => T): T | undefined => {
@@ -280,9 +293,26 @@ export class CodexAdapter implements BackendAdapter {
       throw error;
     } finally {
       signal?.removeEventListener("abort", abort);
-      this.#terminate(session);
-      this.#launches.delete(session);
+      await this.#reap(session);
     }
+  }
+
+  /**
+   * Stop a `providerInfo` app-server: SIGTERM, a short grace, then SIGKILL the process group. It
+   * stays tracked (so `closeAll` still reaches it) until its exit is observed.
+   */
+  async #reap(session: CodexSession): Promise<void> {
+    const exited = new Promise<void>((resolve) => {
+      if (session.exited) resolve();
+      else session.child.once("exit", () => resolve());
+    });
+    for (const signal of ["SIGTERM", "SIGKILL"] as const) {
+      if (session.exited) break;
+      this.#signalGroup(session, signal);
+      await Promise.race([exited, delay(this.#options.probeReapGraceMs ?? DEFAULT_PROBE_REAP_GRACE_MS)]);
+    }
+    if (session.exited) this.#launches.delete(session);
+    else session.child.once("exit", () => this.#launches.delete(session));
   }
 
   /** Every `model/list` page, following `nextCursor`. */
@@ -358,6 +388,7 @@ export class CodexAdapter implements BackendAdapter {
     session.currentTurn = { terminal: false, interruptRequested: false, timedOut: false };
     delete session.lastUsage;
     delete session.turnUsageBase;
+    delete session.turnUsageUnknown;
     const started = await this.#request(session, "turn/start", {
       threadId: session.threadId,
       input: [{ type: "text", text: prompt }],
@@ -489,13 +520,28 @@ export class CodexAdapter implements BackendAdapter {
         return;
       }
       case "thread/tokenUsage/updated": {
+        // A finished turn's usage is final; a late update must not reopen it.
+        if (session.currentTurn.terminal) return;
         if (session.currentTurn.id !== undefined && params.turnId === session.currentTurn.id) {
           // `total` is cumulative for the whole thread and `last` is one model call, so a turn's usage
           // is the latest `total` minus the `total` before its first call (`total - last` on the first
-          // update). No cross-turn state, so a thread resumed in a new process is not double-counted.
+          // update). That needs no cross-turn state, so a thread resumed in a new process is not
+          // double-counted. Without `last`, the previous `total` seen here is the baseline; with
+          // neither, the turn's usage is unknown and is left unreported rather than guessed.
           const total = tokenCounts(get(params, "tokenUsage", "total"));
           if (total === undefined) return;
-          session.turnUsageBase ??= subtractCounts(total, tokenCounts(get(params, "tokenUsage", "last")) ?? ZERO_COUNTS);
+          const previousTotal = session.threadTotal;
+          session.threadTotal = total;
+          if (session.turnUsageUnknown) return;
+          if (session.turnUsageBase === undefined) {
+            const last = tokenCounts(get(params, "tokenUsage", "last"));
+            const base = last !== undefined ? subtractCounts(total, last) : previousTotal;
+            if (base === undefined) {
+              session.turnUsageUnknown = true;
+              return;
+            }
+            session.turnUsageBase = base;
+          }
           session.lastUsage = toUsage(subtractCounts(total, session.turnUsageBase));
           if (session.threadId !== undefined) {
             const turnId = session.currentTurn.id;
@@ -539,7 +585,7 @@ export class CodexAdapter implements BackendAdapter {
     this.#completeTurn(session, status, finalText, session.lastUsage);
   }
 
-  #completeTurn(session: CodexSession, status: NormalizedEventData["turn.completed"]["status"], finalText?: string, usage?: Usage): void {
+  #completeTurn(session: CodexSession, status: NormalizedEventData["turn.completed"]["status"], finalText?: string, usage: Usage | undefined = session.lastUsage): void {
     if (session.currentTurn.terminal) return;
     session.currentTurn.terminal = true;
     if (session.currentTurn.timeout) clearTimeout(session.currentTurn.timeout);
@@ -701,8 +747,6 @@ interface TokenCounts {
   readonly cachedInputTokens: number;
 }
 
-const ZERO_COUNTS: TokenCounts = { inputTokens: 0, outputTokens: 0, cachedInputTokens: 0 };
-
 /** A `TokenUsageBreakdown` (`thread/tokenUsage/updated`'s `total` or `last`), or undefined when it has no counts. */
 function tokenCounts(breakdown: unknown): TokenCounts | undefined {
   if (!isRecord(breakdown)) return undefined;
@@ -728,6 +772,22 @@ function toUsage(counts: TokenCounts): Usage {
     // Codex's inputTokens already includes the cached part.
     uncachedInputTokens: Math.max(0, counts.inputTokens - counts.cachedInputTokens),
   };
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms).unref());
+}
+
+/** Reject with a timeout error if `work` has not settled within `ms`. */
+function withTimeout<T>(work: Promise<T>, ms: number, label: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new CodexAdapterError(`${label} timed out after ${ms}ms`)), ms);
+    timer.unref();
+    work.then(
+      (value) => { clearTimeout(timer); resolve(value); },
+      (error: unknown) => { clearTimeout(timer); reject(error); },
+    );
+  });
 }
 
 function describeError(error: unknown): string {

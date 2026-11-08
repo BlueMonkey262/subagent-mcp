@@ -44,6 +44,8 @@ const DEFAULT_INIT_TIMEOUT_MS = 20_000;
 const DEFAULT_POLL_ACTIVE_MS = 400;
 const DEFAULT_POLL_IDLE_MS = 3_000;
 const DEFAULT_INTERRUPT_GRACE_MS = 5_000;
+/** Each `providerInfo` request gets this long, so one hung endpoint cannot sink the others. */
+const DEFAULT_LIVE_SECTION_TIMEOUT_MS = 10_000;
 
 export interface OpenCodeAdapterOptions {
   readonly executable?: string;
@@ -64,6 +66,8 @@ export interface OpenCodeAdapterOptions {
   readonly protocol?: OpenCodeProtocol;
   /** v2 only: the server password to authenticate with (injected `baseUrl`), or to start the server with. */
   readonly password?: string;
+  /** Per-request limit for `providerInfo` (default 10s). */
+  readonly liveSectionTimeoutMs?: number;
 }
 
 export type OpenCodeProtocol = "v1" | "v2";
@@ -293,8 +297,11 @@ export class OpenCodeAdapter implements BackendAdapter {
     if (this.#protocol !== "v2") {
       return { supported: false, reason: "Live models and usage need opencode >= 2.0 (the v1 server has no /api/model)." };
     }
-    const get = (path: string) => this.#fetchJson(baseUrl, "GET", path, undefined, true, signal)
-      .then((body) => (isRecord(body) ? body.data : undefined));
+    const get = (path: string) => {
+      const timeout = AbortSignal.timeout(this.#options.liveSectionTimeoutMs ?? DEFAULT_LIVE_SECTION_TIMEOUT_MS);
+      return this.#fetchJson(baseUrl, "GET", path, undefined, true, signal === undefined ? timeout : AbortSignal.any([signal, timeout]))
+        .then((body) => (isRecord(body) ? body.data : undefined));
+    };
     const [models, defaultModel, limits] = await Promise.allSettled([
       get("/api/model"),
       get("/api/model/default"),
@@ -762,7 +769,8 @@ function summarizeModel(value: unknown): ProviderModel[] {
 
 /**
  * `/api/experimental/usage/limits`: OpenCode Go meters (`percent` used, `resetsAt` epoch ms) become
- * `percent_used`/`remaining_percent`/ISO `resets_at`; workspace budgets pass through as reported.
+ * `percent_used`/`remaining_percent`/ISO `resets_at`. The workspace keeps only its name: its id and
+ * `usageURL` (which embeds the id) are dropped, and budgets go through an allowlist without their id.
  */
 function summarizeUsageLimits(value: unknown): Readonly<Record<string, unknown>> {
   if (!isRecord(value)) return {};
@@ -780,16 +788,38 @@ function summarizeUsageLimits(value: unknown): Readonly<Record<string, unknown>>
       }]];
     }));
   return {
-    ...(workspace === undefined
-      ? {}
-      : {
-        workspace: {
-          ...(typeof workspace.name === "string" ? { name: workspace.name } : {}),
-          ...(typeof workspace.usageURL === "string" ? { usage_url: workspace.usageURL } : {}),
-        },
-      }),
+    ...(typeof workspace?.name === "string" ? { workspace: { name: workspace.name } } : {}),
     ...(meters === undefined ? {} : { go: meters }),
-    ...(Array.isArray(value.budgets) ? { budgets: value.budgets } : {}),
+    ...(Array.isArray(value.budgets) ? { budgets: value.budgets.filter(isRecord).map(summarizeBudget) } : {}),
+  };
+}
+
+/** One `UsageLimits.Budget` (USD amounts, `resetsAt` epoch ms), by allowlist so its id never passes through. */
+function summarizeBudget(budget: Readonly<Record<string, unknown>>): Readonly<Record<string, unknown>> {
+  const number = (key: string) => (typeof budget[key] === "number" ? budget[key] as number : undefined);
+  const limit = number("limit");
+  const spent = number("spent");
+  const inputPriceAtLeast = number("inputPriceAtLeast");
+  const models = Array.isArray(budget.models)
+    ? budget.models.filter(isRecord).map((model) => ({
+      ...(typeof model.providerID === "string" && typeof model.modelID === "string" ? { model: `${model.providerID}/${model.modelID}` } : {}),
+      ...(typeof model.name === "string" ? { name: model.name } : {}),
+      ...(typeof model.spent === "number" ? { spent_usd: model.spent } : {}),
+    }))
+    : undefined;
+  return {
+    ...(limit === undefined ? {} : { limit_usd: limit }),
+    ...(spent === undefined ? {} : { spent_usd: spent }),
+    ...(limit === undefined || spent === undefined ? {} : { remaining_usd: Math.max(0, limit - spent) }),
+    ...(typeof budget.scope === "string" ? { scope: budget.scope } : {}),
+    ...(typeof budget.per === "string" ? { per: budget.per } : {}),
+    ...(typeof budget.coverage === "string" ? { coverage: budget.coverage } : {}),
+    ...(models === undefined ? {} : { models }),
+    ...(Array.isArray(budget.vendors) ? { vendors: budget.vendors.filter((vendor) => typeof vendor === "string") } : {}),
+    ...(inputPriceAtLeast === undefined ? {} : { input_price_at_least_per_mtok: inputPriceAtLeast }),
+    ...(typeof budget.picked === "boolean" ? { picked: budget.picked } : {}),
+    ...(typeof budget.shared === "boolean" ? { shared: budget.shared } : {}),
+    ...(typeof budget.resetsAt === "number" ? { resets_at: new Date(budget.resetsAt).toISOString() } : {}),
   };
 }
 

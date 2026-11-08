@@ -695,13 +695,20 @@ export class Supervisor {
             continue;
           }
           if (event.type === "usage.updated") {
-            record.liveUsage = { ...event.data.usage };
+            // Only the turn in progress has live usage; a late update for a finished turn would count it twice.
+            const finished = event.data.turnId !== undefined && record.meta.history.some(h => h.turn_id === event.data.turnId);
+            if (!finished && (record.state === "running" || record.state === "needs_approval" || record.state === "starting")) {
+              record.liveUsage = { ...event.data.usage };
+            }
             continue;
           }
           if (event.type === "turn.completed") {
+            // The final usage wins; without one (an interrupt or crash), keep what was observed live.
+            const turnUsage = event.data.usage ?? record.liveUsage;
             delete record.liveUsage;
             if (event.data.finalText !== undefined) record.result = scanChildOutput(event.data.finalText);
-            if (event.data.usage !== undefined) record.usage = { ...event.data.usage };
+            if (turnUsage !== undefined) record.usage = { ...turnUsage };
+            else delete record.usage;
             if (record.meta.history.some(h => h.turn_id === event.data.turnId)) continue;
             if (record.meta.schema && event.data.status === 'completed') {
               try {
@@ -726,7 +733,7 @@ export class Supervisor {
               // #waitForNotableState callers (sendMessage/resolveApproval) keep waiting correctly.
               delete record.pendingMessage;
               record.updatedAt = new Date().toISOString();
-              this.#usage.recordTurn(record.backend, record.model, event.data.usage, {
+              this.#usage.recordTurn(record.backend, record.model, turnUsage, {
                 failed: event.data.status !== "completed",
                 timedOut: record.timedOut,
               });
@@ -736,7 +743,7 @@ export class Supervisor {
             }
             record.state = event.data.status === "completed" ? "completed"
               : event.data.status === "interrupted" ? "interrupted" : "failed";
-            this.#usage.recordTurn(record.backend, record.model, event.data.usage, {
+            this.#usage.recordTurn(record.backend, record.model, turnUsage, {
               failed: event.data.status !== "completed",
               timedOut: record.timedOut,
             });

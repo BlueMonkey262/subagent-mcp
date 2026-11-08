@@ -179,7 +179,10 @@ Token usage arrives as `thread/tokenUsage/updated` with `params.turnId` and
 recent model call. In a two-turn thread, turn 2 reported `total.inputTokens` 37,113 with `last`
 18,566. The adapter therefore reports a turn's usage as the latest `total` minus the `total` before
 the turn's first call (`total - last` on the turn's first update). That needs no state from earlier
-turns, so a thread resumed in a new process is not double-counted. `inputTokens` includes
+turns, so a thread resumed in a new process is not double-counted. Without `last`, the previous
+`total` seen in this process is the baseline; with neither, the turn's usage is left unreported
+rather than guessed. Updates that arrive after the turn has ended are ignored, and a turn ended by
+an interrupt, timeout or process exit keeps the usage observed so far. `inputTokens` includes
 `cachedInputTokens`; fresh input is the difference. Each update is also emitted as `usage.updated`.
 
 Treat `turn/completed` as the terminal event even if expected item notifications were absent. For failed turns, `turn.error` is populated; the server may also emit `error` with `{error, willRetry, threadId, turnId}`. Exact delta segmentation and notification ordering are **unverified**. The adapter should append deltas by `(threadId, turnId, itemId)`, deduplicate terminal events, and retain the completed item's canonical content where available.
@@ -203,8 +206,9 @@ Treat `turn/completed` as the terminal event even if expected item notifications
 - `account/read`: `account.type` (auth mode) and `planType`. The response also includes the email
   address and workspace routing IDs, which the adapter drops.
 
-Each call fails on its own; under API-key auth the rate-limit read fails and the catalog still
-returns.
+Each call fails on its own, with its own 10-second limit; under API-key auth the rate-limit read
+fails and the catalog still returns. The app-server is stopped with SIGTERM, then SIGKILL after a
+2-second grace, and stays tracked until it has exited.
 
 ### Interrupt
 
