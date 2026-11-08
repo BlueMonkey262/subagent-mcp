@@ -56,6 +56,12 @@ To customize, copy `<repo>/.subagents` into your project and edit `models.yaml` 
 you actually have access to (`agent --list-models`, `opencode models`, and so on). Changes under
 `.subagents/` hot-reload.
 
+Antigravity (`agy`) agents carry their system prompt in an `agy` custom agent, not in the
+`.subagents/` file. The bundled `antigravity-general` config points at `subagent-general`, which lives
+in `<repo>/.agents/agents/subagent-general.md`; copy `.agents/` into your project along with
+`.subagents/` (or put an agent file of that name in `~/.gemini/agents/`). `agy` finds project agents
+from the directory it runs in, though `agy agents` only lists the global ones.
+
 ## 6. Optional: custom endpoints
 
 For NVIDIA NIM, install litellm (`pip install 'litellm[proxy]'`), then run
