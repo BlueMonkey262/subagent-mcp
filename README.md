@@ -180,6 +180,16 @@ against the repository, tests, and the operator's actual request.
   the code on disk or other sessions are attached, unless called with `force: true`. Changes to
   tool definitions need the `/mcp` reconnect either way.
 
+## Update notifications
+
+When update checks are enabled, the host looks up the latest GitHub release of
+`BlueMonkey262/subagent-mcp` at most once a day via the public API (a normal request; nothing else is
+sent). The result is cached at `<project>/.subagents/memory/update.json`. The status line shows a dim
+notice when a newer release is available. Nothing is updated automatically. Opt out with
+`SUBAGENT_MCP_UPDATE_CHECK=0`. To update: `git fetch --tags`, `git checkout <tag>`, then
+`npm ci && npm run build`, and restart. Rebuilding in a live checkout can drop a running session's host
+connection, so do it between sessions.
+
 ## Known gaps
 
 - The approval heuristic (`src/approval/policy.ts`) catches the common dangerous patterns

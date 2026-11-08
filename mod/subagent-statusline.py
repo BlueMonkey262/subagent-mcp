@@ -82,13 +82,14 @@ try:  # prune files of dead sessions (untouched for a day)
 except Exception:
     pass
 
+# Missing/stale live file: no agent rows (same as before), but still allow an update notice below.
+agents = []
 try:
     live = json.load(open(os.path.join(LIVE_DIR, session["session_id"] + ".json")))
-    if time.time() * 1000 - live["at"] > 10000:  # poller stopped; don't show ghosts
-        sys.exit(0)
-    agents = [a for a in live["agents"] if a.get("state") in LIVE]
+    if time.time() * 1000 - live["at"] <= 10000:  # fresh poll; skip when poller stopped (no ghosts)
+        agents = [a for a in live["agents"] if a.get("state") in LIVE]
 except Exception:
-    sys.exit(0)
+    pass
 
 saved = {}
 for d in here:
@@ -127,3 +128,20 @@ for a in agents:
         print(f"{BLUE}!{RESET} {row} {BLUE}needs approval{RESET}{used}")
     else:
         print(f"{row} {DIM}{elapsed(a['created_at'])}{RESET}{used}")
+
+# Host-written update cache; never network. One dim line if any project dir reports an available release.
+def _safe_ver(s):
+    return re.sub(r"[\x00-\x1f\x7f]", "", s) if isinstance(s, str) else None
+
+for d in here:
+    try:
+        data = json.load(open(os.path.join(d, ".subagents", "memory", "update.json")))
+        if data.get("available") is not True:
+            continue
+        current, latest = _safe_ver(data.get("current")), _safe_ver(data.get("latest"))
+        if current is None or latest is None:
+            continue
+        print(f"{DIM}subagent-mcp {latest} available (you have {current}){RESET}")
+        break
+    except Exception:
+        pass
