@@ -244,42 +244,6 @@ async function main(): Promise<void> {
     },
   );
 
-  server.registerTool(
-    "record_outcome",
-    {
-      title: "Record outcome",
-      description: "Record your subjective verdict on a completed delegation, for future routing decisions.",
-      inputSchema: {
-        agent: z.string(),
-        verdict: z.enum(["success", "partial", "failure"]),
-        score: z.number().min(0).max(1).optional(),
-        notes: z.string().optional(),
-      },
-    },
-    async ({ agent, verdict, score, notes }) => {
-      await call("record_outcome", {
-        agent,
-        verdict,
-        ...(score === undefined ? {} : { score }),
-        ...(notes === undefined ? {} : { notes }),
-      });
-      return toContent({ recorded: true });
-    },
-  );
-
-  server.registerTool(
-    "add_note",
-    {
-      title: "Add routing note",
-      description: "Append a free-form delegation note to project or user routing memory.",
-      inputSchema: { text: z.string(), scope: z.enum(["project", "user"]).optional() },
-    },
-    async ({ text, scope }) => {
-      await call("add_note", { text, ...(scope === undefined ? {} : { scope }) });
-      return toContent({ recorded: true });
-    },
-  );
-
   const transport = new StdioServerTransport();
   await server.connect(transport);
 

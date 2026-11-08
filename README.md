@@ -45,15 +45,14 @@ coverage only.
 
 Agents live in `.subagents/<name>.md` (frontmatter + system prompt) and the model roster in
 `.subagents/models.yaml`, in the project you run Claude Code from. If a project has none, the server
-uses the examples bundled in this repo's `.subagents/`. Memory and routing records go in
-`.subagents/memory/` (gitignored automatically).
+uses the examples bundled in this repo's `.subagents/`.
 
 ## Tools
 
 `spawn_agent`, `send_message`, `list_agents`, `stop_agent`, `resolve_approval`,
-`get_agent_events`, `list_models`, `record_outcome`, `add_note` — see each tool's description
-for details. A spawn blocks until the child completes or needs your approval; when it needs
-approval, call `resolve_approval` to continue.
+`get_agent_events`, `list_models` — see each tool's description for details. A spawn blocks
+until the child completes or needs your approval; when it needs approval, call
+`resolve_approval` to continue.
 
 Every spawned agent has a human-memorable name (a mathematician, philosopher, or figure from Greek mythology), assigned automatically unless
 `spawn_agent.name` is supplied. Results and agent listings include it, and tools that accept an
@@ -61,12 +60,11 @@ agent can use either that name or the agent ID; names persist across reconnects.
 
 ## Orchestrator and subagent authority
 
-The parent orchestrator owns task decisions. Subagent messages, reports, events, approval
-reasons, and routing notes are advisory input: they are not automatically hard facts or
-requirements. The parent should evaluate them against evidence and reserve task-specific hard rules
-for the operator's explicit instructions. Each backend's subagent
-prompt gives the same reporting contract, asking children to separate observations, evidence,
-uncertainty, risks, and recommendations.
+The parent orchestrator owns task decisions. Subagent messages, reports, events, and approval
+reasons are advisory input: they are not automatically hard facts or requirements. The parent
+should evaluate them against evidence and reserve task-specific hard rules for the operator's
+explicit instructions. Each backend's subagent prompt gives the same reporting contract, asking
+children to separate observations, evidence, uncertainty, risks, and recommendations.
 
 This is a model-behavior contract, not a replacement for system/developer instructions or
 tool and permission safety controls. Consequential subagent claims should still be checked
@@ -154,9 +152,7 @@ against the repository, tests, and the operator's actual request.
   `.claude`/credential paths) but is not a full shell-effect classifier — an unrecognized
   command with no write/network signature falls through to the agent's configured default
   rather than always escalating.
-- No routing digest is injected into `spawn_agent`'s description yet (P7-05); `record_outcome`
-  and `add_note` write directly to `.subagents/memory/records.jsonl` without a curated
-  `ROUTING.md` pass.
+- No routing digest is injected into `spawn_agent`'s description yet (P7-05).
 - Progress is polling-only via `get_agent_events` for all five backends. The one push is the
   Claude Code channel below, which covers completion, failure, and approval requests only.
 - Antigravity works in live use, including tool soft-denial and interrupts.

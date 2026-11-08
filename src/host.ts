@@ -16,7 +16,8 @@ import { isBackend } from "./core/types.js";
 import type { EventReadOptions } from "./events/buffer.js";
 import type { NormalizedEventType } from "./events/schema.js";
 import type { ListAgentsInput, AgentSnapshot, SendMessageInput, SpawnAgentInput, Supervisor } from "./supervisor.js";
-import { Supervisor as SupervisorClass, defaultProjectRouting } from "./supervisor.js";
+import { Supervisor as SupervisorClass } from "./supervisor.js";
+import { ensureProjectMemoryIgnored } from "./storage/routing.js";
 import { UsageLedger } from "./usage.js";
 
 export const HOST_PROTOCOL = 2;
@@ -187,9 +188,10 @@ export async function runHost(): Promise<void> {
 
   const live = new LiveConfig({ agentsDirectory, modelsFile });
   await live.reload();
+  // Sessions, the lock and the usage ledger live in .subagents/memory; keep it out of the user's git.
+  await ensureProjectMemoryIgnored(cwd).catch(() => undefined);
   const usage = new UsageLedger(paths.usagePath);
   await usage.load();
-  const routing = await defaultProjectRouting(cwd).catch(() => undefined);
   const claude = new ClaudeAdapter();
   const codex = new CodexAdapter();
   const opencode = new OpenCodeAdapter();
@@ -202,7 +204,6 @@ export async function runHost(): Promise<void> {
     cwd,
     usage,
     maxConcurrent: live.maxConcurrent(),
-    ...(routing === undefined ? {} : { routing }),
     onDetachedSettled: (result) => endpoint?.notify({ event: "detached", data: result }),
   });
   live.watch(() => supervisor.setMaxConcurrent(live.maxConcurrent()));
@@ -442,22 +443,6 @@ async function dispatch(supervisor: Supervisor, method: string, params: unknown)
     }
     case "list_models":
       return supervisor.listModels(isBackend(input["backend"]) ? input["backend"] : undefined);
-    case "record_outcome": {
-      const agent = requiredString(input, "agent");
-      const verdict = requiredVerdict(input["verdict"]);
-      const score = input["score"];
-      const notes = input["notes"];
-      if (typeof score === "number" && typeof notes === "string") await supervisor.recordOutcome(agent, verdict, score, notes);
-      else if (typeof score === "number") await supervisor.recordOutcome(agent, verdict, score);
-      else if (typeof notes === "string") await supervisor.recordOutcome(agent, verdict, undefined, notes);
-      else await supervisor.recordOutcome(agent, verdict);
-      return { recorded: true };
-    }
-    case "add_note": {
-      const scope = input["scope"];
-      await supervisor.addNote(requiredString(input, "text"), scope === "user" ? "user" : "project");
-      return { recorded: true };
-    }
     case "shutdown": {
       const { active, waiting } = supervisor.concurrency();
       if (active > 0 || waiting > 0) {
@@ -707,11 +692,6 @@ function requiredString(record: Readonly<Record<string, unknown>>, key: string):
 function requiredDecision(value: unknown): "allow" | "allow_for_session" | "deny" {
   if (value === "allow" || value === "allow_for_session" || value === "deny") return value;
   throw new Error("decision must be allow, allow_for_session, or deny");
-}
-
-function requiredVerdict(value: unknown): "success" | "partial" | "failure" {
-  if (value === "success" || value === "partial" || value === "failure") return value;
-  throw new Error("verdict must be success, partial, or failure");
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
