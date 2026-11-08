@@ -231,27 +231,29 @@ export class Supervisor {
       (!input.states || input.states.includes(r.state as string)) &&
       (!input.backend || r.backend === input.backend) &&
       (!input.updated_since || String(r.updated_at) >= input.updated_since));
-    let after: { time: string; id: string } | undefined;
+    let after: { created_at: string; agent_id: string } | undefined;
     if (input.cursor) {
       try { after = JSON.parse(Buffer.from(input.cursor, 'base64url').toString('utf8')); }
       catch { throw new SupervisorError('Invalid cursor'); }
-      if (!after || typeof after.time !== 'string' || typeof after.id !== 'string') throw new SupervisorError('Invalid cursor');
+      if (!after || typeof after.created_at !== 'string' || typeof after.agent_id !== 'string') throw new SupervisorError('Invalid cursor');
     }
-    const sorted = records.sort((a,b) => String(b.updated_at).localeCompare(String(a.updated_at)) || String(a.agent_id).localeCompare(String(b.agent_id)));
-    const filtered = after ? sorted.filter(r => String(r.updated_at) < after!.time || (r.updated_at === after!.time && String(r.agent_id) > after!.id)) : sorted;
+    const sorted = records.sort((a,b) => String(a.created_at).localeCompare(String(b.created_at)) || String(a.agent_id).localeCompare(String(b.agent_id)));
+    const filtered = after ? sorted.filter(r => String(r.created_at) > after!.created_at || (r.created_at === after!.created_at && String(r.agent_id) > after!.agent_id)) : sorted;
     const limit = Math.min(100, Math.max(1, input.limit ?? 25));
     const page = filtered.slice(0, limit);
     const last = page.at(-1);
     return { agents: page,
-      next_cursor: filtered.length > limit && last ? Buffer.from(JSON.stringify({ time: last.updated_at, id: last.agent_id })).toString('base64url') : null,
+      next_cursor: filtered.length > limit && last ? Buffer.from(JSON.stringify({ created_at: last.created_at, agent_id: last.agent_id })).toString('base64url') : null,
       concurrency: this.concurrency(), config_warning: this.#registry.configWarning(), storage_error: this.#storageError };
   }
 
   listAgents(): readonly Readonly<Record<string, unknown>>[] {
-    return [...this.#agents.values()].sort((a,b) => b.updatedAt.localeCompare(a.updatedAt) || a.id.localeCompare(b.id))
-      .map(record => this.#publicRecord(record)).concat([...this.#pending.values()].filter(task => !task.result?.agent_id).map(task => ({
-        agent_id: task.id, state: task.state, backend: task.input.backend, updated_at: task.created_at, group_id: task.input.group_id,
-      })));
+    return [...this.#agents.values()].map(record => this.#publicRecord(record))
+      .concat([...this.#pending.values()].filter(task => !task.result?.agent_id).map(task => ({
+        agent_id: task.id, state: task.state, backend: task.input.backend, created_at: task.created_at,
+        updated_at: task.created_at, group_id: task.input.group_id,
+      })))
+      .sort((a,b) => String(a.created_at).localeCompare(String(b.created_at)) || String(a.agent_id).localeCompare(String(b.agent_id)));
   }
 
   listAgentConfigs() {
@@ -260,11 +262,18 @@ export class Supervisor {
       config_warning: this.#registry.configWarning() };
   }
 
-  async waitForAgents(agents: readonly string[], mode: 'any' | 'all' = 'all', timeout = 60) {
+  async waitForAgents(agents: readonly string[], mode: 'any' | 'all' = 'all', timeout = 60, since?: string) {
     if (!agents.length) throw new SupervisorError('At least one agent is required');
-    const states = () => agents.map(agent => this.#pending.has(agent) ? this.#pending.get(agent)!.result?.agent_id ? this.#requireRecord(String(this.#pending.get(agent)!.result!.agent_id)).state : this.#pending.get(agent)!.state : this.#requireRecord(agent).state);
-    const ready = () => { const values = states(); return values.includes('needs_approval') ||
-      (mode === 'all' ? values.every(v => !['starting','running','queued'].includes(v)) : values.some(v => !['starting','running','queued'].includes(v))); };
+    const statuses = () => agents.map(identifier => {
+      const task = this.#pending.get(identifier);
+      if (task && !task.result?.agent_id) return { identifier, state: task.state, updated_at: task.created_at };
+      const record = this.#requireRecord(identifier);
+      return { identifier, state: record.state, updated_at: record.updatedAt };
+    });
+    const newlySettled = () => statuses().filter(status =>
+      !['starting','running','queued'].includes(status.state) && (!since || status.updated_at > since));
+    const ready = () => { const settled = newlySettled(); return settled.some(status => status.state === 'needs_approval') ||
+      (mode === 'all' ? settled.length === agents.length : settled.length > 0); };
     let timed_out = false;
     await new Promise<void>((resolve, reject) => {
       let timer: NodeJS.Timeout;
@@ -275,7 +284,8 @@ export class Supervisor {
       check();
     });
     await this.#writes;
-    return { timed_out, agents: agents.map(agent => this.#pending.has(agent) && !this.#pending.get(agent)!.result?.agent_id ? this.#pending.get(agent) : this.#result(this.#requireRecord(agent))) };
+    return { timed_out, newly_settled: newlySettled().map(status => status.identifier),
+      agents: agents.map(agent => this.#pending.has(agent) && !this.#pending.get(agent)!.result?.agent_id ? this.#pending.get(agent) : this.#result(this.#requireRecord(agent))) };
   }
 
   getAgentResult(agent: string, turn?: number, offset = 0, limit = 25): Record<string, unknown> | PendingTask {

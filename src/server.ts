@@ -138,8 +138,9 @@ async function main(): Promise<void> {
 
   server.registerTool('list_agent_configs', { description: 'Discover callable configs, source files, pinned options and backend capabilities', inputSchema: {} },
     async () => toContent(await call('list_agent_configs')));
-  server.registerTool('wait_for_agents', { description: 'Event-driven join; returns on any/all completion, approval, or timeout without stopping agents. Maximum 60 seconds.',
-    inputSchema: { agents: z.array(z.string()).min(1), mode: z.enum(['any','all']).optional(), timeout_seconds: z.number().min(0).max(60).optional() } },
+  server.registerTool('wait_for_agents', { description: 'Event-driven join; returns on any/all completion, approval, or timeout without stopping agents. Pass since to wait only for agents that settle after that timestamp; newly_settled identifies them. Maximum 60 seconds.',
+    inputSchema: { agents: z.array(z.string()).min(1), mode: z.enum(['any','all']).optional(), timeout_seconds: z.number().min(0).max(60).optional(),
+      since: z.iso.datetime().optional().describe('Only agents settled after this timestamp count toward readiness.') } },
     async input => toContent(await call('wait_for_agents', input)));
   server.registerTool('get_agent_result', { description: 'Retrieve persisted results and paginated turn history after reconnect or resume',
     inputSchema: { agent: z.string(), turn: z.number().int().positive().optional(), offset: z.number().int().min(0).optional(), limit: z.number().int().min(1).max(100).optional() } },
