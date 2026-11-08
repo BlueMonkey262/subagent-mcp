@@ -1,6 +1,6 @@
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
-import { readdirSync, readFileSync } from "node:fs";
+import { readdirSync, readFileSync, statSync } from "node:fs";
 import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { createConnection, createServer, type Server, type Socket } from "node:net";
 import { tmpdir } from "node:os";
@@ -21,52 +21,86 @@ import { UsageLedger } from "./usage.js";
 
 export const HOST_PROTOCOL = 2;
 
-/**
- * Fingerprint of the compiled code this process loaded: a hash of every `.js` file next to this
- * module, taken at import time so a later rebuild on disk does not change it. A proxy that finds an
- * idle host with a different build replaces it, so rebuilding and reconnecting picks up new code.
- */
-const LOADED_BUILD = hashBuild(dirname(fileURLToPath(import.meta.url)));
+/** A fingerprint of compiled code: a hash of the `.js` files, and when the newest of them was written. */
+export interface BuildInfo {
+  readonly build: string;
+  /** Newest file mtime (ms). Orders builds, so a proxy never replaces a host with older code. */
+  readonly builtAt: number;
+}
 
-function hashBuild(directory: string): string {
+const BUILD_DIRECTORY = dirname(fileURLToPath(import.meta.url));
+
+/**
+ * The build this process loaded, taken at import time so a later rebuild on disk does not change
+ * it. A proxy that finds an idle host on an older build, with no other session attached, replaces
+ * it, so rebuilding and reconnecting picks up new code.
+ */
+const LOADED_BUILD = readBuild(BUILD_DIRECTORY);
+
+function readBuild(directory: string): BuildInfo {
   const hash = createHash("sha256");
+  let builtAt = 0;
   try {
     const files = readdirSync(directory, { recursive: true, encoding: "utf8" })
       .filter((file) => file.endsWith(".js"))
       .sort();
     for (const file of files) {
-      hash.update(file).update("\0").update(readFileSync(join(directory, file))).update("\0");
+      const path = join(directory, file);
+      hash.update(file).update("\0").update(readFileSync(path)).update("\0");
+      builtAt = Math.max(builtAt, statSync(path).mtimeMs);
     }
   } catch {
-    return "unknown";
+    return { build: "unknown", builtAt: 0 };
   }
-  return hash.digest("hex").slice(0, 16);
+  return { build: hash.digest("hex").slice(0, 16), builtAt: Math.floor(builtAt) };
 }
 
-/** This process's build. `SUBAGENT_MCP_BUILD_ID` overrides it (tests). */
-export function buildId(): string {
-  return process.env.SUBAGENT_MCP_BUILD_ID ?? LOADED_BUILD;
+/** This process's build. `SUBAGENT_MCP_BUILD_ID` / `SUBAGENT_MCP_BUILD_TIME` override it (tests). */
+export function buildInfo(): BuildInfo {
+  const time = Number(process.env.SUBAGENT_MCP_BUILD_TIME);
+  return {
+    build: process.env.SUBAGENT_MCP_BUILD_ID ?? LOADED_BUILD.build,
+    builtAt: Number.isFinite(time) && process.env.SUBAGENT_MCP_BUILD_TIME !== undefined ? time : LOADED_BUILD.builtAt,
+  };
+}
+
+/** The build currently on disk, which differs from `buildInfo()` after a rebuild. */
+export function diskBuildInfo(): BuildInfo {
+  return process.env.SUBAGENT_MCP_DISK_BUILD_ID !== undefined
+    ? { build: process.env.SUBAGENT_MCP_DISK_BUILD_ID, builtAt: Number(process.env.SUBAGENT_MCP_BUILD_TIME ?? 0) }
+    : readBuild(BUILD_DIRECTORY);
 }
 
 export interface HostHello {
   readonly protocol?: number;
   readonly pid?: number;
   readonly build?: string;
+  readonly builtAt?: number;
+  /** Connected clients, including the one asking. */
+  readonly clients?: number;
   readonly active?: number;
   readonly waiting?: number;
 }
 
+export type HostDisposition = "keep" | "newer" | "stale" | "replace" | "refuse";
+
 /**
- * What a connecting proxy does with a host: keep it, or replace it because it speaks another
- * protocol or runs an older build. A host with agents running or waiting is never replaced; with
- * a mismatched build it is kept and reported stale, with a mismatched protocol it is refused.
+ * What a connecting proxy does with a host:
+ * - `keep`: same build.
+ * - `newer`: the host runs newer code than this proxy; keep it (never downgrade) and reconnect the proxy.
+ * - `replace`: the host runs older code (or predates build reporting), is idle, and no other session uses it.
+ * - `stale`: older code, but agents are running or waiting, or another session is attached; keep it for now.
+ * - `refuse`/`replace` on a protocol mismatch, by whether agents are running.
  */
-export function hostDisposition(hello: HostHello, build: string): "keep" | "stale" | "replace" | "refuse" {
+export function hostDisposition(hello: HostHello, local: BuildInfo): HostDisposition {
   const busy = (hello.active ?? 0) > 0 || (hello.waiting ?? 0) > 0;
   if (hello.protocol !== HOST_PROTOCOL) return busy ? "refuse" : "replace";
-  if (hello.build === build) return "keep";
-  return busy ? "stale" : "replace";
+  if (hello.build === local.build) return "keep";
+  if (typeof hello.builtAt === "number" && hello.builtAt > local.builtAt) return "newer";
+  const otherClients = Math.max(0, (hello.clients ?? 1) - 1);
+  return busy || otherClients > 0 ? "stale" : "replace";
 }
+
 const IDLE_EXIT_MS = 60_000;
 const CONNECT_WAIT_MS = 8_000;
 const RECORDED_HOST_WAIT_MS = 2_000;
@@ -126,7 +160,7 @@ export async function serveHost(options: {
           if (shuttingDown) return;
           shuttingDown = true;
           options.onShutdown?.();
-        });
+        }, { clients: () => sockets.size });
       }
     });
     const drop = (): void => {
@@ -204,26 +238,113 @@ export async function connectHost(options: {
   return waitForHost(paths.socketPath);
 }
 
+const RESTART_EXIT_WAIT_MS = 10_000;
+
 /**
- * Replace the project host with one running the code now on disk, keeping agent records (they are
- * restored from the snapshot). Refuses while agents are running or waiting, like `shutdown`.
+ * The proxy's connection to its project host, and the one place that replaces it. Owns the client
+ * so a failed restart never leaves tool calls on a closed connection.
  */
-export async function restartHost(client: HostClient | undefined, options: Parameters<typeof connectHost>[0]): Promise<{
-  readonly client: HostClient;
-  readonly previousPid?: number;
-}> {
-  let previousPid: number | undefined;
-  if (client !== undefined) {
-    const hello = await client.call("hello", undefined, 2_000).catch(() => undefined) as HostHello | undefined;
-    previousPid = positiveInteger(hello?.pid);
-    if (hello !== undefined) {
-      await client.call("shutdown", undefined, 5_000);
-      client.close();
-      if (previousPid !== undefined) await waitForExit(previousPid, RECORDED_HOST_WAIT_MS);
+export class HostSession {
+  #client: HostClient | undefined;
+  #error: Error | undefined;
+  readonly #detached: ((data: Readonly<Record<string, unknown>>) => void)[] = [];
+
+  constructor(readonly options: Parameters<typeof connectHost>[0]) {}
+
+  async connect(): Promise<void> {
+    try {
+      this.#attach(await connectHost(this.options));
+    } catch (error) {
+      this.#fail(error);
     }
   }
-  const next = await connectHost(options);
-  return { client: next, ...(previousPid === undefined ? {} : { previousPid }) };
+
+  onDetached(listener: (data: Readonly<Record<string, unknown>>) => void): void {
+    this.#detached.push(listener);
+    this.#client?.onDetached(listener);
+  }
+
+  async call(method: string, params?: unknown): Promise<unknown> {
+    if (this.#client === undefined) {
+      throw this.#error ?? new Error("subagent-mcp host is not connected. Ask the user to run `/mcp` and then reconnect subagent-mcp.");
+    }
+    return this.#client.call(method, params);
+  }
+
+  /** Why the connected host's code differs from this proxy's, if it does. */
+  warning(): string | undefined {
+    const host = this.#client?.host;
+    const local = buildInfo();
+    if (host === undefined || host.build === local.build) return undefined;
+    if (typeof host.builtAt === "number" && host.builtAt > local.builtAt) {
+      return "The subagent-mcp host runs newer code than this MCP connection. Ask the user to run `/mcp` and " +
+        "reconnect subagent-mcp to load updated tool definitions.";
+    }
+    return "The subagent-mcp host runs an older build than this MCP connection, because agents were running or " +
+      "another session was attached when it connected. Once agents finish and other sessions disconnect, call " +
+      "restart_host to load the new code.";
+  }
+
+  /**
+   * Replace the host with one running the code on disk. Refused while agents run or wait (always),
+   * and, unless `force`, when the host already runs the code on disk or other sessions are attached
+   * (replacing it would drop their connections).
+   */
+  async restart(force = false): Promise<Readonly<Record<string, unknown>>> {
+    const client = this.#client;
+    const hello = client === undefined ? undefined : await client.call("hello", undefined, 2_000).catch(() => undefined) as HostHello | undefined;
+    if (hello !== undefined && client !== undefined) {
+      if ((hello.active ?? 0) > 0 || (hello.waiting ?? 0) > 0) {
+        throw new Error("subagent-mcp host still has running agents and will not restart; wait for them to finish.");
+      }
+      if (!force && hello.build === diskBuildInfo().build) {
+        throw new Error("The subagent-mcp host already runs the code on disk; there is nothing to reload. Pass force: true to restart anyway.");
+      }
+      const others = Math.max(0, (hello.clients ?? 1) - 1);
+      if (!force && others > 0) {
+        throw new Error(
+          `${others} other session(s) are connected to this subagent-mcp host; restarting would disconnect them. ` +
+            "Ask the user, then pass force: true to restart anyway.",
+        );
+      }
+      await client.call("shutdown", undefined, 5_000);
+      client.close();
+      this.#client = undefined;
+      const pid = positiveInteger(hello.pid);
+      if (pid !== undefined) await waitForExit(pid, RESTART_EXIT_WAIT_MS);
+    }
+    try {
+      this.#attach(await connectHost(this.options));
+    } catch (error) {
+      this.#fail(error);
+      throw this.#error;
+    }
+    const next = this.#client!.host;
+    return {
+      restarted: true,
+      ...(hello?.pid === undefined ? {} : { previous_pid: hello.pid }),
+      pid: next?.pid,
+      build: next?.build,
+      build_changed: hello?.build !== next?.build,
+      ...(this.warning() === undefined ? {} : { host_warning: this.warning() }),
+    };
+  }
+
+  close(): void {
+    this.#client?.close();
+  }
+
+  #attach(client: HostClient): void {
+    this.#client = client;
+    this.#error = undefined;
+    for (const listener of this.#detached) client.onDetached(listener);
+  }
+
+  #fail(error: unknown): void {
+    this.#client = undefined;
+    const message = error instanceof Error ? error.message : String(error);
+    this.#error = new Error(message.includes("/mcp") ? message : `${message} Ask the user to run \`/mcp\` and then reconnect subagent-mcp.`);
+  }
 }
 
 export async function runHost(): Promise<void> {
@@ -343,8 +464,8 @@ export class HostClient {
   #buffer = "";
   #nextId = 1;
   #closed = false;
-  /** The build the connected host reported in `hello`; differs from `buildId()` when the host is stale. */
-  hostBuild: string | undefined;
+  /** The host's `hello` when this client connected: its build, and whether it was kept as stale or newer. */
+  host: HostHello | undefined;
 
   static connect(socketPath: string, timeoutMs = 5_000): Promise<HostClient> {
     return new Promise((resolve, reject) => {
@@ -446,6 +567,7 @@ async function handleLine(
   line: string,
   supervisor: Supervisor,
   onShutdown: () => void,
+  context: DispatchContext,
 ): Promise<void> {
   let request: unknown;
   try {
@@ -461,7 +583,7 @@ async function handleLine(
   const id = request["id"];
   const method = request["method"];
   try {
-    const result = await dispatch(supervisor, method, request["params"]);
+    const result = await dispatch(supervisor, method, request["params"], context);
     socket.write(`${JSON.stringify({ id, result })}\n`);
     if (method === "shutdown") setTimeout(onShutdown, 30);
   } catch (error) {
@@ -473,13 +595,25 @@ async function handleLine(
 }
 
 /** The build this host process started with (see `buildId`); fixed for the life of the process. */
-const HOST_BUILD = buildId();
+const HOST_BUILD = buildInfo();
 
-async function dispatch(supervisor: Supervisor, method: string, params: unknown): Promise<unknown> {
+interface DispatchContext {
+  /** Clients currently connected to this host. */
+  readonly clients: () => number;
+}
+
+async function dispatch(supervisor: Supervisor, method: string, params: unknown, context: DispatchContext): Promise<unknown> {
   const input = isRecord(params) ? params : {};
   switch (method) {
     case "hello":
-      return { protocol: HOST_PROTOCOL, pid: process.pid, build: HOST_BUILD, ...supervisor.concurrency() };
+      return {
+        protocol: HOST_PROTOCOL,
+        pid: process.pid,
+        build: HOST_BUILD.build,
+        builtAt: HOST_BUILD.builtAt,
+        clients: context.clients(),
+        ...supervisor.concurrency(),
+      };
     case "spawn_agent":
       return supervisor.spawnAgent(input as unknown as SpawnAgentInput);
     case "send_message":
@@ -596,10 +730,10 @@ async function connectCompatibleHost(socketPath: string): Promise<{
   let keep = false;
   try {
     const hello = await client.call("hello", undefined, 2_000) as HostHello;
-    const disposition = hostDisposition(hello, buildId());
-    if (disposition === "keep" || disposition === "stale") {
+    const disposition = hostDisposition(hello, buildInfo());
+    if (disposition === "keep" || disposition === "stale" || disposition === "newer") {
       keep = true;
-      client.hostBuild = hello.build;
+      client.host = hello;
       const pid = positiveInteger(hello.pid);
       return { client, ...(pid === undefined ? {} : { pid }) };
     }
@@ -705,7 +839,7 @@ async function waitForHost(socketPath: string): Promise<HostClient> {
         client.close();
         throw new Error(`subagent-mcp host protocol is ${String(hello.protocol)}, this client speaks ${HOST_PROTOCOL}`);
       }
-      client.hostBuild = hello.build;
+      client.host = hello;
       return client;
     } catch (error) {
       lastError = error;

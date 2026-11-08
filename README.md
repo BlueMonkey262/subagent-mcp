@@ -147,11 +147,15 @@ against the repository, tests, and the operator's actual request.
   to `.subagents/` are picked up without a restart. If no config is loaded, tool calls return
   the files to create and ask the user to run `/mcp` and then reconnect `subagent-mcp`.
 - **Picking up code changes.** After rebuilding subagent-mcp (`npm run build`), run `/mcp` and
-  reconnect. The proxy compares a hash of the compiled code with the host's, and replaces an idle
-  host that runs an older build; agent records, results and usage carry over. If agents are
-  running, the host is left alone and tool responses carry a `host_warning`; once they finish,
-  `restart_host` loads the new code without another reconnect. Changes to tool definitions need
-  the `/mcp` reconnect either way.
+  reconnect. The host reports a fingerprint of the compiled code it loaded and when it was built;
+  the reconnecting proxy replaces the host only when it runs *older* code, is idle, and no other
+  Claude Code session is attached. Agent records, results and usage carry over. A host running
+  newer code than the proxy is never downgraded; tool responses then carry a `host_warning` to
+  reconnect. When agents are running or another session is attached, the old host is kept and the
+  `host_warning` says so; `restart_host` then reloads it once agents finish. `restart_host` is
+  always refused while agents are running or waiting, and also refused when the host already runs
+  the code on disk or other sessions are attached, unless called with `force: true`. Changes to
+  tool definitions need the `/mcp` reconnect either way.
 
 ## Known gaps
 

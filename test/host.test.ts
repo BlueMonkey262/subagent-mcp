@@ -11,7 +11,7 @@ import { FakeAdapter } from "../src/adapters/fake.js";
 import { LiveConfig } from "../src/config/live.js";
 import { ConfigRegistry } from "../src/config/registry.js";
 import type { AgentConfig, ModelRoster } from "../src/config/schema.js";
-import { buildId, connectHost, HOST_PROTOCOL, hostDisposition, hostPaths, HostClient, restartHost, serveHost } from "../src/host.js";
+import { buildInfo, connectHost, HOST_PROTOCOL, hostDisposition, hostPaths, HostClient, HostSession, serveHost } from "../src/host.js";
 import { Supervisor } from "../src/supervisor.js";
 
 const permission = { allow: [], deny: [], default: "escalate" as const };
@@ -303,64 +303,166 @@ test("connectHost refuses to duplicate a live recorded pid with a missing socket
   assert.equal(JSON.parse(await readFile(paths.pidPath, "utf8")).pid, process.pid);
 });
 
-test("hostDisposition replaces idle hosts on another build or protocol and never touches busy ones", () => {
-  const build = "new";
-  assert.equal(hostDisposition({ protocol: HOST_PROTOCOL, build }, build), "keep");
-  assert.equal(hostDisposition({ protocol: HOST_PROTOCOL, build, active: 2 }, build), "keep");
-  assert.equal(hostDisposition({ protocol: HOST_PROTOCOL, build: "old" }, build), "replace");
-  assert.equal(hostDisposition({ protocol: HOST_PROTOCOL }, build), "replace", "a host from before builds were reported is stale");
-  assert.equal(hostDisposition({ protocol: HOST_PROTOCOL, build: "old", active: 1 }, build), "stale");
-  assert.equal(hostDisposition({ protocol: HOST_PROTOCOL, build: "old", waiting: 1 }, build), "stale");
-  assert.equal(hostDisposition({ protocol: HOST_PROTOCOL - 1 }, build), "replace");
-  assert.equal(hostDisposition({ protocol: HOST_PROTOCOL - 1, active: 1 }, build), "refuse");
-  assert.match(buildId(), /^[0-9a-f]{16}$|^unknown$/);
+/** Run `body` with build-identity env overrides, restoring the previous values afterwards. */
+async function withBuildEnv<T>(env: Record<string, string | undefined>, body: () => Promise<T>): Promise<T> {
+  const saved = Object.fromEntries(Object.keys(env).map((key) => [key, process.env[key]]));
+  const apply = (values: Record<string, string | undefined>) => {
+    for (const [key, value] of Object.entries(values)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  };
+  apply(env);
+  try {
+    return await body();
+  } finally {
+    apply(saved);
+  }
+}
+
+const buildEnv = (id: string, time: number) => ({ SUBAGENT_MCP_BUILD_ID: id, SUBAGENT_MCP_BUILD_TIME: String(time) });
+
+test("hostDisposition: replace only an older, idle host no other session uses; never downgrade", () => {
+  const local = { build: "new", builtAt: 2_000 };
+  const host = (extra: Record<string, unknown>) => ({ protocol: HOST_PROTOCOL, clients: 1, ...extra });
+  assert.equal(hostDisposition(host({ build: "new", builtAt: 2_000, active: 2 }), local), "keep");
+  assert.equal(hostDisposition(host({ build: "old", builtAt: 1_000 }), local), "replace");
+  assert.equal(hostDisposition(host({}), local), "replace", "a host from before builds were reported is older");
+  assert.equal(hostDisposition(host({ build: "old", builtAt: 1_000, active: 1 }), local), "stale");
+  assert.equal(hostDisposition(host({ build: "old", builtAt: 1_000, waiting: 1 }), local), "stale");
+  assert.equal(hostDisposition(host({ build: "old", builtAt: 1_000, clients: 2 }), local), "stale", "another session is attached");
+  assert.equal(hostDisposition(host({ build: "newer", builtAt: 3_000 }), local), "newer", "never downgrade");
+  assert.equal(hostDisposition({ protocol: HOST_PROTOCOL - 1 }, local), "replace");
+  assert.equal(hostDisposition({ protocol: HOST_PROTOCOL - 1, active: 1 }, local), "refuse");
+  assert.match(buildInfo().build, /^[0-9a-f]{16}$|^unknown$/);
 });
 
-test("reconnecting replaces an idle host running another build", { timeout: 20_000 }, async () => {
+test("reconnecting replaces an idle host on an older build", { timeout: 20_000 }, async () => {
   const cwd = await mkdtemp(join(tmpdir(), "subagent-host-rebuild-"));
   const options = daemonOptions(cwd);
   await mkdir(options.agentsDirectory, { recursive: true });
-  const saved = process.env.SUBAGENT_MCP_BUILD_ID;
-  let first: HostClient | undefined;
-  let second: HostClient | undefined;
   try {
-    process.env.SUBAGENT_MCP_BUILD_ID = "build-a";
-    first = await connectHost(options);
-    const before = await first.call("hello") as { pid: number; build: string };
+    const before = await withBuildEnv(buildEnv("build-a", 1_000), async () => {
+      const client = await connectHost(options);
+      const hello = await client.call("hello") as { pid: number; build: string; clients: number };
+      client.close();
+      return hello;
+    });
     assert.equal(before.build, "build-a");
-    first.close();
-    first = undefined;
-
-    process.env.SUBAGENT_MCP_BUILD_ID = "build-b";
-    second = await connectHost(options);
-    const after = await second.call("hello") as { pid: number; build: string };
+    assert.equal(before.clients, 1);
+    const after = await withBuildEnv(buildEnv("build-b", 2_000), async () => {
+      const client = await connectHost(options);
+      const hello = await client.call("hello") as { pid: number; build: string };
+      client.close();
+      return hello;
+    });
     assert.equal(after.build, "build-b");
     assert.notEqual(after.pid, before.pid);
-    assert.equal(second.hostBuild, "build-b");
     await waitForPidExit(before.pid);
   } finally {
-    if (saved === undefined) delete process.env.SUBAGENT_MCP_BUILD_ID;
-    else process.env.SUBAGENT_MCP_BUILD_ID = saved;
-    first?.close();
-    second?.close();
     await stopDaemon(cwd);
   }
 });
 
-test("restartHost refuses while an agent is running and leaves the host up", async () => {
+test("a host another session is using is kept, and restart_host refuses without force", { timeout: 20_000 }, async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "subagent-host-shared-"));
+  const options = daemonOptions(cwd);
+  await mkdir(options.agentsDirectory, { recursive: true });
+  let sessionA: HostClient | undefined;
+  const sessionB = new HostSession(options);
+  try {
+    sessionA = await withBuildEnv(buildEnv("build-a", 1_000), () => connectHost(options));
+    const first = await sessionA.call("hello") as { pid: number };
+    await withBuildEnv({ ...buildEnv("build-b", 2_000), SUBAGENT_MCP_DISK_BUILD_ID: "build-b" }, async () => {
+      await sessionB.connect();
+      const shared = await sessionB.call("hello") as { pid: number; build: string; clients: number };
+      assert.equal(shared.pid, first.pid, "session A's host was not replaced");
+      assert.equal(shared.build, "build-a");
+      assert.equal(shared.clients, 2);
+      assert.match(sessionB.warning() ?? "", /older build/);
+      await assert.rejects(sessionB.restart(), /other session\(s\) are connected/);
+      assert.equal((await sessionA!.call("hello") as { pid: number }).pid, first.pid, "A is still connected");
+    });
+  } finally {
+    sessionA?.close();
+    sessionB.close();
+    await stopDaemon(cwd);
+  }
+});
+
+test("a host newer than the connecting proxy is never downgraded", { timeout: 20_000 }, async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "subagent-host-newer-"));
+  const options = daemonOptions(cwd);
+  await mkdir(options.agentsDirectory, { recursive: true });
+  try {
+    const newer = await withBuildEnv(buildEnv("build-new", 2_000), async () => {
+      const client = await connectHost(options);
+      const hello = await client.call("hello") as { pid: number };
+      client.close();
+      return hello;
+    });
+    await withBuildEnv(buildEnv("build-old", 1_000), async () => {
+      const session = new HostSession(options);
+      await session.connect();
+      assert.equal((await session.call("hello") as { pid: number }).pid, newer.pid);
+      assert.match(session.warning() ?? "", /newer code than this MCP connection/);
+      session.close();
+    });
+  } finally {
+    await stopDaemon(cwd);
+  }
+});
+
+test("a failed restart leaves a clear error instead of a closed connection", { timeout: 30_000 }, async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "subagent-host-failed-restart-"));
+  const options = { ...daemonOptions(cwd) };
+  await mkdir(options.agentsDirectory, { recursive: true });
+  const session = new HostSession(options);
+  try {
+    await withBuildEnv({ ...buildEnv("build-a", 1_000), SUBAGENT_MCP_DISK_BUILD_ID: "build-b" }, async () => {
+      await session.connect();
+      options.scriptPath = join(cwd, "missing-server.js"); // the replacement cannot start
+      await assert.rejects(session.restart(), /did not come up/);
+      await assert.rejects(session.call("hello"), /reconnect subagent-mcp/, "not \"connection is closed\"");
+    });
+  } finally {
+    session.close();
+    await stopDaemon(cwd);
+  }
+});
+
+test("restart is refused while an agent waits for approval, and the host stays up", async () => {
   const cwd = await mkdtemp(join(tmpdir(), "subagent-host-busy-"));
-  const adapter = new FakeAdapter("codex"); // no script: the turn stays running
+  const adapter = new FakeAdapter("codex");
+  adapter.queueScript([{
+    create: (context) => ({
+      type: "approval.requested",
+      agentId: context.agentId,
+      backend: context.backend,
+      data: {
+        requestId: "req-busy",
+        agentId: context.agentId,
+        backend: "codex" as const,
+        toolName: "Bash",
+        input: { command: "npm test" },
+        command: "npm test",
+        cwd,
+        requestedAt: new Date().toISOString(),
+      },
+    }),
+  }]);
   const supervisor = new Supervisor({ registry: registry(), adapters: new AdapterRegistry([adapter]), cwd });
   const paths = hostPaths(cwd);
   const endpoint = await serveHost({ socketPath: paths.socketPath, supervisor });
-  const client = await HostClient.connect(paths.socketPath);
+  const session = new HostSession(daemonOptions(cwd));
   try {
-    await client.call("spawn_agent", { agent: "general", prompt: "work", description: "busy", run_in_background: true });
-    await assert.rejects(restartHost(client, daemonOptions(cwd)), /running agents/);
-    const hello = await client.call("hello") as { active: number };
-    assert.equal(hello.active, 1, "the busy host is still serving");
+    await session.connect();
+    const spawned = await session.call("spawn_agent", { agent: "general", prompt: "work", description: "busy" }) as { status: string };
+    assert.equal(spawned.status, "needs_approval");
+    await assert.rejects(session.restart(true), /running agents/, "force never overrides running agents");
+    assert.equal((await session.call("hello") as { active: number }).active, 1, "the busy host is still serving");
   } finally {
-    client.close();
+    session.close();
     await endpoint.close();
     await rm(paths.socketPath, { force: true });
   }
