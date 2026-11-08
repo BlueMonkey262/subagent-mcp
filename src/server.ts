@@ -7,6 +7,7 @@ import { fileURLToPath } from "node:url";
 
 import { CHANNEL_CAPABILITY, CHANNEL_INSTRUCTIONS, createChannelNotifier } from "./channel.js";
 import { BACKENDS, isBackend } from "./core/types.js";
+import { NORMALIZED_EVENT_TYPES } from "./events/schema.js";
 import { connectHost, runHost, type HostClient } from "./host.js";
 import { ORCHESTRATOR_AUTHORITY_NOTICE } from "./prompt-policy.js";
 
@@ -192,21 +193,33 @@ async function main(): Promise<void> {
         "The response identifies the agent by both `name` and `agent_id`; prefer the name in conversation. " +
         "The response always includes `currentSequence` (the true latest sequence for this agent, even when " +
         "`events` is empty) so you can seek straight to \"now\" instead of bisecting `since`. Pass `limit` to " +
-        "cap how many events come back in one call; `hasMore` says whether more remain past `nextSequence`.",
+        "cap how many events come back in one call (applied after `types` filtering); `hasMore` says whether " +
+        "more remain past `nextSequence`. `types` keeps only the listed event types — raw logs are mostly tiny " +
+        "`message.delta` text chunks, so filtering to e.g. `tool.start`/`tool.end` cuts the noise. `coalesce` " +
+        "(default false) merges consecutive `message.delta` events into one on read, without changing storage. " +
+        "`summary: true` returns a compact digest (state, tool counts, last few tool calls, tail of the latest " +
+        "message) instead of the raw log — prefer it for progress checks; pass `since` with it to scope the " +
+        "digest to events after a previous `currentSequence`, so repeat calls only report what's new.",
       inputSchema: {
         agent: z.string(),
         since: z.number().int().nonnegative().optional(),
         limit: z.number().int().positive().optional().describe("Caps events returned in this call"),
+        types: z.array(z.enum(NORMALIZED_EVENT_TYPES)).optional().describe("Keep only events of these types"),
+        coalesce: z.boolean().optional().describe(
+          "Merge consecutive message.delta events into one on read (default false; does not change what's stored)",
+        ),
         summary: z.boolean().optional().describe(
           "Return a compact digest (state, tool counts, last few tool calls, tail of the latest message) instead of the raw log. Prefer this for progress checks.",
         ),
       },
     },
-    async ({ agent, since, limit, summary }) => toContent(await call("get_agent_events", {
+    async ({ agent, since, limit, types, coalesce, summary }) => toContent(await call("get_agent_events", {
       agent,
       ...(summary === undefined ? {} : { summary }),
       ...(since === undefined ? {} : { since }),
       ...(limit === undefined ? {} : { limit }),
+      ...(types === undefined ? {} : { types }),
+      ...(coalesce === undefined ? {} : { coalesce }),
     })),
   );
 

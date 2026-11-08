@@ -40,6 +40,7 @@ import type { ModelEntry } from "./config/schema.js";
 import { AgentCapacity, childDepthEnv } from "./core/limits.js";
 import { ConfigurationError, SubagentError } from "./core/errors.js";
 import { EventBuffer } from "./events/buffer.js";
+import type { EventReadOptions } from "./events/buffer.js";
 import type { AgentEvent } from "./events/schema.js";
 import { scanChildOutput } from "./safety/output.js";
 import { describeToolInput } from "./tool-describe.js";
@@ -598,6 +599,7 @@ export class Supervisor {
     agent: string,
     since: number,
     limit?: number,
+    options?: EventReadOptions,
   ): {
     readonly agent_id: string;
     readonly name: string;
@@ -607,7 +609,7 @@ export class Supervisor {
     readonly hasMore?: boolean;
   } {
     const record = this.#requireRecord(agent);
-    const read = this.#events.read(record.id, since, limit);
+    const read = this.#events.read(record.id, since, limit, options);
     return {
       agent_id: record.id,
       name: record.name,
@@ -621,10 +623,13 @@ export class Supervisor {
   /**
    * Compact digest of an agent's event log: counts, tool histogram, the last few tool calls and
    * the tail of its latest message. Meant to replace reading the whole log just to see progress.
+   * `since`, when given, scopes the digest to events after that sequence (e.g. a previous call's
+   * `currentSequence`), so repeat polling only reports what's new; `currentSequence` is always
+   * returned so the caller can pass it back next time.
    */
-  summarizeAgentEvents(agent: string, recent = 5): Record<string, unknown> {
+  summarizeAgentEvents(agent: string, recent = 5, since = 0): Record<string, unknown> {
     const record = this.#requireRecord(agent);
-    const read = this.#events.read(record.id, 0);
+    const read = this.#events.read(record.id, since);
     const tools: Record<string, number> = {};
     type Call = { sequence: number; tool: string; status: string; target?: string; preview?: string };
     const calls: Call[] = [];
