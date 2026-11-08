@@ -850,3 +850,27 @@ test("describeToolInput normalizes targets and edit previews across harness shap
   assert.equal(codex.preview, "-old\n+new");
   assert.deepEqual(describeToolInput("nope"), {});
 });
+
+test("waitForAgents 'all' with since needs one fresh settle but counts earlier ones as done; since without milliseconds compares as an instant", async () => {
+  const adapter = new FakeAdapter("codex");
+  const supervisor = new Supervisor({
+    registry: testRegistry([codexAgentConfig()]),
+    adapters: new AdapterRegistry([adapter]),
+    cwd: "/work",
+  });
+  adapter.queueScript([]);
+  adapter.queueScript([]);
+  const first = String((await supervisor.spawnAgent({ agent: "general", prompt: "a", description: "a", run_in_background: true }))["agent_id"]);
+  const second = String((await supervisor.spawnAgent({ agent: "general", prompt: "b", description: "b", run_in_background: true }))["agent_id"]);
+  adapter.emit(first, "turn.completed", { turnId: "t1", status: "completed", finalText: "done" });
+  await waitUntil(() => supervisor.listAgents().find((a) => a["agent_id"] === first)?.["state"] === "completed");
+
+  await new Promise((resolve) => setTimeout(resolve, 1100));
+  const since = new Date().toISOString().replace(/\.\d+Z$/, "Z"); // whole seconds, as a caller might send
+  const waiting = supervisor.waitForAgents([first, second], "all", 2, since);
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  adapter.emit(second, "turn.completed", { turnId: "t2", status: "completed", finalText: "done" });
+  const result = await waiting;
+  assert.equal(result.timed_out, false);
+  assert.deepEqual(result.newly_settled, [second]);
+});

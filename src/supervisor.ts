@@ -270,10 +270,18 @@ export class Supervisor {
       const record = this.#requireRecord(identifier);
       return { identifier, state: record.state, updated_at: record.updatedAt };
     });
+    const isSettled = (state: string) => !['starting','running','queued'].includes(state);
+    // Compare as instants: `since` may be "…:00Z" while stored times carry milliseconds
+    const sinceMs = since === undefined ? undefined : Date.parse(since);
     const newlySettled = () => statuses().filter(status =>
-      !['starting','running','queued'].includes(status.state) && (!since || status.updated_at > since));
-    const ready = () => { const settled = newlySettled(); return settled.some(status => status.state === 'needs_approval') ||
-      (mode === 'all' ? settled.length === agents.length : settled.length > 0); };
+      isSettled(status.state) && (sinceMs === undefined || Date.parse(status.updated_at) > sinceMs));
+    const ready = () => {
+      const fresh = newlySettled();
+      if (fresh.some(status => status.state === 'needs_approval')) return true;
+      if (mode === 'any') return fresh.length > 0;
+      // 'all': everything has settled; with `since`, at least one must have settled after it
+      return statuses().every(status => isSettled(status.state)) && (sinceMs === undefined || fresh.length > 0);
+    };
     let timed_out = false;
     await new Promise<void>((resolve, reject) => {
       let timer: NodeJS.Timeout;
