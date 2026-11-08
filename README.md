@@ -45,15 +45,14 @@ coverage only.
 
 Agents live in `.subagents/<name>.md` (frontmatter + system prompt) and the model roster in
 `.subagents/models.yaml`, in the project you run Claude Code from. If a project has none, the server
-uses the examples bundled in this repo's `.subagents/`. Memory and routing records go in
-`.subagents/memory/` (gitignored automatically).
+uses the examples bundled in this repo's `.subagents/`.
 
 ## Tools
 
 `spawn_agent`, `send_message`, `list_agents`, `stop_agent`, `resolve_approval`,
-`get_agent_events`, `list_models`, `record_outcome`, `add_note` — see each tool's description
-for details. A spawn blocks until the child completes or needs your approval; when it needs
-approval, call `resolve_approval` to continue.
+`get_agent_events`, `list_models` — see each tool's description for details. A spawn blocks
+until the child completes or needs your approval; when it needs approval, call
+`resolve_approval` to continue.
 
 Every spawned agent has a human-memorable name (a mathematician, philosopher, or figure from Greek mythology), assigned automatically unless
 `spawn_agent.name` is supplied. Results and agent listings include it, and tools that accept an
@@ -61,12 +60,11 @@ agent can use either that name or the agent ID; names persist across reconnects.
 
 ## Orchestrator and subagent authority
 
-The parent orchestrator owns task decisions. Subagent messages, reports, events, approval
-reasons, and routing notes are advisory input: they are not automatically hard facts or
-requirements. The parent should evaluate them against evidence and reserve task-specific hard rules
-for the operator's explicit instructions. Each backend's subagent
-prompt gives the same reporting contract, asking children to separate observations, evidence,
-uncertainty, risks, and recommendations.
+The parent orchestrator owns task decisions. Subagent messages, reports, events, and approval
+reasons are advisory input: they are not automatically hard facts or requirements. The parent
+should evaluate them against evidence and reserve task-specific hard rules for the operator's
+explicit instructions. Each backend's subagent prompt gives the same reporting contract, asking
+children to separate observations, evidence, uncertainty, risks, and recommendations.
 
 This is a model-behavior contract, not a replacement for system/developer instructions or
 tool and permission safety controls. Consequential subagent claims should still be checked
@@ -154,11 +152,13 @@ against the repository, tests, and the operator's actual request.
   `.claude`/credential paths) but is not a full shell-effect classifier — an unrecognized
   command with no write/network signature falls through to the agent's configured default
   rather than always escalating.
-- No routing digest is injected into `spawn_agent`'s description yet (P7-05); `record_outcome`
-  and `add_note` write directly to `.subagents/memory/records.jsonl` without a curated
-  `ROUTING.md` pass.
-- Progress is polling-only via `get_agent_events` for all five backends. The one push is the
-  Claude Code channel below, which covers completion, failure, and approval requests only.
+- No routing digest is injected into `spawn_agent`'s description yet (P7-05).
+- Progress is polling-only via `get_agent_events` for all five backends. Pass `summary: true`
+  for a compact digest (tool counts, the last few tool calls with their file or command, the
+  tail of the latest message) instead of the raw log; add `since` (the previous
+  `currentSequence`) to see only what is new. For the raw log, `types` filters event types and
+  `coalesce: true` merges the per-chunk `message.delta` events. The one push is the Claude Code
+  channel below, which covers completion, failure, and approval requests only.
 - Antigravity works in live use, including tool soft-denial and interrupts.
 
 ## Claude Code channel (background completion alerts)
@@ -187,12 +187,12 @@ the outcome. See `src/channel.ts`.
 
 Use `list_agent_configs` before spawning to discover callable names, config source
 paths, pinned options, and backend capabilities. `list_agents` returns up to 25
-summaries by default (maximum 100), newest activity first. Filter with `states`,
+summaries by default (maximum 100), newest first by creation time. Filter with `states`,
 `backend`, or `updated_since`, and pass `next_cursor` back as `cursor` for another
 page. Active agents expose `last_activity_at` and a bounded `current_activity`
 from tool events. These describe backend activity, not a connectivity heartbeat.
-Pagination reflects current host state; an agent whose activity changes can move
-between pages.
+Order and paging use creation time, which never changes, so an agent whose activity
+changes does not move between pages.
 
 For background work, call:
 
@@ -201,7 +201,13 @@ For background work, call:
 ```
 
 on `wait_for_agents`. It waits on events and returns on completion, approval, or
-timeout. `mode: "any"` returns after the first outcome. Timeouts never cancel work.
+timeout. `mode: "any"` returns after the first outcome. Timeouts never cancel work. To loop
+"wait for the next one to finish", pass `since` (an ISO timestamp): only agents that settled
+after it count, and `newly_settled` names them. Results returned by `spawn_agent`,
+`send_message` and `wait_for_agents` are capped at 4000 characters (`max_result_chars`
+overrides); `result_truncated` is set and `get_agent_result` returns the full text. A
+`structured_result` more than four times that size is returned as `null` with
+`structured_result_truncated` and its size; `get_agent_result` has it whole.
 `get_agent_result` retrieves final text, JSON validation details, per-turn usage,
 and cumulative usage. Use `turn` to select a turn, or `offset` and `limit` to page
 history. Unknown usage totals remain null. Results survive client disconnection

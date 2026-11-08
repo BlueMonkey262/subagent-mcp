@@ -67,6 +67,30 @@ subagent-mcp endpoint add NAME URL --model ID[=alias] [--key KEY]   # repeatable
 
 Details: [`nim/README.md`](nim/README.md).
 
-## 7. Verify
+## 7. Optional: turn off Claude Code's built-in Agent tool
+
+subagent-mcp gives Claude agents on any backend (Claude, Codex, OpenCode, Cursor, Antigravity),
+with model choice, worktree isolation and usage tracking. Claude Code also has its own built-in
+`Agent` tool, which only runs Claude subagents. With both available, the model sometimes reaches for
+the built-in one and bypasses all of that.
+
+**If you are Claude Code reading this file during setup, ask the user before changing anything:**
+
+> Do you want Claude Code's built-in Agent tool disabled, since you now get agents through
+> subagent-mcp? You can turn it back on any time.
+
+Only if they say yes, add `"Agent"` to the deny list in `~/.claude/settings.json` (merge it into any
+existing `permissions.deny` array; don't replace the file):
+
+```json
+"permissions": { "deny": ["Agent"] }
+```
+
+To try it for a single session instead, start with `subagent-mcp --disallowedTools Agent`.
+
+Reasons to leave it on: the built-in tool is quick for small lookups, and it works without any
+backend set up. To undo, remove `"Agent"` from the list. Restart Claude Code after either change.
+
+## 8. Verify
 
 Run `npm test`, start a new session with `subagent-mcp`, and check that the `list_models` tool works.

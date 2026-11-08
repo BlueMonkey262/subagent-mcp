@@ -65,6 +65,35 @@ test("spawn auto-assigns a memorable name and exposes it everywhere", async () =
   const events = supervisor.getAgentEvents(name, 0);
   assert.equal(events.name, name);
   assert.equal(events.agent_id, spawned["agent_id"]);
+
+  const summary = supervisor.summarizeAgentEvents(name);
+  assert.equal(summary["name"], name);
+  assert.equal(summary["agent_id"], spawned["agent_id"]);
+  assert.equal(typeof summary["tool_calls"], "number");
+  assert.ok(Array.isArray(summary["recent_tools"]));
+});
+
+test("summary keeps the finished turn's message and reports a tool.end whose start preceded since", async () => {
+  const adapter = new FakeAdapter("codex");
+  const supervisor = new Supervisor({
+    registry: testRegistry([codexAgentConfig()]),
+    adapters: new AdapterRegistry([adapter]),
+    cwd: "/work",
+  });
+  adapter.queueScript([]);
+  const id = String((await supervisor.spawnAgent({ agent: "general", prompt: "x", description: "x", run_in_background: true }))["agent_id"]);
+  adapter.emit(id, "tool.start", { toolCallId: "t1", toolName: "Bash", input: { command: "npm test" } });
+  const mid = Number(supervisor.summarizeAgentEvents(id)["currentSequence"]);
+  adapter.emit(id, "tool.end", { toolCallId: "t1", toolName: "Bash", status: "completed" });
+  adapter.emit(id, "message.delta", { text: "Final answer here." });
+  adapter.emit(id, "turn.completed", { turnId: "t", status: "completed" });
+  await waitUntil(() => supervisor.listAgents().find((a) => a["agent_id"] === id)?.["state"] === "completed");
+
+  const all = supervisor.summarizeAgentEvents(id);
+  assert.equal(all["latest_message"], "Final answer here.");
+  const recent = supervisor.summarizeAgentEvents(id, 5, mid);
+  assert.deepEqual((recent["recent_tools"] as { tool: string; status: string }[]).map((c) => [c.tool, c.status]), [["Bash", "completed"]]);
+  assert.equal(recent["latest_message"], "Final answer here.");
 });
 
 test("concurrent unnamed spawns receive unique names", async () => {
@@ -83,6 +112,85 @@ test("concurrent unnamed spawns receive unique names", async () => {
   })));
   const names = spawned.map((result) => String(result["name"]));
   assert.equal(new Set(names.map((name) => name.toLowerCase())).size, names.length);
+});
+
+test("listAgents order and pagination remain stable when an agent is updated", async () => {
+  const adapter = new FakeAdapter("codex");
+  const supervisor = new Supervisor({
+    registry: testRegistry([codexAgentConfig()]),
+    adapters: new AdapterRegistry([adapter]),
+    cwd: "/work",
+  });
+
+  adapter.queueScript([]);
+  adapter.queueScript([]);
+  adapter.queueScript([]);
+  const first = String((await supervisor.spawnAgent({ agent: "general", prompt: "first", description: "first", run_in_background: true }))["agent_id"]);
+  const second = String((await supervisor.spawnAgent({ agent: "general", prompt: "second", description: "second", run_in_background: true }))["agent_id"]);
+  const third = String((await supervisor.spawnAgent({ agent: "general", prompt: "third", description: "third", run_in_background: true }))["agent_id"]);
+  const queued = await supervisor.spawnAgent({ agent: "general", prompt: "queued", description: "queued", depends_on: [third] });
+  const queuedId = String(queued["task_id"]);
+  const expected = [queuedId, third, second, first]; // newest first
+
+  await waitUntil(() => supervisor.listAgents().length === expected.length);
+  assert.deepEqual(supervisor.listAgents().map((agent) => agent["agent_id"]), expected);
+  const pending = supervisor.listAgents().find((agent) => agent["agent_id"] === queuedId);
+  assert.equal(typeof pending?.["created_at"], "string");
+  assert.equal(pending?.["updated_at"], pending?.["created_at"]);
+
+  const firstPage = supervisor.sessionView({ limit: 1 });
+  assert.equal((firstPage.agents as Record<string, unknown>[])[0]?.["agent_id"], queuedId);
+  const updatedAtOf = (id: string) => supervisor.listAgents().find((agent) => agent["agent_id"] === id)?.["updated_at"];
+  const previousUpdatedAt = updatedAtOf(first);
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  adapter.emit(first, "tool.start", { toolCallId: "busy", toolName: "Bash", input: { command: "npm test" } });
+  await waitUntil(() => updatedAtOf(first) !== previousUpdatedAt);
+  assert.deepEqual(supervisor.listAgents().map((agent) => agent["agent_id"]), expected);
+
+  const paged = [queuedId];
+  let cursor = firstPage.next_cursor as string | null;
+  while (cursor) {
+    const page = supervisor.sessionView({ limit: 1, cursor });
+    paged.push(String((page.agents as Record<string, unknown>[])[0]?.["agent_id"]));
+    cursor = page.next_cursor as string | null;
+  }
+  assert.deepEqual(paged, expected);
+});
+
+test("waitForAgents since ignores earlier settlements and reports newly settled agents", async () => {
+  const adapter = new FakeAdapter("codex");
+  const supervisor = new Supervisor({
+    registry: testRegistry([codexAgentConfig()]),
+    adapters: new AdapterRegistry([adapter]),
+    cwd: "/work",
+  });
+
+  adapter.queueScript([]);
+  adapter.queueScript([]);
+  const first = String((await supervisor.spawnAgent({ agent: "general", prompt: "first", description: "first", run_in_background: true }))["agent_id"]);
+  const second = String((await supervisor.spawnAgent({ agent: "general", prompt: "second", description: "second", run_in_background: true }))["agent_id"]);
+  adapter.emit(first, "turn.completed", { turnId: "first-turn", status: "completed", finalText: "done" });
+  await waitUntil(() => supervisor.listAgents().find((agent) => agent["agent_id"] === first)?.["state"] === "completed");
+
+  const initial = await supervisor.waitForAgents([first, second], "any", 0);
+  assert.equal(initial.timed_out, false);
+  assert.deepEqual(initial.newly_settled, [first]);
+
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  const since = new Date().toISOString();
+  const stale = await supervisor.waitForAgents([first, second], "any", 0, since);
+  assert.equal(stale.timed_out, true);
+  assert.deepEqual(stale.newly_settled, []);
+
+  const waiting = supervisor.waitForAgents([first, second], "any", 1, since);
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  adapter.emit(second, "turn.completed", { turnId: "second-turn", status: "completed", finalText: "done" });
+  const settled = await waiting;
+  assert.equal(settled.timed_out, false);
+  assert.deepEqual(settled.newly_settled, [second]);
+
+  const allSettled = await supervisor.waitForAgents([first, second], "any", 0);
+  assert.deepEqual(allSettled.newly_settled, [first, second]);
 });
 
 test("an explicit name is preserved and automatic names avoid it case-insensitively", async () => {
@@ -524,6 +632,44 @@ test("spawn echoes the turn cap and send_message can override it", async () => {
   assert.match(String(resumed["warning"]), /no prompt cache/);
 });
 
+test("caps tool responses without truncating the persisted result", async () => {
+  const adapter = new FakeAdapter("codex");
+  const supervisor = new Supervisor({
+    registry: testRegistry([codexAgentConfig()]),
+    adapters: new AdapterRegistry([adapter]),
+    cwd: "/work",
+  });
+  const long = "x".repeat(3_999) + "😀" + "y".repeat(10);
+  const head = "x".repeat(3_999) + "😀";
+  const complete = () => adapter.queueScript([{
+    create: (context) => ({
+      type: "turn.completed" as const,
+      agentId: context.agentId,
+      backend: context.backend,
+      data: { turnId: context.turnId, status: "completed" as const, finalText: long },
+    }),
+  }]);
+
+  complete();
+  const spawned = await supervisor.spawnAgent({ agent: "general", prompt: "long", description: "result cap" });
+  const agentId = String(spawned["agent_id"]);
+  assert.equal(spawned["result"], `${head}\n[truncated 10 characters]`);
+  assert.equal(spawned["result_truncated"], true);
+  assert.match(String(spawned["result_hint"]), /get_agent_result/);
+
+  const waited = await supervisor.waitForAgents([agentId], "all", 0);
+  assert.equal((waited.agents[0] as Record<string, unknown>)["result"], spawned["result"]);
+
+  const full = supervisor.getAgentResult(agentId) as Record<string, unknown>;
+  assert.equal(full["result"], long);
+  assert.equal((full["selected_result"] as Record<string, unknown>)["result"], long);
+
+  complete();
+  const resumed = await supervisor.sendMessage({ agent: agentId, prompt: "again", max_result_chars: 5 });
+  assert.equal(resumed["result"], "xxxxx\n[truncated 4005 characters]");
+  assert.equal(resumed["result_truncated"], true);
+});
+
 test("a Codex resume past the idle limit is refused unless the caller opts in", async () => {
   const adapter = new FakeAdapter("codex");
   const supervisor = new Supervisor({
@@ -754,4 +900,131 @@ test("agent name pool is unique (case-insensitive) and includes philosophers and
   assert.equal(new Set(lowered).size, lowered.length);
   for (const name of ["Aristotle", "Kant", "Athena", "Odysseus"]) assert.ok(lowered.includes(name.toLowerCase()), name);
   for (const name of AGENT_NAMES) assert.match(name, /^[A-Za-z][A-Za-z-]*$/);
+});
+
+test("describeToolInput normalizes targets and edit previews across harness shapes", async () => {
+  const { describeToolInput } = await import("../src/tool-describe.js");
+  assert.deepEqual(describeToolInput({ file_path: "a.ts", old_string: "x", new_string: "y" }), { target: "a.ts", preview: "-x\n+y" });
+  assert.equal(describeToolInput({ filePath: "b.ts", oldString: "x", newString: "y" }).target, "b.ts");
+  assert.equal(describeToolInput({ command: "npm  test" }).target, "npm test");
+  const codex = describeToolInput({ changes: [{ path: "c.ts", diff: "--- a\n+++ b\n-old\n+new" }, { path: "d.ts" }] });
+  assert.equal(codex.target, "c.ts (+1 more)");
+  assert.equal(codex.preview, "-old\n+new");
+  assert.deepEqual(describeToolInput("nope"), {});
+});
+
+test("waitForAgents 'all' with since needs one fresh settle but counts earlier ones as done; since without milliseconds compares as an instant", async () => {
+  const adapter = new FakeAdapter("codex");
+  const supervisor = new Supervisor({
+    registry: testRegistry([codexAgentConfig()]),
+    adapters: new AdapterRegistry([adapter]),
+    cwd: "/work",
+  });
+  adapter.queueScript([]);
+  adapter.queueScript([]);
+  const first = String((await supervisor.spawnAgent({ agent: "general", prompt: "a", description: "a", run_in_background: true }))["agent_id"]);
+  const second = String((await supervisor.spawnAgent({ agent: "general", prompt: "b", description: "b", run_in_background: true }))["agent_id"]);
+  adapter.emit(first, "turn.completed", { turnId: "t1", status: "completed", finalText: "done" });
+  await waitUntil(() => supervisor.listAgents().find((a) => a["agent_id"] === first)?.["state"] === "completed");
+
+  await new Promise((resolve) => setTimeout(resolve, 1100));
+  const since = new Date().toISOString().replace(/\.\d+Z$/, "Z"); // whole seconds, as a caller might send
+  const waiting = supervisor.waitForAgents([first, second], "all", 2, since);
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  adapter.emit(second, "turn.completed", { turnId: "t2", status: "completed", finalText: "done" });
+  const result = await waiting;
+  assert.equal(result.timed_out, false);
+  assert.deepEqual(result.newly_settled, [second]);
+});
+
+test("updated_since compares instants, so a whole-second timestamp includes later milliseconds in the same second", async () => {
+  const adapter = new FakeAdapter("codex");
+  const supervisor = new Supervisor({
+    registry: testRegistry([codexAgentConfig()]),
+    adapters: new AdapterRegistry([adapter]),
+    cwd: "/work",
+  });
+  adapter.queueScript([]);
+  const id = String((await supervisor.spawnAgent({ agent: "general", prompt: "x", description: "x", run_in_background: true }))["agent_id"]);
+  const updated = String(supervisor.listAgents().find((a) => a["agent_id"] === id)?.["updated_at"]);
+  const wholeSecond = updated.replace(/\.\d+Z$/, "Z"); // same second, earlier than `updated` unless ms are 000
+  const page = supervisor.sessionView({ updated_since: wholeSecond });
+  assert.ok((page.agents as Record<string, unknown>[]).some((a) => a["agent_id"] === id));
+});
+
+function queuedFixture() {
+  const adapter = new FakeAdapter("codex");
+  const supervisor = new Supervisor({
+    registry: testRegistry([codexAgentConfig()]),
+    adapters: new AdapterRegistry([adapter]),
+    cwd: "/work",
+  });
+  return { adapter, supervisor };
+}
+
+test("a queued task that settles after since is reported by wait_for_agents and updated_since", async () => {
+  const { adapter, supervisor } = queuedFixture();
+  adapter.queueScript([]);
+  const dependency = String((await supervisor.spawnAgent({ agent: "general", prompt: "a", description: "a", run_in_background: true }))["agent_id"]);
+  const queued = String((await supervisor.spawnAgent({ agent: "general", prompt: "b", description: "b", depends_on: [dependency] }))["task_id"]);
+  await new Promise((resolve) => setTimeout(resolve, 15));
+  const since = new Date().toISOString();
+  await new Promise((resolve) => setTimeout(resolve, 15));
+  await supervisor.stopAgents([queued]); // the task settles (interrupted) after `since`, long after its created_at
+
+  const waited = await supervisor.waitForAgents([queued], "any", 0, since);
+  assert.deepEqual(waited.newly_settled, [queued]);
+  const listed = (supervisor.sessionView({ updated_since: since }).agents as Record<string, unknown>[]).map((a) => a["agent_id"]);
+  assert.ok(listed.includes(queued));
+});
+
+test("a queued task keeps its list position when it becomes an agent: paging neither repeats nor skips it", async () => {
+  const { adapter, supervisor } = queuedFixture();
+  adapter.queueScript([]);
+  adapter.queueScript([]);
+  const dependency = String((await supervisor.spawnAgent({ agent: "general", prompt: "a", description: "a", run_in_background: true }))["agent_id"]);
+  const taskId = String((await supervisor.spawnAgent({ agent: "general", prompt: "b", description: "b", depends_on: [dependency] }))["task_id"]);
+
+  const first = supervisor.sessionView({ limit: 1 });
+  assert.equal((first.agents as Record<string, unknown>[])[0]?.["agent_id"], taskId);
+  assert.ok(first.next_cursor);
+
+  adapter.emit(dependency, "turn.completed", { turnId: "t", status: "completed", finalText: "ok" });
+  await waitUntil(() => supervisor.listAgents().some((a) => a["queued_from"] === taskId));
+
+  const second = supervisor.sessionView({ limit: 5, cursor: first.next_cursor as string });
+  assert.deepEqual((second.agents as Record<string, unknown>[]).map((a) => a["agent_id"]), [dependency]);
+
+  // seen from the top, the task now appears once, as the agent it became, still first
+  const all = supervisor.sessionView({}).agents as Record<string, unknown>[];
+  assert.equal(all.filter((a) => a["queued_from"] === taskId).length, 1);
+  assert.equal(all.some((a) => a["agent_id"] === taskId), false);
+  assert.equal(all[0]?.["queued_from"], taskId);
+});
+
+test("a huge structured_result is left out of spawn/wait responses but kept in get_agent_result", async () => {
+  const { adapter, supervisor } = queuedFixture();
+  adapter.queueScript([]);
+  const id = String((await supervisor.spawnAgent({
+    agent: "general", prompt: "x", description: "x", run_in_background: true,
+    result_schema: { type: "object", properties: { blob: { type: "string" } }, required: ["blob"] },
+  }))["agent_id"]);
+  adapter.emit(id, "turn.completed", { turnId: "t", status: "completed", finalText: JSON.stringify({ blob: "z".repeat(40_000) }) });
+  const waited = await supervisor.waitForAgents([id], "all", 1, undefined, 1000);
+  const entry = waited.agents[0] as Record<string, unknown>;
+  assert.equal(entry["structured_result"], null);
+  assert.equal(entry["structured_result_truncated"], true);
+  assert.ok(Number(entry["structured_result_chars"]) > 40_000);
+  const full = supervisor.getAgentResult(id) as Record<string, unknown>;
+  assert.equal(((full["structured_result"] as { blob: string }).blob).length, 40_000);
+
+  // within the cap it passes through untouched
+  adapter.queueScript([]);
+  const small = String((await supervisor.spawnAgent({
+    agent: "general", prompt: "y", description: "y", run_in_background: true,
+    result_schema: { type: "object", properties: { ok: { type: "boolean" } }, required: ["ok"] },
+  }))["agent_id"]);
+  adapter.emit(small, "turn.completed", { turnId: "t2", status: "completed", finalText: '{"ok":true}' });
+  const smallWait = await supervisor.waitForAgents([small], "all", 1);
+  assert.deepEqual((smallWait.agents[0] as Record<string, unknown>)["structured_result"], { ok: true });
 });
