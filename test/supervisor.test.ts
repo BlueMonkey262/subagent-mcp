@@ -951,3 +951,80 @@ test("updated_since compares instants, so a whole-second timestamp includes late
   const page = supervisor.sessionView({ updated_since: wholeSecond });
   assert.ok((page.agents as Record<string, unknown>[]).some((a) => a["agent_id"] === id));
 });
+
+function queuedFixture() {
+  const adapter = new FakeAdapter("codex");
+  const supervisor = new Supervisor({
+    registry: testRegistry([codexAgentConfig()]),
+    adapters: new AdapterRegistry([adapter]),
+    cwd: "/work",
+  });
+  return { adapter, supervisor };
+}
+
+test("a queued task that settles after since is reported by wait_for_agents and updated_since", async () => {
+  const { adapter, supervisor } = queuedFixture();
+  adapter.queueScript([]);
+  const dependency = String((await supervisor.spawnAgent({ agent: "general", prompt: "a", description: "a", run_in_background: true }))["agent_id"]);
+  const queued = String((await supervisor.spawnAgent({ agent: "general", prompt: "b", description: "b", depends_on: [dependency] }))["task_id"]);
+  await new Promise((resolve) => setTimeout(resolve, 15));
+  const since = new Date().toISOString();
+  await new Promise((resolve) => setTimeout(resolve, 15));
+  await supervisor.stopAgents([queued]); // the task settles (interrupted) after `since`, long after its created_at
+
+  const waited = await supervisor.waitForAgents([queued], "any", 0, since);
+  assert.deepEqual(waited.newly_settled, [queued]);
+  const listed = (supervisor.sessionView({ updated_since: since }).agents as Record<string, unknown>[]).map((a) => a["agent_id"]);
+  assert.ok(listed.includes(queued));
+});
+
+test("a queued task keeps its list position when it becomes an agent: paging neither repeats nor skips it", async () => {
+  const { adapter, supervisor } = queuedFixture();
+  adapter.queueScript([]);
+  adapter.queueScript([]);
+  const dependency = String((await supervisor.spawnAgent({ agent: "general", prompt: "a", description: "a", run_in_background: true }))["agent_id"]);
+  const taskId = String((await supervisor.spawnAgent({ agent: "general", prompt: "b", description: "b", depends_on: [dependency] }))["task_id"]);
+
+  const first = supervisor.sessionView({ limit: 1 });
+  assert.equal((first.agents as Record<string, unknown>[])[0]?.["agent_id"], taskId);
+  assert.ok(first.next_cursor);
+
+  adapter.emit(dependency, "turn.completed", { turnId: "t", status: "completed", finalText: "ok" });
+  await waitUntil(() => supervisor.listAgents().some((a) => a["queued_from"] === taskId));
+
+  const second = supervisor.sessionView({ limit: 5, cursor: first.next_cursor as string });
+  assert.deepEqual((second.agents as Record<string, unknown>[]).map((a) => a["agent_id"]), [dependency]);
+
+  // seen from the top, the task now appears once, as the agent it became, still first
+  const all = supervisor.sessionView({}).agents as Record<string, unknown>[];
+  assert.equal(all.filter((a) => a["queued_from"] === taskId).length, 1);
+  assert.equal(all.some((a) => a["agent_id"] === taskId), false);
+  assert.equal(all[0]?.["queued_from"], taskId);
+});
+
+test("a huge structured_result is left out of spawn/wait responses but kept in get_agent_result", async () => {
+  const { adapter, supervisor } = queuedFixture();
+  adapter.queueScript([]);
+  const id = String((await supervisor.spawnAgent({
+    agent: "general", prompt: "x", description: "x", run_in_background: true,
+    result_schema: { type: "object", properties: { blob: { type: "string" } }, required: ["blob"] },
+  }))["agent_id"]);
+  adapter.emit(id, "turn.completed", { turnId: "t", status: "completed", finalText: JSON.stringify({ blob: "z".repeat(40_000) }) });
+  const waited = await supervisor.waitForAgents([id], "all", 1, undefined, 1000);
+  const entry = waited.agents[0] as Record<string, unknown>;
+  assert.equal(entry["structured_result"], null);
+  assert.equal(entry["structured_result_truncated"], true);
+  assert.ok(Number(entry["structured_result_chars"]) > 40_000);
+  const full = supervisor.getAgentResult(id) as Record<string, unknown>;
+  assert.equal(((full["structured_result"] as { blob: string }).blob).length, 40_000);
+
+  // within the cap it passes through untouched
+  adapter.queueScript([]);
+  const small = String((await supervisor.spawnAgent({
+    agent: "general", prompt: "y", description: "y", run_in_background: true,
+    result_schema: { type: "object", properties: { ok: { type: "boolean" } }, required: ["ok"] },
+  }))["agent_id"]);
+  adapter.emit(small, "turn.completed", { turnId: "t2", status: "completed", finalText: '{"ok":true}' });
+  const smallWait = await supervisor.waitForAgents([small], "all", 1);
+  assert.deepEqual((smallWait.agents[0] as Record<string, unknown>)["structured_result"], { ok: true });
+});

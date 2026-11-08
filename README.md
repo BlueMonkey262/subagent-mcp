@@ -205,7 +205,9 @@ timeout. `mode: "any"` returns after the first outcome. Timeouts never cancel wo
 "wait for the next one to finish", pass `since` (an ISO timestamp): only agents that settled
 after it count, and `newly_settled` names them. Results returned by `spawn_agent`,
 `send_message` and `wait_for_agents` are capped at 4000 characters (`max_result_chars`
-overrides); `result_truncated` is set and `get_agent_result` returns the full text.
+overrides); `result_truncated` is set and `get_agent_result` returns the full text. A
+`structured_result` more than four times that size is returned as `null` with
+`structured_result_truncated` and its size; `get_agent_result` has it whole.
 `get_agent_result` retrieves final text, JSON validation details, per-turn usage,
 and cumulative usage. Use `turn` to select a turn, or `offset` and `limit` to page
 history. Unknown usage totals remain null. Results survive client disconnection

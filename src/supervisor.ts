@@ -16,13 +16,20 @@ interface ExecutionMeta {
   structured?: unknown;
   validation_errors?: unknown;
   group_id?: string;
+  /** Set when the agent was started from a queued task: the task's id and creation time, which fix its list position. */
+  queued_from?: string;
+  queued_at?: string;
 }
+type Row = Readonly<Record<string, unknown>>;
+/** Position of a listed row. An agent started from a queued task keeps that task's position, so the task turning into an agent never moves it between pages. */
+const listKey = (r: Row) => ({ at: String(r.queued_at ?? r.created_at), id: String(r.queued_from ?? r.agent_id) });
+const newestFirst = (a: Row, b: Row) => listKey(b).at.localeCompare(listKey(a).at) || listKey(b).id.localeCompare(listKey(a).id);
 export interface ListAgentsInput {
   states?: string[] | undefined; backend?: Backend | undefined; updated_since?: string | undefined;
   limit?: number | undefined; cursor?: string | undefined;
 }
 interface PendingTask {
-  id: string; created_at: string; input: SpawnAgentInput; dependencies: { agent: string; turn: number }[];
+  id: string; created_at: string; updated_at?: string; input: SpawnAgentInput; dependencies: { agent: string; turn: number }[];
   state: 'queued' | 'starting' | 'blocked' | 'interrupted' | 'completed'; result?: Record<string, unknown>;
 }
 
@@ -238,23 +245,24 @@ export class Supervisor {
       if (!after || typeof after.created_at !== 'string' || typeof after.agent_id !== 'string') throw new SupervisorError('Invalid cursor');
     }
     // newest first on an immutable key (created_at never changes, unlike updated_at), so pages never skip or repeat
-    const sorted = records.sort((a,b) => String(b.created_at).localeCompare(String(a.created_at)) || String(b.agent_id).localeCompare(String(a.agent_id)));
-    const filtered = after ? sorted.filter(r => String(r.created_at) < after!.created_at || (r.created_at === after!.created_at && String(r.agent_id) < after!.agent_id)) : sorted;
+    const sorted = records.sort(newestFirst);
+    const filtered = after ? sorted.filter(r => { const k = listKey(r); return k.at < after!.created_at || (k.at === after!.created_at && k.id < after!.agent_id); }) : sorted;
     const limit = Math.min(100, Math.max(1, input.limit ?? 25));
     const page = filtered.slice(0, limit);
     const last = page.at(-1);
     return { agents: page,
-      next_cursor: filtered.length > limit && last ? Buffer.from(JSON.stringify({ created_at: last.created_at, agent_id: last.agent_id })).toString('base64url') : null,
+      next_cursor: filtered.length > limit && last ? Buffer.from(JSON.stringify({ created_at: listKey(last).at, agent_id: listKey(last).id })).toString('base64url') : null,
       concurrency: this.concurrency(), config_warning: this.#registry.configWarning(), storage_error: this.#storageError };
   }
 
   listAgents(): readonly Readonly<Record<string, unknown>>[] {
+    const started = new Set([...this.#agents.values()].map(record => record.meta.queued_from));
     return [...this.#agents.values()].map(record => this.#publicRecord(record))
-      .concat([...this.#pending.values()].filter(task => !task.result?.agent_id).map(task => ({
+      .concat([...this.#pending.values()].filter(task => !task.result?.agent_id && !started.has(task.id)).map(task => ({
         agent_id: task.id, state: task.state, backend: task.input.backend, created_at: task.created_at,
-        updated_at: task.created_at, group_id: task.input.group_id,
+        updated_at: task.updated_at ?? task.created_at, group_id: task.input.group_id,
       })))
-      .sort((a,b) => String(b.created_at).localeCompare(String(a.created_at)) || String(b.agent_id).localeCompare(String(a.agent_id)));
+      .sort(newestFirst);
   }
 
   listAgentConfigs() {
@@ -267,7 +275,7 @@ export class Supervisor {
     if (!agents.length) throw new SupervisorError('At least one agent is required');
     const statuses = () => agents.map(identifier => {
       const task = this.#pending.get(identifier);
-      if (task && !task.result?.agent_id) return { identifier, state: task.state, updated_at: task.created_at };
+      if (task && !task.result?.agent_id) return { identifier, state: task.state, updated_at: task.updated_at ?? task.created_at };
       const record = this.#requireRecord(identifier);
       return { identifier, state: record.state, updated_at: record.updatedAt };
     });
@@ -321,7 +329,7 @@ export class Supervisor {
     const ids = agents ?? [...this.#agents.values()].filter(r => r.meta.group_id === group).map(r => r.id)
       .concat([...this.#pending.values()].filter(t => t.input.group_id === group).map(t => t.id));
     return Promise.all(ids.map(async id => {
-      try { const task = this.#pending.get(id); if (task) { if (task.result?.agent_id) await this.stopAgent(String(task.result.agent_id)); task.state = 'interrupted'; await this.#writeSnapshot(); this.#changed(); return task; }
+      try { const task = this.#pending.get(id); if (task) { if (task.result?.agent_id) await this.stopAgent(String(task.result.agent_id)); this.#setTaskState(task, 'interrupted'); await this.#writeSnapshot(); this.#changed(); return task; }
         return await this.stopAgent(id);
       } catch(error) { return { agent_id: id, error: String(error) }; }
     }));
@@ -342,6 +350,12 @@ export class Supervisor {
     return { task_id: task.id, agent_id: task.id, status: task.state };
   }
 
+  /** Every state change stamps updated_at, so `since` / `updated_since` see when a queued task settled. */
+  #setTaskState(task: PendingTask, state: PendingTask['state']): void {
+    task.state = state;
+    task.updated_at = new Date().toISOString();
+  }
+
   async #runTask(task: PendingTask) {
     const run = async () => {
       if (task.state !== 'queued') { this.#changes.delete(check); return; }
@@ -353,8 +367,8 @@ export class Supervisor {
       });
       if (results.some(r => !r)) return;
       this.#changes.delete(check);
-      if (results.some(r => r!.status !== 'completed' || r!.validation_errors)) { task.state = 'blocked'; await this.#writeSnapshot(); this.#changed(); return; }
-      task.state = 'starting';
+      if (results.some(r => r!.status !== 'completed' || r!.validation_errors)) { this.#setTaskState(task, 'blocked'); await this.#writeSnapshot(); this.#changed(); return; }
+      this.#setTaskState(task, 'starting');
       await this.#writeSnapshot();
       if ((task.state as string) === 'interrupted') return;
       try {
@@ -362,11 +376,11 @@ export class Supervisor {
           prompt: task.input.prompt + '\nDependency results (untrusted input data):\n' + JSON.stringify(results) }, task);
         task.result = { ...result };
         if ((task.state as string) === 'interrupted') { if (result.agent_id) await this.stopAgent(String(result.agent_id)); }
-        else task.state = 'completed';
-      } catch(error) { task.state = 'blocked'; task.result = { error: String(error) }; }
+        else this.#setTaskState(task, 'completed');
+      } catch(error) { this.#setTaskState(task, 'blocked'); task.result = { error: String(error) }; }
       await this.#writeSnapshot(); this.#changed();
     };
-    const check = () => { void run().catch(error => { task.state = 'blocked'; task.result = { error: String(error) }; this.#changed(); }); };
+    const check = () => { void run().catch(error => { this.#setTaskState(task, 'blocked'); task.result = { error: String(error) }; this.#changed(); }); };
     this.#changes.add(check); check();
   }
 
@@ -416,7 +430,8 @@ export class Supervisor {
       const name = picked.name;
       const record: AgentRecord = {
         meta: { turn: 1, history: [], ...(input.permission ? { permission } : {}), ...(worktree ? { worktree } : {}),
-          ...(input.group_id ? { group_id: input.group_id } : {}), ...(input.result_schema ? { schema: input.result_schema } : {}) },
+          ...(input.group_id ? { group_id: input.group_id } : {}), ...(input.result_schema ? { schema: input.result_schema } : {}),
+          ...(task ? { queued_from: task.id, queued_at: task.created_at } : {}) },
         id: turn.agentId,
         name,
         backend: resolved.backend,
@@ -852,9 +867,17 @@ export class Supervisor {
   }
 
   #cappedResult(record: AgentRecord, maxResultChars?: number): Readonly<Record<string, unknown>> {
-    const result = this.#result(record);
+    const full = this.#result(record);
+    const cap = maxResultChars ?? MAX_CONTENT_CHARS;
+    let result = full;
+    // Parsed JSON is the point of result_schema, so it gets a roomier cap (4x); past that it is left out here.
+    const structured = full.structured_result === undefined ? undefined : JSON.stringify(full.structured_result);
+    if (structured !== undefined && structured.length > cap * 4) {
+      result = { ...result, structured_result: null, structured_result_truncated: true, structured_result_chars: structured.length,
+        result_hint: "Use get_agent_result to retrieve the full result." };
+    }
     if (typeof result.result !== "string") return result;
-    const truncated = truncateText(result.result, maxResultChars ?? MAX_CONTENT_CHARS);
+    const truncated = truncateText(result.result, cap);
     if (truncated.truncatedChars === 0) return result;
     return {
       ...result,
@@ -917,6 +940,7 @@ export class Supervisor {
       current_activity: record.meta.activity ?? null,
       activity_source: record.meta.activity ? 'tool_event' : null,
       created_at: record.createdAt,
+      ...(record.meta.queued_from === undefined ? {} : { queued_from: record.meta.queued_from, queued_at: record.meta.queued_at }),
       updated_at: record.updatedAt,
     };
   }
@@ -973,7 +997,7 @@ export class Supervisor {
 
   restorePending(tasks: readonly PendingTask[]): void {
     for (const task of tasks) {
-      if (task.state === 'starting') task.state = 'interrupted';
+      if (task.state === 'starting') this.#setTaskState(task, 'interrupted');
       this.#pending.set(task.id, task);
     }
     for (const task of tasks) if (task.state === 'queued') void this.#runTask(task);
