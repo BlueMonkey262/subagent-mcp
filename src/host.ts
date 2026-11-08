@@ -427,6 +427,7 @@ async function dispatch(supervisor: Supervisor, method: string, params: unknown)
     }
     case "get_agent_events": {
       const agent = requiredString(input, "agent");
+      if (input["summary"] === true) return supervisor.summarizeAgentEvents(agent);
       const since = typeof input["since"] === "number" ? input["since"] : 0;
       return typeof input["limit"] === "number"
         ? supervisor.getAgentEvents(agent, since, input["limit"])

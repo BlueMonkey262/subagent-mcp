@@ -65,6 +65,12 @@ test("spawn auto-assigns a memorable name and exposes it everywhere", async () =
   const events = supervisor.getAgentEvents(name, 0);
   assert.equal(events.name, name);
   assert.equal(events.agent_id, spawned["agent_id"]);
+
+  const summary = supervisor.summarizeAgentEvents(name);
+  assert.equal(summary["name"], name);
+  assert.equal(summary["agent_id"], spawned["agent_id"]);
+  assert.equal(typeof summary["tool_calls"], "number");
+  assert.ok(Array.isArray(summary["recent_tools"]));
 });
 
 test("concurrent unnamed spawns receive unique names", async () => {
@@ -754,4 +760,15 @@ test("agent name pool is unique (case-insensitive) and includes philosophers and
   assert.equal(new Set(lowered).size, lowered.length);
   for (const name of ["Aristotle", "Kant", "Athena", "Odysseus"]) assert.ok(lowered.includes(name.toLowerCase()), name);
   for (const name of AGENT_NAMES) assert.match(name, /^[A-Za-z][A-Za-z-]*$/);
+});
+
+test("describeToolInput normalizes targets and edit previews across harness shapes", async () => {
+  const { describeToolInput } = await import("../src/tool-describe.js");
+  assert.deepEqual(describeToolInput({ file_path: "a.ts", old_string: "x", new_string: "y" }), { target: "a.ts", preview: "-x\n+y" });
+  assert.equal(describeToolInput({ filePath: "b.ts", oldString: "x", newString: "y" }).target, "b.ts");
+  assert.equal(describeToolInput({ command: "npm  test" }).target, "npm test");
+  const codex = describeToolInput({ changes: [{ path: "c.ts", diff: "--- a\n+++ b\n-old\n+new" }, { path: "d.ts" }] });
+  assert.equal(codex.target, "c.ts (+1 more)");
+  assert.equal(codex.preview, "-old\n+new");
+  assert.deepEqual(describeToolInput("nope"), {});
 });

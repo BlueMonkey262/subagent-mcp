@@ -42,6 +42,7 @@ import { ConfigurationError, SubagentError } from "./core/errors.js";
 import { EventBuffer } from "./events/buffer.js";
 import type { AgentEvent } from "./events/schema.js";
 import { scanChildOutput } from "./safety/output.js";
+import { describeToolInput } from "./tool-describe.js";
 import { RoutingStore, projectRoutingPaths, ensureProjectMemoryIgnored, type MemoryScope } from "./storage/routing.js";
 import { remainingAllowances, UsageLedger } from "./usage.js";
 
@@ -599,6 +600,55 @@ export class Supervisor {
     };
   }
 
+  /**
+   * Compact digest of an agent's event log: counts, tool histogram, the last few tool calls and
+   * the tail of its latest message. Meant to replace reading the whole log just to see progress.
+   */
+  summarizeAgentEvents(agent: string, recent = 5): Record<string, unknown> {
+    const record = this.#requireRecord(agent);
+    const read = this.#events.read(record.id, 0);
+    const tools: Record<string, number> = {};
+    type Call = { sequence: number; tool: string; status: string; target?: string; preview?: string };
+    const calls: Call[] = [];
+    const byId = new Map<string, Call>();
+    let message = "";
+    let errors = 0;
+    let turns = 0;
+    for (const event of read.events) {
+      if (event.type === "tool.start") {
+        tools[event.data.toolName] = (tools[event.data.toolName] ?? 0) + 1;
+        const call: Call = { sequence: event.sequence, tool: event.data.toolName, status: "running", ...describeToolInput(event.data.input) };
+        byId.set(event.data.toolCallId, call);
+        calls.push(call);
+      } else if (event.type === "tool.end") {
+        const call = byId.get(event.data.toolCallId);
+        if (call) call.status = event.data.status;
+      } else if (event.type === "message.delta") {
+        message += event.data.text;
+        if (message.length > 4000) message = message.slice(-2000);
+      } else if (event.type === "turn.completed") {
+        turns += 1;
+        message = "";
+      } else if (event.type === "error") {
+        errors += 1;
+      }
+    }
+    return {
+      agent_id: record.id,
+      name: record.name,
+      state: record.state,
+      events: read.events.length,
+      currentSequence: read.currentSequence,
+      turns_completed: turns,
+      errors,
+      tool_calls: calls.length,
+      tools,
+      recent_tools: calls.slice(-recent).map(c => ({ ...c, tool: scanChildOutput(c.tool).slice(0, 80) })),
+      current_activity: record.meta.activity ?? null,
+      latest_message: scanChildOutput(message.trim()).slice(-300),
+    };
+  }
+
   async recordOutcome(agent: string, verdict: "success" | "partial" | "failure", score?: number, notes?: string): Promise<void> {
     const record = this.#requireRecord(agent);
     if (!this.#routing) return;
@@ -632,7 +682,7 @@ export class Supervisor {
           const previousActivity = record.meta.checkpointAt;
           record.updatedAt = new Date().toISOString();
           record.meta.activityAt = record.updatedAt;
-          if (event.type === 'tool.start') record.meta.activity = scanChildOutput(event.data.toolName).slice(0,160);
+          if (event.type === 'tool.start') record.meta.activity = scanChildOutput([event.data.toolName, describeToolInput(event.data.input).target].filter(Boolean).join(' ')).slice(0,160);
           if (event.type === 'tool.end' || event.type === 'turn.completed') delete record.meta.activity;
           if (!previousActivity || Date.parse(record.updatedAt) - Date.parse(previousActivity) >= 5000 || event.type === 'tool.start' || event.type === 'tool.end') { record.meta.checkpointAt = record.updatedAt; void this.#writeSnapshot().catch(() => {}); }
           if (event.type === "approval.requested") {

@@ -196,10 +196,14 @@ async function main(): Promise<void> {
         agent: z.string(),
         since: z.number().int().nonnegative().optional(),
         limit: z.number().int().positive().optional().describe("Caps events returned in this call"),
+        summary: z.boolean().optional().describe(
+          "Return a compact digest (state, tool counts, last few tool calls, tail of the latest message) instead of the raw log. Prefer this for progress checks.",
+        ),
       },
     },
-    async ({ agent, since, limit }) => toContent(await call("get_agent_events", {
+    async ({ agent, since, limit, summary }) => toContent(await call("get_agent_events", {
       agent,
+      ...(summary === undefined ? {} : { summary }),
       ...(since === undefined ? {} : { since }),
       ...(limit === undefined ? {} : { limit }),
     })),
