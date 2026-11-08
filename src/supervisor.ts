@@ -43,7 +43,6 @@ import { EventBuffer } from "./events/buffer.js";
 import type { AgentEvent } from "./events/schema.js";
 import { scanChildOutput } from "./safety/output.js";
 import { describeToolInput } from "./tool-describe.js";
-import { RoutingStore, projectRoutingPaths, ensureProjectMemoryIgnored, type MemoryScope } from "./storage/routing.js";
 import { remainingAllowances, UsageLedger } from "./usage.js";
 
 export type ToolAgentState = "starting" | "running" | "needs_approval" | "completed" | "interrupted" | "failed";
@@ -139,7 +138,6 @@ export interface SupervisorOptions {
   readonly registry: AgentConfigSource;
   readonly adapters: AdapterRegistry;
   readonly cwd: string;
-  readonly routing?: RoutingStore;
   /** Called once when a turn whose caller did not block (run_in_background) settles or needs approval. */
   readonly onDetachedSettled?: (result: Readonly<Record<string, unknown>>) => void;
   /** Overrides the registry cap. Calls wait in FIFO order once this many agents are active. */
@@ -169,7 +167,6 @@ export class Supervisor {
   readonly #agents = new Map<string, AgentRecord>();
   readonly #names = new Map<string, string>();
   readonly #events = new EventBuffer();
-  readonly #routing: RoutingStore | undefined;
   readonly #onDetachedSettled: ((result: Readonly<Record<string, unknown>>) => void) | undefined;
   readonly #codexResumeIdleMs: number | undefined;
   readonly #usage: UsageLedger;
@@ -185,7 +182,6 @@ export class Supervisor {
     this.#registry = options.registry;
     this.#adapters = options.adapters;
     this.#cwd = options.cwd;
-    this.#routing = options.routing;
     this.#onDetachedSettled = options.onDetachedSettled;
     this.#codexResumeIdleMs = options.codexResumeIdleMs;
     this.#usage = options.usage ?? new UsageLedger();
@@ -649,30 +645,6 @@ export class Supervisor {
     };
   }
 
-  async recordOutcome(agent: string, verdict: "success" | "partial" | "failure", score?: number, notes?: string): Promise<void> {
-    const record = this.#requireRecord(agent);
-    if (!this.#routing) return;
-    await this.#routing.append({
-      kind: "outcome",
-      delegationId: record.id,
-      recordedAt: new Date().toISOString(),
-      scope: "project",
-      verdict,
-      ...(score === undefined ? {} : { score }),
-      ...(notes === undefined ? {} : { notes }),
-    });
-  }
-
-  async addNote(text: string, scope: MemoryScope = "project"): Promise<void> {
-    if (!this.#routing) return;
-    await this.#routing.append({
-      kind: "note",
-      recordedAt: new Date().toISOString(),
-      scope,
-      text,
-    });
-  }
-
   #pump(record: AgentRecord, adapter: BackendAdapter): void {
     void (async () => {
       try {
@@ -1108,10 +1080,4 @@ export class Supervisor {
 
 export function modelRosterList(entries: readonly ModelEntry[]): readonly string[] {
   return entries.map((entry) => entry.name);
-}
-
-export async function defaultProjectRouting(projectRoot: string): Promise<RoutingStore> {
-  const paths = projectRoutingPaths(projectRoot);
-  await ensureProjectMemoryIgnored(projectRoot);
-  return new RoutingStore(paths);
 }
