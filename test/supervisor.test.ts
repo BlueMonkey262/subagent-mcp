@@ -530,6 +530,44 @@ test("spawn echoes the turn cap and send_message can override it", async () => {
   assert.match(String(resumed["warning"]), /no prompt cache/);
 });
 
+test("caps tool responses without truncating the persisted result", async () => {
+  const adapter = new FakeAdapter("codex");
+  const supervisor = new Supervisor({
+    registry: testRegistry([codexAgentConfig()]),
+    adapters: new AdapterRegistry([adapter]),
+    cwd: "/work",
+  });
+  const long = "x".repeat(3_999) + "😀" + "y".repeat(10);
+  const head = "x".repeat(3_999) + "😀";
+  const complete = () => adapter.queueScript([{
+    create: (context) => ({
+      type: "turn.completed" as const,
+      agentId: context.agentId,
+      backend: context.backend,
+      data: { turnId: context.turnId, status: "completed" as const, finalText: long },
+    }),
+  }]);
+
+  complete();
+  const spawned = await supervisor.spawnAgent({ agent: "general", prompt: "long", description: "result cap" });
+  const agentId = String(spawned["agent_id"]);
+  assert.equal(spawned["result"], `${head}\n[truncated 10 characters]`);
+  assert.equal(spawned["result_truncated"], true);
+  assert.match(String(spawned["result_hint"]), /get_agent_result/);
+
+  const waited = await supervisor.waitForAgents([agentId], "all", 0);
+  assert.equal((waited.agents[0] as Record<string, unknown>)["result"], spawned["result"]);
+
+  const full = supervisor.getAgentResult(agentId) as Record<string, unknown>;
+  assert.equal(full["result"], long);
+  assert.equal((full["selected_result"] as Record<string, unknown>)["result"], long);
+
+  complete();
+  const resumed = await supervisor.sendMessage({ agent: agentId, prompt: "again", max_result_chars: 5 });
+  assert.equal(resumed["result"], "xxxxx\n[truncated 4005 characters]");
+  assert.equal(resumed["result_truncated"], true);
+});
+
 test("a Codex resume past the idle limit is refused unless the caller opts in", async () => {
   const adapter = new FakeAdapter("codex");
   const supervisor = new Supervisor({

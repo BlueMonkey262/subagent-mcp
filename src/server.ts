@@ -60,6 +60,7 @@ async function main(): Promise<void> {
         "spawn. When the concurrency cap is full the call waits for a free slot instead of failing. `model` is " +
         "required unless the named agent config pins one; there is no default model at any layer. Implementation " +
         "work that requires search, iteration, or verification should go to a subagent rather than being done inline. " +
+        "Results are capped at 4000 characters by default; set `max_result_chars` to override the cap. " +
         ORCHESTRATOR_AUTHORITY_NOTICE,
       inputSchema: {
         agent: z.string().describe("Name of a configured agent in .subagents/<name>.md"),
@@ -84,6 +85,7 @@ async function main(): Promise<void> {
         timeout: z.number().int().positive().optional().describe(
           "Turn cap in seconds. Overrides the agent config for this spawn. Echoed back as timeout_seconds.",
         ),
+        max_result_chars: z.number().int().positive().optional().describe("Maximum result characters returned by this call"),
       },
     },
     async (input) => toContent(await call("spawn_agent", input)),
@@ -99,7 +101,8 @@ async function main(): Promise<void> {
         "after a long idle (default 30 minutes, codexResumeIdleSeconds in models.yaml) is refused unless " +
         "allow_expensive_resume is true. `timeout` is the turn cap in seconds and is echoed as timeout_seconds. " +
         "If the agent is still mid-turn, this queues the message (one slot) for delivery the moment the current turn " +
-        "ends, rather than failing — call list_agents/get_agent_events if you need to know when it lands.",
+        "ends, rather than failing — call list_agents/get_agent_events if you need to know when it lands. Results " +
+        "are capped at 4000 characters by default; set `max_result_chars` to override the cap.",
       inputSchema: {
         agent: z.string().describe("Agent ID or name"),
         prompt: z.string(),
@@ -114,6 +117,7 @@ async function main(): Promise<void> {
           "Resume a Codex agent even though it has been idle past the uncached-replay limit.",
         ),
         run_in_background: z.boolean().optional(),
+        max_result_chars: z.number().int().positive().optional().describe("Maximum result characters returned by this call"),
       },
     },
     async (input) => toContent(await call("send_message", input)),
@@ -138,8 +142,8 @@ async function main(): Promise<void> {
 
   server.registerTool('list_agent_configs', { description: 'Discover callable configs, source files, pinned options and backend capabilities', inputSchema: {} },
     async () => toContent(await call('list_agent_configs')));
-  server.registerTool('wait_for_agents', { description: 'Event-driven join; returns on any/all completion, approval, or timeout without stopping agents. Maximum 60 seconds.',
-    inputSchema: { agents: z.array(z.string()).min(1), mode: z.enum(['any','all']).optional(), timeout_seconds: z.number().min(0).max(60).optional() } },
+  server.registerTool('wait_for_agents', { description: 'Event-driven join; returns on any/all completion, approval, or timeout without stopping agents. Results are capped at 4000 characters by default; set max_result_chars to override. Maximum 60 seconds.',
+    inputSchema: { agents: z.array(z.string()).min(1), mode: z.enum(['any','all']).optional(), timeout_seconds: z.number().min(0).max(60).optional(), max_result_chars: z.number().int().positive().optional() } },
     async input => toContent(await call('wait_for_agents', input)));
   server.registerTool('get_agent_result', { description: 'Retrieve persisted results and paginated turn history after reconnect or resume',
     inputSchema: { agent: z.string(), turn: z.number().int().positive().optional(), offset: z.number().int().min(0).optional(), limit: z.number().int().min(1).max(100).optional() } },

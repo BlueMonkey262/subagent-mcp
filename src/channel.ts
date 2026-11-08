@@ -1,5 +1,7 @@
 import type { Server } from "@modelcontextprotocol/sdk/server/index.js";
 
+import { MAX_CONTENT_CHARS, truncateText } from "./truncate.js";
+
 /**
  * Claude Code "channel" push (https://code.claude.com/docs/en/channels-reference): a background
  * agent that settles is pushed into the parent session as a `<channel source="subagent-mcp" ...>`
@@ -15,9 +17,6 @@ export const CHANNEL_METHOD = "notifications/claude/channel";
 
 /** `clientInfo.name` Claude Code sends in `initialize`. */
 const CLAUDE_CODE_CLIENT_NAME = "claude-code";
-
-/** Long results are cut; the full text stays available via `get_agent_events`. */
-const MAX_CONTENT_CHARS = 4_000;
 
 export const CHANNEL_INSTRUCTIONS =
   'Every agent has a human-memorable name; refer to agents by name. When a run_in_background agent settles, ' +
@@ -56,11 +55,8 @@ export function formatChannelEvent(result: Readonly<Record<string, unknown>>): C
   } else {
     if (result.error !== undefined) lines.push(`error: ${JSON.stringify(result.error)}`);
     if (typeof result.result === "string" && result.result.length > 0) {
-      lines.push(
-        result.result.length > MAX_CONTENT_CHARS
-          ? `${result.result.slice(0, MAX_CONTENT_CHARS)}\n[truncated]`
-          : result.result,
-      );
+      const truncated = truncateText(result.result, MAX_CONTENT_CHARS);
+      lines.push(truncated.truncatedChars > 0 ? `${truncated.text}\n[truncated]` : result.result);
     }
   }
   return { content: lines.join("\n"), meta };
