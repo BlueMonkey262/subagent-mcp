@@ -12,7 +12,7 @@ models:
       description: Balanced default for most delegated work
     - name: claude-opus-5
       description: Highest capability, slower and more expensive
-    - name: claude-haiku-4-5-20251001
+    - name: claude-haiku-5-5
       description: Fast and cheap for narrow, well-scoped tasks
   codex:
     - name: gpt-5.6-sol
