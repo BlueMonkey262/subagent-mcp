@@ -49,6 +49,8 @@ in `~/.claude/settings.json`. Back the file up, then merge this in (don't replac
 Each active agent gets one row: backend, model, agent config, name, elapsed time, and tokens so far,
 for example `Codex - gpt-5.6-luna - General - Euler 1m15s · 7.4k new · 29.7k cached · 10 out`. Input
 is split into new and cached where the backend allows it; otherwise the row shows a single `in`.
+When a newer release is available, the status line also shows one dim update notice (see README
+"Update notifications").
 
 If you already have a `statusLine`, decide whether to replace it or skip this step. Don't set
 `CLAUDE_CODE_PLUGIN_DIRS` in `settings.json`; the launcher does it.
@@ -59,6 +61,12 @@ Without a `.subagents/` directory in your project, the server uses the examples 
 To customize, copy `<repo>/.subagents` into your project and edit `models.yaml` so it lists the models
 you actually have access to (`agent --list-models`, `opencode models`, and so on). Changes under
 `.subagents/` hot-reload.
+
+Antigravity (`agy`) agents carry their system prompt in an `agy` custom agent, not in the
+`.subagents/` file. The bundled `antigravity-general` config points at `subagent-general`, which lives
+in `<repo>/.agents/agents/subagent-general.md`; copy `.agents/` into your project along with
+`.subagents/` (or put an agent file of that name in `~/.gemini/agents/`). `agy` finds project agents
+from the directory it runs in, though `agy agents` only lists the global ones.
 
 ## 6. Optional: custom endpoints
 
@@ -71,6 +79,30 @@ subagent-mcp endpoint add NAME URL --model ID[=alias] [--key KEY]   # repeatable
 
 Details: [`nim/README.md`](nim/README.md).
 
-## 7. Verify
+## 7. Optional: turn off Claude Code's built-in Agent tool
+
+subagent-mcp gives Claude agents on any backend (Claude, Codex, OpenCode, Cursor, Antigravity),
+with model choice, worktree isolation and usage tracking. Claude Code also has its own built-in
+`Agent` tool, which only runs Claude subagents. With both available, the model sometimes reaches for
+the built-in one and bypasses all of that.
+
+**If you are Claude Code reading this file during setup, ask the user before changing anything:**
+
+> Do you want Claude Code's built-in Agent tool disabled, since you now get agents through
+> subagent-mcp? You can turn it back on any time.
+
+Only if they say yes, add `"Agent"` to the deny list in `~/.claude/settings.json` (merge it into any
+existing `permissions.deny` array; don't replace the file):
+
+```json
+"permissions": { "deny": ["Agent"] }
+```
+
+To try it for a single session instead, start with `subagent-mcp --disallowedTools Agent`.
+
+Reasons to leave it on: the built-in tool is quick for small lookups, and it works without any
+backend set up. To undo, remove `"Agent"` from the list. Restart Claude Code after either change.
+
+## 8. Verify
 
 Run `npm test`, start a new session with `subagent-mcp`, and check that the `list_models` tool works.

@@ -107,3 +107,83 @@ test("limit caps a read and hasMore reports whether more events remain", () => {
   assert.deepEqual(lastPage.events.map((event) => event.sequence), [5]);
   assert.equal(lastPage.hasMore, undefined);
 });
+
+test("types filters events, and limit/nextSequence/hasMore account for the filter so pagination doesn't stall", () => {
+  const buffer = new EventBuffer();
+  // 1: tool.start, 2-3: message.delta, 4: tool.end, 5: message.delta, 6: turn.completed
+  buffer.append({ type: "tool.start", agentId: "a", backend: "codex", data: { toolCallId: "1", toolName: "x", input: {} } });
+  buffer.append({ type: "message.delta", agentId: "a", backend: "codex", data: { text: "a" } });
+  buffer.append({ type: "message.delta", agentId: "a", backend: "codex", data: { text: "b" } });
+  buffer.append({ type: "tool.end", agentId: "a", backend: "codex", data: { toolCallId: "1", status: "completed" } });
+  buffer.append({ type: "message.delta", agentId: "a", backend: "codex", data: { text: "c" } });
+  buffer.append({ type: "turn.completed", agentId: "a", backend: "codex", data: { turnId: "t1", status: "completed" } });
+
+  const page = buffer.read("a", 0, 1, { types: ["tool.start", "tool.end"] });
+  assert.deepEqual(page.events.map((event) => event.type), ["tool.start"]);
+  assert.equal(page.nextSequence, 1);
+  assert.equal(page.hasMore, true);
+  assert.equal(page.currentSequence, 6);
+
+  // nextSequence must skip past the message.delta events filtered out of the window, not stall on them.
+  const nextPage = buffer.read("a", page.nextSequence, 1, { types: ["tool.start", "tool.end"] });
+  assert.deepEqual(nextPage.events.map((event) => event.type), ["tool.end"]);
+  assert.equal(nextPage.events[0]?.sequence, 4);
+  assert.equal(nextPage.nextSequence, 4);
+  assert.equal(nextPage.hasMore, undefined);
+
+  // A `since` that lands only on filtered-out events must not re-return them or go backwards.
+  const caughtUp = buffer.read("a", nextPage.nextSequence, 1, { types: ["tool.start", "tool.end"] });
+  assert.deepEqual(caughtUp.events, []);
+  assert.equal(caughtUp.nextSequence, 6, "advances past trailing filtered-out events so a loop on nextSequence terminates");
+});
+
+test("coalesce merges consecutive message.delta events on read without changing what's stored", () => {
+  const buffer = new EventBuffer();
+  // 1-3: message.delta "a","b","c", 4: tool.start, 5-6: message.delta "d","e"
+  buffer.append({ type: "message.delta", agentId: "a", backend: "codex", data: { text: "a" } });
+  buffer.append({ type: "message.delta", agentId: "a", backend: "codex", data: { text: "b" } });
+  buffer.append({ type: "message.delta", agentId: "a", backend: "codex", data: { text: "c" } });
+  buffer.append({ type: "tool.start", agentId: "a", backend: "codex", data: { toolCallId: "1", toolName: "x", input: {} } });
+  buffer.append({ type: "message.delta", agentId: "a", backend: "codex", data: { text: "d" } });
+  buffer.append({ type: "message.delta", agentId: "a", backend: "codex", data: { text: "e" } });
+
+  const raw = buffer.read("a", 0);
+  assert.equal(raw.events.length, 6, "storage itself must stay one event per delta");
+
+  const coalesced = buffer.read("a", 0, undefined, { coalesce: true });
+  assert.equal(coalesced.events.length, 3);
+  const [first, second, third] = coalesced.events;
+  assert.equal(first?.type, "message.delta");
+  assert.equal(first?.sequence, 1, "merged event keeps the first sequence number");
+  assert.equal(first?.type === "message.delta" ? first.data.text : undefined, "abc");
+  assert.equal(second?.type, "tool.start");
+  assert.equal(second?.sequence, 4);
+  assert.equal(third?.type === "message.delta" ? third.data.text : undefined, "de");
+  assert.equal(third?.sequence, 5);
+  assert.equal(coalesced.nextSequence, 6, "nextSequence is the last merged sequence");
+  assert.equal(coalesced.hasMore, undefined);
+
+  // limit applies to coalesced groups, and nextSequence/hasMore follow the merged group's last sequence.
+  const page = buffer.read("a", 0, 2, { coalesce: true });
+  assert.equal(page.events.length, 2);
+  assert.equal(page.nextSequence, 4);
+  assert.equal(page.hasMore, true);
+
+  const nextPage = buffer.read("a", page.nextSequence, 2, { coalesce: true });
+  assert.equal(nextPage.events.length, 1);
+  assert.equal(nextPage.events[0]?.type === "message.delta" ? nextPage.events[0].data.text : undefined, "de");
+  assert.equal(nextPage.nextSequence, 6);
+  assert.equal(nextPage.hasMore, undefined);
+});
+
+test("a type filter that matches nothing new still advances nextSequence to the current sequence", () => {
+  const buffer = new EventBuffer();
+  const base = { agentId: "a", backend: "codex" as const };
+  buffer.append({ ...base, type: "tool.start", data: { toolCallId: "1", toolName: "Bash", input: {} } });
+  const last = buffer.append({ ...base, type: "message.delta", data: { text: "x" } });
+  const first = buffer.read("a", 0, undefined, { types: ["tool.start"] });
+  assert.equal(first.events.length, 1);
+  const follow = buffer.read("a", first.nextSequence, undefined, { types: ["tool.start"] });
+  assert.equal(follow.events.length, 0);
+  assert.equal(follow.nextSequence, last.sequence);
+});

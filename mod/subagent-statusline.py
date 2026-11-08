@@ -8,7 +8,8 @@ from datetime import datetime, timezone
 
 LIVE = {"starting", "running", "needs_approval"}
 BLUE, BOLD, DIM, RESET = "\033[34m", "\033[1m", "\033[2m", "\033[0m"
-HARNESS_COLORS = {"codex": "\033[38;5;141m", "opencode": "\033[36m", "claude": "\033[38;5;208m"}  # purple, cyan, orange
+HARNESS_COLORS = {"codex": "\033[38;5;141m", "opencode": "\033[36m", "claude": "\033[38;5;208m",
+                  "cursor": "\033[97m", "antigravity": "\033[32m"}  # purple, cyan, orange, white, green
 
 def load_names():
     """Name pool shared with the server (src/agent-names.ts); only used for servers that don't send names."""
@@ -81,13 +82,14 @@ try:  # prune files of dead sessions (untouched for a day)
 except Exception:
     pass
 
+# Missing/stale live file: no agent rows (same as before), but still allow an update notice below.
+agents = []
 try:
     live = json.load(open(os.path.join(LIVE_DIR, session["session_id"] + ".json")))
-    if time.time() * 1000 - live["at"] > 10000:  # poller stopped; don't show ghosts
-        sys.exit(0)
-    agents = [a for a in live["agents"] if a.get("state") in LIVE]
+    if time.time() * 1000 - live["at"] <= 10000:  # fresh poll; skip when poller stopped (no ghosts)
+        agents = [a for a in live["agents"] if a.get("state") in LIVE]
 except Exception:
-    sys.exit(0)
+    pass
 
 saved = {}
 for d in here:
@@ -97,11 +99,20 @@ for d in here:
     except Exception:
         pass
 configs = {i: x.get("agentConfig", "") for i, x in saved.items()}
-agents = [a for a in agents if saved.get(a["agent_id"], {}).get("cwd") in here]
+def in_project(agent_id):
+    """An agent belongs here if it runs in this project, or in a managed worktree made from it."""
+    rec = saved.get(agent_id, {})
+    repo = ((rec.get("meta") or {}).get("worktree") or {}).get("repository")
+    return rec.get("cwd") in here or (repo is not None and repo in here)
+
+agents = [a for a in agents if in_project(a["agent_id"])]
 
 # the server assigns each agent its name; hash only as a fallback for older servers
 fallback = assign_names([a for a in agents if not a.get("name")])
 sep = f" {DIM}-{RESET} "
+
+# list_agents order isn't stable between polls; sort so rows never shuffle (oldest first, id breaks ties)
+agents.sort(key=lambda a: (a.get("created_at", ""), a["agent_id"]))
 
 for a in agents:
     backend = a.get("backend", "")
@@ -117,3 +128,34 @@ for a in agents:
         print(f"{BLUE}!{RESET} {row} {BLUE}needs approval{RESET}{used}")
     else:
         print(f"{row} {DIM}{elapsed(a['created_at'])}{RESET}{used}")
+
+# Host-written update cache; never network. One dim line if any project dir reports an available release.
+_SEMVER = re.compile(r"^v?(\d{1,9})\.(\d{1,9})\.(\d{1,9})$")  # stable releases only; bounded, no escapes
+
+def _ver(s):
+    m = _SEMVER.match(s) if isinstance(s, str) and len(s) <= 24 else None
+    return tuple(int(x) for x in m.groups()) if m else None
+
+def _running_version():
+    """The installed version (this script lives in <repo>/mod), so a cache made for another version is ignored."""
+    try:
+        pkg = os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "package.json")
+        return _ver(json.load(open(pkg)).get("version"))
+    except Exception:
+        return None
+
+if os.environ.get("SUBAGENT_MCP_UPDATE_CHECK", "").strip().lower() not in ("0", "false"):
+    running = _running_version()
+    for d in here:
+        try:
+            data = json.load(open(os.path.join(d, ".subagents", "memory", "update.json")))
+            current, latest = _ver(data.get("current")), _ver(data.get("latest"))
+            if current is None or latest is None or latest <= current:
+                continue  # `available` is derived from the versions, not trusted
+            if running is not None and current != running:
+                continue
+            fmt = lambda v: ".".join(map(str, v))
+            print(f"{DIM}subagent-mcp {fmt(latest)} available (you have {fmt(current)}){RESET}")
+            break
+        except Exception:
+            pass

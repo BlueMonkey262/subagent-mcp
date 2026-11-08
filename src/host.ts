@@ -1,9 +1,11 @@
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
+import { readdirSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { createConnection, createServer, type Server, type Socket } from "node:net";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 
 import { AdapterRegistry } from "./adapters/adapter.js";
 import { AntigravityAdapter } from "./adapters/antigravity/adapter.js";
@@ -13,11 +15,96 @@ import { CursorAdapter } from "./adapters/cursor/adapter.js";
 import { OpenCodeAdapter } from "./adapters/opencode/adapter.js";
 import { LiveConfig } from "./config/live.js";
 import { isBackend } from "./core/types.js";
+import type { EventReadOptions } from "./events/buffer.js";
+import type { NormalizedEventType } from "./events/schema.js";
 import type { ListAgentsInput, AgentSnapshot, SendMessageInput, SpawnAgentInput, Supervisor } from "./supervisor.js";
-import { Supervisor as SupervisorClass, defaultProjectRouting } from "./supervisor.js";
+import { Supervisor as SupervisorClass } from "./supervisor.js";
+import { ensureProjectMemoryIgnored } from "./storage/routing.js";
+import { checkForUpdate } from "./update-check.js";
 import { UsageLedger } from "./usage.js";
 
 export const HOST_PROTOCOL = 2;
+
+/** A fingerprint of compiled code: a hash of the `.js` files, and when the newest of them was written. */
+export interface BuildInfo {
+  readonly build: string;
+  /** Newest file mtime (ms). Orders builds, so a proxy never replaces a host with older code. */
+  readonly builtAt: number;
+}
+
+const BUILD_DIRECTORY = dirname(fileURLToPath(import.meta.url));
+
+/**
+ * The build this process loaded, taken at import time so a later rebuild on disk does not change
+ * it. A proxy that finds an idle host on an older build, with no other session attached, replaces
+ * it, so rebuilding and reconnecting picks up new code.
+ */
+const LOADED_BUILD = readBuild(BUILD_DIRECTORY);
+
+function readBuild(directory: string): BuildInfo {
+  const hash = createHash("sha256");
+  let builtAt = 0;
+  try {
+    const files = readdirSync(directory, { recursive: true, encoding: "utf8" })
+      .filter((file) => file.endsWith(".js"))
+      .sort();
+    for (const file of files) {
+      const path = join(directory, file);
+      hash.update(file).update("\0").update(readFileSync(path)).update("\0");
+      builtAt = Math.max(builtAt, statSync(path).mtimeMs);
+    }
+  } catch {
+    return { build: "unknown", builtAt: 0 };
+  }
+  return { build: hash.digest("hex").slice(0, 16), builtAt: Math.floor(builtAt) };
+}
+
+/** This process's build. `SUBAGENT_MCP_BUILD_ID` / `SUBAGENT_MCP_BUILD_TIME` override it (tests). */
+export function buildInfo(): BuildInfo {
+  const time = Number(process.env.SUBAGENT_MCP_BUILD_TIME);
+  return {
+    build: process.env.SUBAGENT_MCP_BUILD_ID ?? LOADED_BUILD.build,
+    builtAt: Number.isFinite(time) && process.env.SUBAGENT_MCP_BUILD_TIME !== undefined ? time : LOADED_BUILD.builtAt,
+  };
+}
+
+/** The build currently on disk, which differs from `buildInfo()` after a rebuild. */
+export function diskBuildInfo(): BuildInfo {
+  return process.env.SUBAGENT_MCP_DISK_BUILD_ID !== undefined
+    ? { build: process.env.SUBAGENT_MCP_DISK_BUILD_ID, builtAt: Number(process.env.SUBAGENT_MCP_BUILD_TIME ?? 0) }
+    : readBuild(BUILD_DIRECTORY);
+}
+
+export interface HostHello {
+  readonly protocol?: number;
+  readonly pid?: number;
+  readonly build?: string;
+  readonly builtAt?: number;
+  /** Connected clients, including the one asking. */
+  readonly clients?: number;
+  readonly active?: number;
+  readonly waiting?: number;
+}
+
+export type HostDisposition = "keep" | "newer" | "stale" | "replace" | "refuse";
+
+/**
+ * What a connecting proxy does with a host:
+ * - `keep`: same build.
+ * - `newer`: the host runs newer code than this proxy; keep it (never downgrade) and reconnect the proxy.
+ * - `replace`: the host runs older code (or predates build reporting), is idle, and no other session uses it.
+ * - `stale`: older code, but agents are running or waiting, or another session is attached; keep it for now.
+ * - `refuse`/`replace` on a protocol mismatch, by whether agents are running.
+ */
+export function hostDisposition(hello: HostHello, local: BuildInfo): HostDisposition {
+  const busy = (hello.active ?? 0) > 0 || (hello.waiting ?? 0) > 0;
+  if (hello.protocol !== HOST_PROTOCOL) return busy ? "refuse" : "replace";
+  if (hello.build === local.build) return "keep";
+  if (typeof hello.builtAt === "number" && hello.builtAt > local.builtAt) return "newer";
+  const otherClients = Math.max(0, (hello.clients ?? 1) - 1);
+  return busy || otherClients > 0 ? "stale" : "replace";
+}
+
 const IDLE_EXIT_MS = 60_000;
 const CONNECT_WAIT_MS = 8_000;
 const RECORDED_HOST_WAIT_MS = 2_000;
@@ -34,7 +121,9 @@ export interface HostPaths {
 
 export function hostPaths(cwd: string): HostPaths {
   const directory = join(resolve(cwd), ".subagents", "memory");
-  const hash = createHash("sha256").update(resolve(cwd)).digest("hex").slice(0, 16);
+  // Hash the canonical path: on macOS /tmp and /var are symlinks into /private, and a spawned
+  // host's process.cwd() reports the resolved path, so the client must hash the same string.
+  const hash = createHash("sha256").update(canonicalPath(cwd)).digest("hex").slice(0, 16);
   return {
     socketPath: join(tmpdir(), `subagent-mcp-${hash}.sock`),
     directory,
@@ -44,6 +133,14 @@ export function hostPaths(cwd: string): HostPaths {
     lockPath: join(directory, "host.lock"),
     logPath: join(directory, "host.log"),
   };
+}
+
+function canonicalPath(path: string): string {
+  try {
+    return realpathSync(path);
+  } catch {
+    return resolve(path);
+  }
 }
 
 export interface RunningHost {
@@ -77,7 +174,7 @@ export async function serveHost(options: {
           if (shuttingDown) return;
           shuttingDown = true;
           options.onShutdown?.();
-        });
+        }, { clients: () => sockets.size });
       }
     });
     const drop = (): void => {
@@ -155,6 +252,117 @@ export async function connectHost(options: {
   return waitForHost(paths.socketPath);
 }
 
+const RESTART_EXIT_WAIT_MS = 10_000;
+
+/**
+ * The proxy's connection to its project host, and the one place that replaces it. Owns the client
+ * so a failed restart never leaves tool calls on a closed connection.
+ */
+export class HostSession {
+  #client: HostClient | undefined;
+  #error: Error | undefined;
+  readonly #detached: ((data: Readonly<Record<string, unknown>>) => void)[] = [];
+
+  constructor(readonly options: Parameters<typeof connectHost>[0]) {}
+
+  async connect(): Promise<void> {
+    try {
+      this.#attach(await connectHost(this.options));
+    } catch (error) {
+      // Startup failures used to reach stderr (visible in Claude Code's MCP log); keep that.
+      process.stderr.write(`subagent-mcp: ${error instanceof Error ? error.message : String(error)}\n`);
+      this.#fail(error);
+    }
+  }
+
+  onDetached(listener: (data: Readonly<Record<string, unknown>>) => void): void {
+    this.#detached.push(listener);
+    this.#client?.onDetached(listener);
+  }
+
+  async call(method: string, params?: unknown): Promise<unknown> {
+    if (this.#client === undefined) {
+      throw this.#error ?? new Error("subagent-mcp host is not connected. Ask the user to run `/mcp` and then reconnect subagent-mcp.");
+    }
+    return this.#client.call(method, params);
+  }
+
+  /** Why the connected host's code differs from this proxy's, if it does. */
+  warning(): string | undefined {
+    const host = this.#client?.host;
+    const local = buildInfo();
+    if (host === undefined || host.build === local.build) return undefined;
+    if (typeof host.builtAt === "number" && host.builtAt > local.builtAt) {
+      return "The subagent-mcp host runs newer code than this MCP connection. Ask the user to run `/mcp` and " +
+        "reconnect subagent-mcp to load updated tool definitions.";
+    }
+    return "The subagent-mcp host runs an older build than this MCP connection, because agents were running or " +
+      "another session was attached when it connected. Once agents finish and other sessions disconnect, call " +
+      "restart_host to load the new code.";
+  }
+
+  /**
+   * Replace the host with one running the code on disk. Refused while agents run or wait (always),
+   * and, unless `force`, when the host already runs the code on disk or other sessions are attached
+   * (replacing it would drop their connections).
+   */
+  async restart(force = false): Promise<Readonly<Record<string, unknown>>> {
+    const client = this.#client;
+    const hello = client === undefined ? undefined : await client.call("hello", undefined, 2_000).catch(() => undefined) as HostHello | undefined;
+    if (hello !== undefined && client !== undefined) {
+      if ((hello.active ?? 0) > 0 || (hello.waiting ?? 0) > 0) {
+        throw new Error("subagent-mcp host still has running agents and will not restart; wait for them to finish.");
+      }
+      if (!force && hello.build === diskBuildInfo().build) {
+        throw new Error("The subagent-mcp host already runs the code on disk; there is nothing to reload. Pass force: true to restart anyway.");
+      }
+      const others = Math.max(0, (hello.clients ?? 1) - 1);
+      if (!force && others > 0) {
+        throw new Error(
+          `${others} other session(s) are connected to this subagent-mcp host; restarting would disconnect them. ` +
+            "Ask the user, then pass force: true to restart anyway.",
+        );
+      }
+      await client.call("shutdown", undefined, 5_000);
+      client.close();
+      this.#client = undefined;
+      const pid = positiveInteger(hello.pid);
+      if (pid !== undefined) await waitForExit(pid, RESTART_EXIT_WAIT_MS);
+    }
+    try {
+      this.#attach(await connectHost(this.options));
+    } catch (error) {
+      this.#fail(error);
+      throw this.#error;
+    }
+    const next = this.#client!.host;
+    return {
+      restarted: true,
+      ...(hello?.pid === undefined ? {} : { previous_pid: hello.pid }),
+      pid: next?.pid,
+      build: next?.build,
+      build_changed: hello?.build !== next?.build,
+      ...(this.warning() === undefined ? {} : { host_warning: this.warning() }),
+    };
+  }
+
+  close(): void {
+    this.#client?.close();
+  }
+
+  #attach(client: HostClient): void {
+    this.#client = client;
+    this.#error = undefined;
+    for (const listener of this.#detached) client.onDetached(listener);
+  }
+
+  #fail(error: unknown): void {
+    this.#client = undefined;
+    const message = error instanceof Error ? error.message : String(error);
+    this.#error = new Error(message.includes("/mcp") ? message : `${message} Ask the user to run \`/mcp\` and then reconnect subagent-mcp.`);
+  }
+}
+
 export async function runHost(): Promise<void> {
   const cwd = process.cwd();
   const agentsDirectory = process.env.SUBAGENT_MCP_AGENTS_DIR ?? join(cwd, ".subagents");
@@ -185,9 +393,10 @@ export async function runHost(): Promise<void> {
 
   const live = new LiveConfig({ agentsDirectory, modelsFile });
   await live.reload();
+  // Sessions, the lock and the usage ledger live in .subagents/memory; keep it out of the user's git.
+  await ensureProjectMemoryIgnored(cwd).catch(() => undefined);
   const usage = new UsageLedger(paths.usagePath);
   await usage.load();
-  const routing = await defaultProjectRouting(cwd).catch(() => undefined);
   const claude = new ClaudeAdapter();
   const codex = new CodexAdapter();
   const opencode = new OpenCodeAdapter();
@@ -199,8 +408,8 @@ export async function runHost(): Promise<void> {
     adapters: new AdapterRegistry([claude, codex, opencode, antigravity, cursor]),
     cwd,
     usage,
+    updateCachePath: join(paths.directory, "update.json"),
     maxConcurrent: live.maxConcurrent(),
-    ...(routing === undefined ? {} : { routing }),
     onDetachedSettled: (result) => endpoint?.notify({ event: "detached", data: result }),
   });
   live.watch(() => supervisor.setMaxConcurrent(live.maxConcurrent()));
@@ -212,12 +421,20 @@ export async function runHost(): Promise<void> {
   await supervisor.recoverResults();
   supervisor.restorePending(pending);
 
+  const runUpdateCheck = (): void => {
+    void checkForUpdate({ memoryDirectory: paths.directory }).catch(() => undefined);
+  };
+  runUpdateCheck();
+  const updateTimer = setInterval(runUpdateCheck, 24 * 60 * 60 * 1_000);
+  updateTimer.unref();
+
   let shuttingDown = false;
   let idleTimer: NodeJS.Timeout | undefined;
   const shutdown = async (): Promise<void> => {
     if (shuttingDown) return;
     shuttingDown = true;
     if (idleTimer !== undefined) clearTimeout(idleTimer);
+    clearInterval(updateTimer);
     live.close();
     await Promise.all([
       claude.closeAll(),
@@ -272,6 +489,8 @@ export class HostClient {
   #buffer = "";
   #nextId = 1;
   #closed = false;
+  /** The host's `hello` when this client connected: its build, and whether it was kept as stale or newer. */
+  host: HostHello | undefined;
 
   static connect(socketPath: string, timeoutMs = 5_000): Promise<HostClient> {
     return new Promise((resolve, reject) => {
@@ -378,6 +597,7 @@ async function handleLine(
   line: string,
   supervisor: Supervisor,
   onShutdown: () => void,
+  context: DispatchContext,
 ): Promise<void> {
   let request: unknown;
   try {
@@ -393,7 +613,7 @@ async function handleLine(
   const id = request["id"];
   const method = request["method"];
   try {
-    const result = await dispatch(supervisor, method, request["params"]);
+    const result = await dispatch(supervisor, method, request["params"], context);
     socket.write(`${JSON.stringify({ id, result })}\n`);
     if (method === "shutdown") setTimeout(onShutdown, 30);
   } catch (error) {
@@ -404,11 +624,26 @@ async function handleLine(
   }
 }
 
-async function dispatch(supervisor: Supervisor, method: string, params: unknown): Promise<unknown> {
+/** The build this host process started with (see `buildId`); fixed for the life of the process. */
+const HOST_BUILD = buildInfo();
+
+interface DispatchContext {
+  /** Clients currently connected to this host. */
+  readonly clients: () => number;
+}
+
+async function dispatch(supervisor: Supervisor, method: string, params: unknown, context: DispatchContext): Promise<unknown> {
   const input = isRecord(params) ? params : {};
   switch (method) {
     case "hello":
-      return { protocol: HOST_PROTOCOL, pid: process.pid, ...supervisor.concurrency() };
+      return {
+        protocol: HOST_PROTOCOL,
+        pid: process.pid,
+        build: HOST_BUILD.build,
+        builtAt: HOST_BUILD.builtAt,
+        clients: context.clients(),
+        ...supervisor.concurrency(),
+      };
     case "spawn_agent":
       return supervisor.spawnAgent(input as unknown as SpawnAgentInput);
     case "send_message":
@@ -416,7 +651,8 @@ async function dispatch(supervisor: Supervisor, method: string, params: unknown)
     case "list_agents":
       return supervisor.sessionView(input as ListAgentsInput);
     case "list_agent_configs": return supervisor.listAgentConfigs();
-    case "wait_for_agents": return supervisor.waitForAgents(input.agents as string[], input.mode as 'all' | 'any' | undefined, input.timeout_seconds as number | undefined);
+    case "wait_for_agents": return supervisor.waitForAgents(input.agents as string[], input.mode as 'all' | 'any' | undefined,
+      input.timeout_seconds as number | undefined, input.since as string | undefined, input.max_result_chars as number | undefined);
     case "get_agent_result": return supervisor.getAgentResult(requiredString(input, 'agent'), input.turn as number | undefined, input.offset as number | undefined, input.limit as number | undefined);
     case "cleanup_worktree": return supervisor.cleanupWorktree(requiredString(input, 'agent'));
     case "stop_agents": return supervisor.stopAgents(input.agents as string[] | undefined, input.group_id as string | undefined);
@@ -433,31 +669,20 @@ async function dispatch(supervisor: Supervisor, method: string, params: unknown)
     case "get_agent_events": {
       const agent = requiredString(input, "agent");
       const since = typeof input["since"] === "number" ? input["since"] : 0;
+      if (input["summary"] === true) return supervisor.summarizeAgentEvents(agent, 5, since);
+      const types = Array.isArray(input["types"]) ? (input["types"] as NormalizedEventType[]) : undefined;
+      const coalesce = input["coalesce"] === true;
+      const options: EventReadOptions | undefined =
+        types !== undefined || coalesce ? { ...(types !== undefined ? { types } : {}), ...(coalesce ? { coalesce } : {}) } : undefined;
       return typeof input["limit"] === "number"
-        ? supervisor.getAgentEvents(agent, since, input["limit"])
-        : supervisor.getAgentEvents(agent, since);
+        ? supervisor.getAgentEvents(agent, since, input["limit"], options)
+        : supervisor.getAgentEvents(agent, since, undefined, options);
     }
     case "list_models":
       return supervisor.listModels(
         isBackend(input["backend"]) ? input["backend"] : undefined,
         ...(typeof input["live"] === "boolean" ? [input["live"]] : []),
       );
-    case "record_outcome": {
-      const agent = requiredString(input, "agent");
-      const verdict = requiredVerdict(input["verdict"]);
-      const score = input["score"];
-      const notes = input["notes"];
-      if (typeof score === "number" && typeof notes === "string") await supervisor.recordOutcome(agent, verdict, score, notes);
-      else if (typeof score === "number") await supervisor.recordOutcome(agent, verdict, score);
-      else if (typeof notes === "string") await supervisor.recordOutcome(agent, verdict, undefined, notes);
-      else await supervisor.recordOutcome(agent, verdict);
-      return { recorded: true };
-    }
-    case "add_note": {
-      const scope = input["scope"];
-      await supervisor.addNote(requiredString(input, "text"), scope === "user" ? "user" : "project");
-      return { recorded: true };
-    }
     case "shutdown": {
       const { active, waiting } = supervisor.concurrency();
       if (active > 0 || waiting > 0) {
@@ -527,17 +752,15 @@ async function connectCompatibleHost(socketPath: string): Promise<{
   if (client === undefined) return {};
   let keep = false;
   try {
-    const hello = await client.call("hello", undefined, 2_000) as {
-      protocol?: number;
-      active?: number;
-      pid?: number;
-    };
-    if (hello.protocol === HOST_PROTOCOL) {
+    const hello = await client.call("hello", undefined, 2_000) as HostHello;
+    const disposition = hostDisposition(hello, buildInfo());
+    if (disposition === "keep" || disposition === "stale" || disposition === "newer") {
       keep = true;
+      client.host = hello;
       const pid = positiveInteger(hello.pid);
       return { client, ...(pid === undefined ? {} : { pid }) };
     }
-    if ((hello.active ?? 0) > 0) {
+    if (disposition === "refuse") {
       throw new Error(
         `subagent-mcp host speaks protocol ${String(hello.protocol)} and still has running agents. ` +
           "Stop those agents, then ask the user to run `/mcp` and then reconnect subagent-mcp.",
@@ -634,11 +857,12 @@ async function waitForHost(socketPath: string): Promise<HostClient> {
   while (Date.now() < deadline) {
     try {
       const client = await HostClient.connect(socketPath, 300);
-      const hello = await client.call("hello", undefined, 2_000) as { protocol?: number };
+      const hello = await client.call("hello", undefined, 2_000) as HostHello;
       if (hello.protocol !== HOST_PROTOCOL) {
         client.close();
         throw new Error(`subagent-mcp host protocol is ${String(hello.protocol)}, this client speaks ${HOST_PROTOCOL}`);
       }
+      client.host = hello;
       return client;
     } catch (error) {
       lastError = error;
@@ -707,11 +931,6 @@ function requiredString(record: Readonly<Record<string, unknown>>, key: string):
 function requiredDecision(value: unknown): "allow" | "allow_for_session" | "deny" {
   if (value === "allow" || value === "allow_for_session" || value === "deny") return value;
   throw new Error("decision must be allow, allow_for_session, or deny");
-}
-
-function requiredVerdict(value: unknown): "success" | "partial" | "failure" {
-  if (value === "success" || value === "partial" || value === "failure") return value;
-  throw new Error("verdict must be success, partial, or failure");
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
