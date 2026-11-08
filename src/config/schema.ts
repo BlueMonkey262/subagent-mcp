@@ -1,4 +1,5 @@
 import type { Backend } from "../core/types.js";
+import type { ModelPolicy } from "../core/model-policy.js";
 
 export type PermissionDefault = "allow" | "deny" | "escalate";
 
@@ -44,6 +45,8 @@ export interface AgentConfig {
 export interface ModelEntry {
   /** Exact value accepted by a spawn call and passed to the backend. */
   readonly name: string;
+  /** Actual model id behind an endpoint alias; absent for ordinary roster entries. */
+  readonly upstreamModel?: string;
   /** Provider/backend version identifier for non-stationary routing records. */
   readonly version?: string;
   readonly description?: string;
@@ -69,6 +72,8 @@ export interface ServerLimits {
   readonly maxConcurrent: number;
   readonly codexResumeIdleMs: number;
   readonly allowances: Readonly<Partial<Record<Backend, Allowance>>>;
+  /** Which backends and models are refused (see core/model-policy.ts). */
+  readonly modelPolicy: ModelPolicy;
 }
 
 export interface ResolvedAgentConfig extends Omit<AgentConfig, "model"> {

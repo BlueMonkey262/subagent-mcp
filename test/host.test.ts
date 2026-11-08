@@ -306,6 +306,24 @@ test("connectHost refuses to duplicate a live recorded pid with a missing socket
   assert.equal(JSON.parse(await readFile(paths.pidPath, "utf8")).pid, process.pid);
 });
 
+test("host errors keep their code, first in the message", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "subagent-host-codes-"));
+  const supervisor = new Supervisor({ registry: registry(), adapters: new AdapterRegistry([new FakeAdapter("codex")]), cwd });
+  const paths = hostPaths(cwd);
+  const endpoint = await serveHost({ socketPath: paths.socketPath, supervisor });
+  const client = await HostClient.connect(paths.socketPath);
+  try {
+    await assert.rejects(
+      client.call("spawn_agent", { agent: "missing", prompt: "hi", description: "no such agent" }),
+      (error: Error & { code?: string }) => error.code === "CONFIGURATION_ERROR" && error.message.startsWith("CONFIGURATION_ERROR: "),
+    );
+  } finally {
+    client.close();
+    await endpoint.close();
+    await rm(paths.socketPath, { force: true });
+  }
+});
+
 /** Run `body` with build-identity env overrides, restoring the previous values afterwards. */
 async function withBuildEnv<T>(env: Record<string, string | undefined>, body: () => Promise<T>): Promise<T> {
   const saved = Object.fromEntries(Object.keys(env).map((key) => [key, process.env[key]]));

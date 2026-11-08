@@ -45,7 +45,8 @@ import type { AgentConfigSource } from "./config/registry.js";
 import type { Backend, Usage } from "./core/types.js";
 import type { ModelEntry } from "./config/schema.js";
 import { AgentCapacity, childDepthEnv } from "./core/limits.js";
-import { ConfigurationError, SubagentError } from "./core/errors.js";
+import { blockReason, describeBlock, isRestrictive, ModelBlockedError } from "./core/model-policy.js";
+import { ConfigInvalidError, ConfigurationError, SubagentError } from "./core/errors.js";
 import { EventBuffer } from "./events/buffer.js";
 import type { EventReadOptions } from "./events/buffer.js";
 import type { AgentEvent } from "./events/schema.js";
@@ -232,8 +233,11 @@ export class Supervisor {
   async listModels(backend?: Backend, live: boolean = backend !== undefined): Promise<Readonly<Record<string, unknown>>> {
     const local = { ...this.#localModels(backend), ...await this.#updateNotice() };
     if (!live) return local;
-    const adapters = this.#adapters.list().filter((adapter) =>
-      adapter.providerInfo !== undefined && (backend === undefined || adapter.backend === backend));
+    const disabled = this.#registry.modelPolicy().disabledBackends;
+    if (backend !== undefined && disabled.includes(backend)) return { ...local, live: { disabled: true } };
+    // A disabled backend is not queried: that would start its CLI or server for nothing.
+    const adapters = this.#adapters.list().filter((adapter) => adapter.providerInfo !== undefined
+      && !disabled.includes(adapter.backend) && (backend === undefined || adapter.backend === backend));
     const entries = await Promise.all(adapters.map(async (adapter) =>
       [adapter.backend, await this.#liveInfo(adapter)] as const));
     if (entries.length === 0) return local;
@@ -272,16 +276,57 @@ export class Supervisor {
     try {
       const info = await Promise.race([adapter.providerInfo!(controller.signal), timedOut]);
       if (info.models === undefined) return info;
-      const offered = new Set(info.models.map((model) => model.id));
+      const policy = this.#registry.modelPolicy();
+      const models = info.models.map((model) => {
+        const reason = blockReason(policy, adapter.backend, model.id);
+        return reason === undefined ? model : { ...model, blocked: true, blocked_by: describeBlock(reason) };
+      });
+      const offered = new Set(models.map((model) => model.id));
       const roster = this.#registry.listModels(adapter.backend) as readonly ModelEntry[];
       // Entries routed to a custom provider (e.g. endpoint models) are outside the backend's own catalog.
       const missing = roster.filter((entry) => entry.provider === undefined && !offered.has(entry.name)).map((entry) => entry.name);
-      return { ...info, ...(missing.length === 0 ? {} : { roster_not_offered: missing }) };
+      return { ...info, models, ...(missing.length === 0 ? {} : { roster_not_offered: missing }) };
     } catch (error) {
       return { error: error instanceof Error ? error.message : String(error) };
     } finally {
       clearTimeout(timer);
     }
+  }
+
+  /** Refuse what models.yaml or the environment blocks (see core/model-policy.ts). */
+  #assertModelAllowed(backend: Backend, model: string): void {
+    const entries = this.#registry.listModels(backend) as readonly ModelEntry[];
+    const upstream = entries.find((entry) => entry.name === model)?.upstreamModel;
+    const reason = blockReason(this.#registry.modelPolicy(), backend, model, upstream);
+    if (reason !== undefined) throw new ModelBlockedError(reason, backend, model);
+  }
+
+  #assertConfigValid(): void {
+    const warning = this.#registry.configWarning();
+    if (warning !== undefined) throw new ConfigInvalidError(warning);
+  }
+
+  /** The roster, with `blocked: true` and `blocked_by` on entries the model policy refuses. */
+  #roster(backend?: Backend): unknown {
+    const roster = this.#registry.listModels(backend);
+    const policy = this.#registry.modelPolicy();
+    if (!isRestrictive(policy)) return roster;
+    const mark = (owner: Backend, entries: readonly ModelEntry[]) => entries.map((entry) => {
+      const reason = blockReason(policy, owner, entry.name, entry.upstreamModel);
+      return reason === undefined ? entry : { ...entry, blocked: true, blocked_by: describeBlock(reason) };
+    });
+    if (backend !== undefined) return mark(backend, roster as readonly ModelEntry[]);
+    return Object.fromEntries(Object.entries(roster as Readonly<Record<Backend, readonly ModelEntry[]>>)
+      .map(([owner, entries]) => [owner, mark(owner as Backend, entries)]));
+  }
+
+  #policyView(): Readonly<Record<string, unknown>> {
+    const policy = this.#registry.modelPolicy();
+    return {
+      claude_models_blocked: policy.blockClaudeModels,
+      disabled_backends: policy.disabledBackends,
+      block_models: policy.blockModels,
+    };
   }
 
   #localModels(backend?: Backend): Readonly<Record<string, unknown>> {
@@ -292,7 +337,8 @@ export class Supervisor {
     const filteredAllowance = backend === undefined ? allowances : allowances[backend];
     const filteredRemaining = backend === undefined ? remaining : remaining[backend];
     return {
-      models: this.#registry.listModels(backend),
+      models: this.#roster(backend),
+      ...(isRestrictive(this.#registry.modelPolicy()) ? { model_policy: this.#policyView() } : {}),
       usage: backend === undefined ? usage : usage[backend],
       ...(filteredAllowance === undefined || (backend !== undefined && filteredAllowance === undefined)
         ? {}
@@ -335,9 +381,18 @@ export class Supervisor {
       .sort(newestFirst);
   }
 
+  /** A config is blocked when its whole backend is, or when the model it pins is. */
+  #configBlock(backend: Backend, model: string | undefined): Readonly<Record<string, unknown>> {
+    const policy = this.#registry.modelPolicy();
+    const reason = policy.disabledBackends.includes(backend) ? { kind: "backend" as const }
+      : model === undefined ? undefined : blockReason(policy, backend, model);
+    return reason === undefined ? {} : { blocked: true, blocked_by: describeBlock(reason) };
+  }
+
   listAgentConfigs() {
     return { configs: this.#registry.listAgents().map(config => ({ name: config.name, source_path: config.sourcePath,
-      backend: config.backend, model: config.model, effort: config.reasoningEffort, capabilities: capabilities(config.backend) })),
+      backend: config.backend, model: config.model, effort: config.reasoningEffort, capabilities: capabilities(config.backend),
+      ...this.#configBlock(config.backend, config.model) })),
       config_warning: this.#registry.configWarning() };
   }
 
@@ -455,12 +510,14 @@ export class Supervisor {
   }
 
   async spawnAgent(input: SpawnAgentInput, task?: PendingTask): Promise<Readonly<Record<string, unknown>>> {
+    this.#assertConfigValid();
     const resolved = this.#registry.resolveAgent({
       agent: input.agent,
       ...(input.model === undefined ? {} : { model: input.model }),
       ...(input.backend === undefined ? {} : { backend: input.backend }),
       ...(input.effort === undefined ? {} : { reasoningEffort: input.effort }),
     });
+    this.#assertModelAllowed(resolved.backend, resolved.model);
     if (input.result_schema) validator.compile(input.result_schema);
     if (input.permission && resolved.backend !== 'claude') throw new SupervisorError('This backend cannot enforce per-spawn permission restrictions');
     const permission = restrictPermission(resolved.permission, input.permission);
@@ -476,10 +533,15 @@ export class Supervisor {
     const timeoutSeconds = input.timeout ?? resolved.timeout ?? null;
     const release = await this.#acquireCapacity();
     if (task?.state === 'interrupted') { release(); return { status: 'interrupted' }; }
+    // The policy can change while a spawn waits for a slot (models.yaml is hot-reloaded).
+    try { this.#assertModelAllowed(resolved.backend, resolved.model); } catch (error) { release(); throw error; }
     let worktree: Worktree | undefined;
     let launched = false;
     try {
       if (input.isolation === 'worktree') { worktree = await createWorktree(this.#cwd); await setupWorktree(worktree, resolved.worktreeSetup ?? []); }
+      // Config can hot-reload while worktree setup commands run.
+      this.#assertConfigValid();
+      this.#assertModelAllowed(resolved.backend, resolved.model);
       const turn = await adapter.spawn({
         prompt: input.prompt + (input.result_schema ? '\nReturn only JSON matching this schema: ' + JSON.stringify(input.result_schema) : ''),
         description: input.description,
@@ -541,8 +603,10 @@ export class Supervisor {
   }
 
   async sendMessage(input: SendMessageInput): Promise<Readonly<Record<string, unknown>>> {
+    this.#assertConfigValid();
     const record = this.#requireRecord(input.agent);
     if (record.meta.cleaned) throw new SupervisorError("Worktree was removed; spawn a new agent");
+    this.#assertModelAllowed(record.backend, record.model);
     if (record.state === "starting" || record.state === "running") {
       // No queue used to mean "already has an active turn" was a hard error, forcing the caller
       // to notice and manually resend once the child finished — finding #5 in
@@ -578,6 +642,7 @@ export class Supervisor {
     // The agent went terminal and released its slot; resuming it is active work
     // again, so re-count it. The call waits when the pool is full.
     record.release = await this.#acquireCapacity();
+    try { this.#assertModelAllowed(record.backend, record.model); } catch (error) { record.release(); throw error; }
     record.state = "running";
     record.timedOut = false;
     delete record.lastError;
@@ -600,6 +665,10 @@ export class Supervisor {
 
   /** Shared by sendMessage() and the queued-message delivery inside #pump(). */
   async #deliverResume(record: AgentRecord, adapter: BackendAdapter, prompt: string, effort?: string, timeout?: number): Promise<void> {
+    // Checked here too, not only when send_message is called: a queued message is delivered after
+    // the current turn ends, by which time the policy may have changed.
+    this.#assertConfigValid();
+    this.#assertModelAllowed(record.backend, record.model);
     const resolved = this.#registry.resolveAgent({
       agent: record.agentConfig,
       model: record.model,
@@ -834,7 +903,17 @@ export class Supervisor {
                 timedOut: record.timedOut,
               });
               record.timedOut = false;
-              await this.#deliverResume(record, adapter, pending.prompt, pending.effort, pending.timeout);
+              try {
+                await this.#deliverResume(record, adapter, pending.prompt, pending.effort, pending.timeout);
+              } catch (error) {
+                if (!(error instanceof ModelBlockedError) && !(error instanceof ConfigInvalidError)) throw error;
+                // The queued message is refused; the agent ends on the turn that just finished.
+                record.lastError = { code: error.code, message: error.message };
+                record.state = event.data.status === "completed" ? "completed"
+                  : event.data.status === "interrupted" ? "interrupted" : "failed";
+                record.release();
+                await this.#notify(record);
+              }
               continue;
             }
             record.state = event.data.status === "completed" ? "completed"

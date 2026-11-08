@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { mkdtemp, readFile, writeFile } from 'node:fs/promises';
+import { access, mkdtemp, readFile, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { execFile } from 'node:child_process';
@@ -8,7 +8,8 @@ import { promisify } from 'node:util';
 import { Supervisor } from '../src/supervisor.js';
 import { FakeAdapter } from '../src/adapters/fake.js';
 import { AdapterRegistry } from '../src/adapters/adapter.js';
-import { ConfigRegistry } from '../src/config/registry.js';
+import { ConfigRegistry, defaultServerLimits } from '../src/config/registry.js';
+import type { Backend } from '../src/core/types.js';
 import { createWorktree, discardWorktree, removeWorktree, restrictPermission } from '../src/execution.js';
 const exec = promisify(execFile);
 function fixture() {
@@ -92,6 +93,39 @@ test('managed worktrees retain branches and refuse dirty cleanup', async () => {
   await writeFile(join(failed.path, 'setup-output'), 'partial setup');
   await discardWorktree(failed);
   assert.equal((await exec('git', ['branch','--list',failed.branch], { cwd: repository })).stdout.trim(), '');
+});
+
+test('spawn rechecks model policy after worktree setup and cleans up on refusal', async () => {
+  const repository = await mkdtemp(join(tmpdir(), 'worktree-policy-'));
+  await exec('git', ['init', repository]);
+  await exec('git', ['-c','user.name=Test','-c','user.email=test@example.com','commit','--allow-empty','-m','initial'], { cwd: repository });
+  const started = join(repository, 'setup-started');
+  const release = join(repository, 'setup-release');
+  const adapter = new FakeAdapter('claude');
+  const limits = {
+    ...defaultServerLimits(),
+    modelPolicy: { blockClaudeModels: false, disabledBackends: [] as Backend[], blockModels: [] as string[] },
+  };
+  const registry = new ConfigRegistry([{
+    name: 'general', backend: 'claude', model: 'fake', description: 'test', systemPrompt: '', env: {},
+    sourcePath: '/configs/general.md', permission: { allow: [], deny: [], default: 'escalate' },
+    worktreeSetup: [`touch ${started}; while [ ! -f ${release} ]; do sleep 0.01; done`],
+  }], { claude: [{ name: 'fake' }], codex: [], opencode: [], cursor: [], antigravity: [] }, limits);
+  const supervisor = new Supervisor({ registry, adapters: new AdapterRegistry([adapter]), cwd: repository });
+
+  const spawning = supervisor.spawnAgent({ ...spawn, isolation: 'worktree' })
+    .then(() => undefined, (error: unknown) => error);
+  const deadline = Date.now() + 2_000;
+  while (Date.now() < deadline) {
+    try { await access(started); break; } catch { await tick(); }
+  }
+  await access(started);
+  limits.modelPolicy = { blockClaudeModels: false, disabledBackends: ['claude'], blockModels: [] };
+  await writeFile(release, 'go');
+  const error = await spawning as Error & { code?: string };
+  assert.equal(error.code, 'BACKEND_DISABLED');
+  assert.equal(adapter.spawnRequests.length, 0);
+  assert.equal((await exec('git', ['branch', '--list', 'subagent/*'], { cwd: repository })).stdout.trim(), '');
 });
 
 test('permissions cannot widen configuration', () => {

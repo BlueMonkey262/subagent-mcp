@@ -10,6 +10,7 @@ import {
   MAX_CONCURRENT_AGENTS,
 } from "../core/limits.js";
 import { BACKENDS, isBackend, type Backend } from "../core/types.js";
+import { OPEN_POLICY, parseBackendList, parsePatternList, type ModelPolicy } from "../core/model-policy.js";
 import {
   CLAUDE_PERMISSION_MODES,
   type AgentConfig,
@@ -44,6 +45,7 @@ export interface AgentConfigSource {
   maxConcurrent(): number;
   codexResumeIdleMs(): number;
   allowances(): Readonly<Partial<Record<Backend, Allowance>>>;
+  modelPolicy(): ModelPolicy;
   configWarning(): string | undefined;
 }
 
@@ -96,6 +98,10 @@ export class ConfigRegistry implements AgentConfigSource {
 
   allowances(): Readonly<Partial<Record<Backend, Allowance>>> {
     return this.limits.allowances;
+  }
+
+  modelPolicy(): ModelPolicy {
+    return this.limits.modelPolicy;
   }
 
   configWarning(): string | undefined {
@@ -155,6 +161,7 @@ export function defaultServerLimits(): ServerLimits {
     maxConcurrent: MAX_CONCURRENT_AGENTS,
     codexResumeIdleMs: DEFAULT_CODEX_RESUME_IDLE_MS,
     allowances: {},
+    modelPolicy: OPEN_POLICY,
   };
 }
 
@@ -337,6 +344,13 @@ function optionalString(record: UnknownRecord, key: string, context: string): st
   return value;
 }
 
+function optionalBoolean(record: UnknownRecord, key: string, context: string): boolean | undefined {
+  const value = record[key];
+  if (value === undefined) return undefined;
+  if (typeof value !== "boolean") throw new ConfigurationError(`${context}: ${key} must be true or false`);
+  return value;
+}
+
 function optionalPositiveInteger(record: UnknownRecord, key: string, context: string): number | undefined {
   const value = record[key];
   if (value === undefined) return undefined;
@@ -382,6 +396,11 @@ function parseServerLimits(root: UnknownRecord, path: string): ServerLimits {
     maxConcurrent,
     codexResumeIdleMs: idleSeconds === undefined ? DEFAULT_CODEX_RESUME_IDLE_MS : idleSeconds * 1000,
     allowances: parseAllowances(root["allowances"], path),
+    modelPolicy: {
+      blockClaudeModels: optionalBoolean(root, "blockClaudeModels", path) ?? false,
+      disabledBackends: parseBackendList(stringArray(root["disabledBackends"], `${path}: disabledBackends`), `${path}: disabledBackends`),
+      blockModels: parsePatternList(stringArray(root["blockModels"], `${path}: blockModels`), `${path}: blockModels`),
+    },
   };
 }
 

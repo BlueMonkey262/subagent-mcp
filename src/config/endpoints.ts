@@ -30,7 +30,12 @@ export async function withEndpointModels(roster: ModelRoster, path = endpointsFi
   for (const [name, endpoint] of Object.entries(endpoints)) {
     for (const model of endpoint.models ?? []) {
       if (typeof model.alias !== "string") continue;
-      const entry = { name: `${name}/${model.alias}`, description: `${model.id ?? model.alias} via endpoint "${name}"` };
+      const upstreamModel = typeof model.id === "string" ? model.id : model.alias;
+      const entry = {
+        name: `${name}/${model.alias}`,
+        upstreamModel,
+        description: `${upstreamModel} via endpoint "${name}"`,
+      };
       extra.claude.push(entry);
       extra.codex.push({ ...entry, provider: ENDPOINT_CODEX_PROVIDER });
       extra.opencode.push(entry);

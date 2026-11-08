@@ -15,6 +15,14 @@ export class ConfigurationError extends SubagentError {
   }
 }
 
+export class ConfigInvalidError extends SubagentError {
+  constructor(warning: string) {
+    super(`Configuration reload is invalid; execution is paused until it is fixed. ${warning}`, "CONFIG_INVALID", {
+      warning,
+    });
+  }
+}
+
 export class CapacityError extends SubagentError {
   constructor(message: string, details?: Readonly<Record<string, unknown>>) {
     super(message, "CAPACITY_EXCEEDED", details);

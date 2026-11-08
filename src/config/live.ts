@@ -16,6 +16,7 @@ import {
   type ResolveAgentOptions,
 } from "./registry.js";
 import type { Allowance, ModelEntry, ResolvedAgentConfig } from "./schema.js";
+import { applyPolicyEnv, OPEN_POLICY, type ModelPolicy } from "../core/model-policy.js";
 
 export function missingConfigMessage(input: {
   readonly agentsDirectory: string;
@@ -56,7 +57,8 @@ export function missingConfigMessage(input: {
 
 /**
  * Config viewed by the supervisor. Reloads when the roster or agent files change so a roster
- * edit does not require an MCP reconnect. A failed reload keeps the last good registry.
+ * edit does not require an MCP reconnect. A failed reload keeps the last good registry for
+ * listing, while the supervisor refuses execution until a valid reload clears the warning.
  */
 export class LiveConfig implements AgentConfigSource {
   #registry: ConfigRegistry | undefined;
@@ -129,6 +131,11 @@ export class LiveConfig implements AgentConfigSource {
 
   allowances(): Readonly<Partial<Record<Backend, Allowance>>> {
     return this.#registry?.allowances() ?? {};
+  }
+
+  /** The project's policy with the MCP server's environment applied, so one setting can cover every project. */
+  modelPolicy(): ModelPolicy {
+    return applyPolicyEnv(this.#registry?.modelPolicy() ?? OPEN_POLICY);
   }
 
   configWarning(): string | undefined {

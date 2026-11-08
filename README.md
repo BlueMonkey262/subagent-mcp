@@ -137,6 +137,33 @@ against the repository, tests, and the operator's actual request.
 - **Concurrency.** At most `maxConcurrent` agents run at once (default 12, or
   `SUBAGENT_MCP_MAX_CONCURRENT`). Further `spawn_agent` calls wait for a free slot.
   `list_models` and `list_agents` report `concurrency.active` and `concurrency.waiting`.
+- **Blocking backends and models.** Three `models.yaml` settings refuse agents before they start:
+
+  | Setting | Refuses | Environment variable |
+  |---|---|---|
+  | `disabledBackends: [cursor, antigravity]` | Every model on those backends | `SUBAGENT_MCP_DISABLED_BACKENDS=cursor,antigravity` (adds to the file's list) |
+  | `blockModels: ["*grok*", "codex:gpt-5.6-sol"]` | Model ids matching a case-insensitive glob (`*`, `?`); a `backend:` prefix limits a pattern to that backend | `SUBAGENT_MCP_BLOCK_MODELS=*grok*,codex:gpt-5.6-sol` (adds to the file's list) |
+  | `blockClaudeModels: true` | Anthropic Claude models on every backend | `SUBAGENT_MCP_BLOCK_CLAUDE_MODELS=1` (overrides the file; `0` forces it off) |
+
+  The variables go in the MCP server's environment and apply to every project; a project's file
+  can add blocks but not lift the variables' list entries. The host takes its environment from
+  the MCP connection that started it, so after changing them, run `/mcp` to reconnect and then
+  restart the host process; restarting the host alone keeps the old environment.
+  `models.yaml` changes need neither step: the file is reloaded live. If a reload is invalid,
+  execution fails closed with `CONFIG_INVALID` (listing still shows the last good config and its
+  `config_warning`) until a valid file is loaded.
+
+  Blocks apply to spawns, scheduled spawns (refused up front), and `send_message` to an existing
+  agent. Endpoint entries are checked by both their `<endpoint>/<alias>` and upstream model id for
+  `blockModels`; `blockClaudeModels` uses the upstream id, so a vendor-looking alias alone does not
+  count as Claude. Other models count as Claude when their id contains `claude` or an `anthropic`
+  provider segment, or when it is a bare id on the `claude` backend (`sonnet`, `opus`). Inside
+  Claude Code, a Claude subagent costs less through its own Agent tool, so that refusal
+  (`CLAUDE_MODEL_BLOCKED`) tells the orchestrator to ask the user for explicit approval and use
+  the built-in Agent tool. The others are
+  `BACKEND_DISABLED` and `MODEL_BLOCKED`. `list_models` reports the active `model_policy` and
+  marks refused roster and live entries `blocked` with `blocked_by`; it skips live queries for disabled
+  backends. `list_agent_configs` marks configs on a disabled backend or pinned to a blocked model.
 - **Usage.** `list_models` includes per-backend and per-model counters (spawns, resumes, turns,
   failures, timeouts, tokens, cost), persisted under `.subagents/memory/`. Optional `allowances`
   in `models.yaml` produce a `remaining` object (allowance minus observed usage).
