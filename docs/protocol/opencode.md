@@ -200,6 +200,30 @@ Unknown event kinds and additive JSON fields should be logged and tolerated.
 Missing required correlation IDs or changed discriminators are protocol errors,
 not silently ignored events.
 
+## OpenCode 2.x usage and live API
+
+Verified against opencode 2.2.5 on 2026-11-08.
+
+- Assistant messages carry `tokens: {input, output, reasoning, cache: {read, write}}` and `cost`.
+  `input` excludes cache reads (recorded turns show `cache.read` far above `input`), so the adapter
+  reports fresh input as `input + cache.write`. The adapter sums every assistant message after the
+  turn's prompt and emits the running total as `usage.updated` whenever a poll finds it changed.
+- `GET /api/model` lists every model the server can run (`providerID`, `modelID`, `name`,
+  `status`, `limit.context`/`limit.output`, `cost[0]` in USD per million tokens, `variants`).
+  Entries also carry `headers` and `settings` with the workspace's org ID and provider endpoints;
+  the adapter drops them.
+- `GET /api/model/default` is the model used when a session sets none.
+- `GET /api/experimental/usage/limits` returns `workspace {name, usageURL}`, OpenCode Go meters
+  `go.rolling|weekly|monthly {percent, limited, resetsAt}` (`percent` is the share used;
+  `resetsAt` is epoch **milliseconds**), and workspace `budgets`. It covers only what OpenCode's
+  console knows, not quotas of external provider keys, and it is marked experimental. The adapter
+  keeps only the workspace name (`usageURL` embeds the workspace ID) and maps each budget through
+  an allowlist (`UsageLimits.Budget` in `GET /openapi.json`) without its `id`.
+
+All responses are wrapped as `{location, data}`. `list_models` with `backend: "opencode"` reads
+these through the adapter's own server, each with a 10-second limit; a failure or timeout in one
+shows up under `live.errors`.
+
 ## Version pin recommendation
 
 Pin exactly `opencode==1.17.6` (or the distribution's equivalent immutable

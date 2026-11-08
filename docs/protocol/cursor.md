@@ -50,7 +50,8 @@ non-`success` subtype) is a failed turn.
 
 `result.usage` is `{inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens}`. The adapter
 maps `inputTokens`→`inputTokens`, `outputTokens`→`outputTokens`, and `cacheReadTokens`→
-`cachedInputTokens`. `cacheWriteTokens` has no normalized field and is dropped.
+`cachedInputTokens`. `inputTokens` excludes cache reads, so `uncachedInputTokens` is
+`inputTokens + cacheWriteTokens` (cache writes were processed fresh).
 
 ## Resume
 

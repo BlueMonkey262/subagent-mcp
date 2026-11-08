@@ -46,6 +46,10 @@ in `~/.claude/settings.json`. Back the file up, then merge this in (don't replac
 "statusLine": { "type": "command", "command": "python3 <repo>/mod/subagent-statusline.py", "refreshInterval": 1 }
 ```
 
+Each active agent gets one row: backend, model, agent config, name, elapsed time, and tokens so far,
+for example `Codex - gpt-5.6-luna - General - Euler 1m15s · 7.4k new · 29.7k cached · 10 out`. Input
+is split into new and cached where the backend allows it; otherwise the row shows a single `in`.
+
 If you already have a `statusLine`, decide whether to replace it or skip this step. Don't set
 `CLAUDE_CODE_PLUGIN_DIRS` in `settings.json`; the launcher does it.
 

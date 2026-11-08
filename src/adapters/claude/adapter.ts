@@ -62,6 +62,8 @@ interface CurrentTurn {
   timedOut: boolean;
   timeout?: NodeJS.Timeout;
   interruptPromise?: Promise<void>;
+  /** Latest `usage` per assistant message id this turn; stream-json repeats a message once per content block. */
+  readonly messageUsage: Map<string, Usage>;
 }
 
 interface Deferred<T> {
@@ -463,6 +465,7 @@ export class ClaudeAdapter implements BackendAdapter {
 
   #onAssistant(session: ClaudeSession, message: Readonly<Record<string, unknown>>): void {
     const body = isRecord(message.message) ? message.message : undefined;
+    this.#trackUsage(session, body);
     const content = body?.content;
     if (!Array.isArray(content)) return;
     for (const block of content) {
@@ -477,6 +480,25 @@ export class ClaudeAdapter implements BackendAdapter {
         });
       }
     }
+  }
+
+  /** Sum the turn's per-message usage so far and report it as `usage.updated` when it changes. */
+  #trackUsage(session: ClaudeSession, body: Readonly<Record<string, unknown>> | undefined): void {
+    if (session.currentTurn.terminal || typeof body?.id !== "string") return;
+    const usage = extractUsage(body);
+    if (usage === undefined) return;
+    const turn = session.currentTurn;
+    const previous = JSON.stringify(turn.messageUsage.get(body.id));
+    if (previous === JSON.stringify(usage)) return;
+    turn.messageUsage.set(body.id, usage);
+    const total = { inputTokens: 0, outputTokens: 0, cachedInputTokens: 0, uncachedInputTokens: 0 };
+    for (const part of turn.messageUsage.values()) {
+      total.inputTokens += part.inputTokens ?? 0;
+      total.outputTokens += part.outputTokens ?? 0;
+      total.cachedInputTokens += part.cachedInputTokens ?? 0;
+      total.uncachedInputTokens += part.uncachedInputTokens ?? 0;
+    }
+    this.#emit(session, "usage.updated", { turnId: turn.id, usage: total });
   }
 
   #onToolResults(session: ClaudeSession, message: Readonly<Record<string, unknown>>): void {
@@ -859,7 +881,7 @@ function positiveInteger(value: number | undefined, name: string, fallback: numb
 }
 
 function newTurn(turnId: string): CurrentTurn {
-  return { id: turnId, commandUuid: turnId, terminal: false, interruptRequested: false, timedOut: false };
+  return { id: turnId, commandUuid: turnId, terminal: false, interruptRequested: false, timedOut: false, messageUsage: new Map() };
 }
 
 function deferred<T>(): Deferred<T> {
@@ -913,6 +935,10 @@ function extractUsage(message: Readonly<Record<string, unknown>>): Usage | undef
     ...(typeof usage?.input_tokens === "number" ? { inputTokens: usage.input_tokens } : {}),
     ...(typeof usage?.output_tokens === "number" ? { outputTokens: usage.output_tokens } : {}),
     ...(typeof usage?.cache_read_input_tokens === "number" ? { cachedInputTokens: usage.cache_read_input_tokens } : {}),
+    // input_tokens excludes both cache reads and cache writes; writes were processed fresh.
+    ...(typeof usage?.input_tokens === "number"
+      ? { uncachedInputTokens: usage.input_tokens + (typeof usage.cache_creation_input_tokens === "number" ? usage.cache_creation_input_tokens : 0) }
+      : {}),
     ...(typeof message.total_cost_usd === "number" ? { costUsd: message.total_cost_usd } : {}),
   };
   return Object.keys(result).length === 0 ? undefined : result;

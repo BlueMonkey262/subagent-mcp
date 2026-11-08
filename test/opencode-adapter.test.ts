@@ -41,6 +41,12 @@ class FakeV2 {
   /** Newest-first session log, as `GET /api/session/{id}/message?order=desc` returns it. */
   log: Record<string, unknown>[] = [];
   permissions: Record<string, unknown>[] = [];
+  /** `GET /api/model` entries; the first is also `GET /api/model/default`. */
+  models: Record<string, unknown>[] = [];
+  /** `GET /api/experimental/usage/limits` data; undefined makes the endpoint fail with 500. */
+  usageLimits: Record<string, unknown> | undefined;
+  /** When true, `/api/experimental/usage/limits` never answers. */
+  hangUsageLimits = false;
   private nextMessage = 1;
 
   constructor() {
@@ -81,6 +87,12 @@ class FakeV2 {
       res.writeHead(status, { "content-type": "application/json" }).end(JSON.stringify(value));
     };
     const path = url.pathname;
+    if (req.method === "GET" && path === "/api/model") return json({ data: this.models });
+    if (req.method === "GET" && path === "/api/model/default") return json({ data: this.models[0] });
+    if (req.method === "GET" && path === "/api/experimental/usage/limits") {
+      if (this.hangUsageLimits) return;
+      return this.usageLimits === undefined ? json({ error: "gone" }, 500) : json({ data: this.usageLimits });
+    }
     if (req.method === "POST" && path === "/api/session") return json({ data: { id: "ses_fake1", location: { directory: "/tmp" } } });
     const session = /^\/api\/session\/(ses_[^/]+)(\/.*)?$/.exec(path);
     if (session) {
@@ -118,7 +130,7 @@ function assistant(id: string, content: unknown[], extra: Record<string, unknown
     agent: "build",
     model: { providerID: "opencode", id: "space-bunny-free" },
     content,
-    tokens: { input: 10, output: 5, reasoning: 0, cache: { read: 3, write: 0 } },
+    tokens: { input: 10, output: 5, reasoning: 0, cache: { read: 3, write: 1 } },
     cost: 0.25,
     ...extra,
   };
@@ -159,7 +171,7 @@ test("v2: creates a session scoped to the directory, authenticates with Basic, s
     const data = done.data as { status: string; finalText?: string; usage?: Record<string, number> };
     assert.equal(data.status, "completed");
     assert.equal(data.finalText, "All done.");
-    assert.deepEqual(data.usage, { inputTokens: 20, outputTokens: 10, cachedInputTokens: 6, costUsd: 0.5 });
+    assert.deepEqual(data.usage, { inputTokens: 20, outputTokens: 10, cachedInputTokens: 6, uncachedInputTokens: 22, costUsd: 0.5 });
   } finally {
     await adapter.closeAll();
     fake.close();
@@ -331,6 +343,103 @@ test("v1 binary: serve keeps --pure and sends no Authorization header", async ()
     assert.equal(args, "serve --hostname 127.0.0.1 --port 0 --pure");
     assert.equal(fake.calls[0]?.path, "/session?directory=%2Ftmp", "v1 still uses its own session route");
     assert.equal(fake.calls[0]?.authorization, undefined);
+  } finally {
+    await adapter.closeAll();
+    fake.close();
+  }
+});
+
+test("v2: providerInfo summarizes models, the default, and Go usage without leaking headers", async () => {
+  const fake = new FakeV2();
+  const baseUrl = await fake.listen();
+  fake.models = [{
+    id: "hy4", modelID: "hy4", providerID: "opencode-go", name: "Hy4", status: "active", enabled: true,
+    headers: { "x-opencode-org-id": "org_secret" }, settings: { baseURL: "https://example.invalid" },
+    capabilities: { tools: true }, variants: [{ id: "none" }, { id: "high" }],
+    cost: [{ input: 0.834, output: 2.501, cache: { read: 0.042, write: 0 } }],
+    limit: { context: 1048576, output: 65536 },
+  }];
+  fake.usageLimits = {
+    workspace: { id: "org_secret", name: "Personal", usageURL: "https://opencode.ai/console/org_secret/activity/overview" },
+    go: { weekly: { percent: 41, limited: false, resetsAt: Date.UTC(2026, 10, 15) } },
+    budgets: [{
+      id: "bud_secret", limit: 20, spent: 7.5, scope: "combined", per: "set", coverage: "models",
+      models: [{ providerID: "opencode-go", modelID: "hy4", name: "Hy4", spent: 7.5 }],
+      vendors: ["opencode"], picked: true, shared: false, resetsAt: Date.UTC(2026, 11, 1), unexpected: "org_secret",
+    }],
+  };
+  const adapter = new OpenCodeAdapter({ baseUrl, protocol: "v2", password: PASSWORD, ...fast });
+  try {
+    const info = await adapter.providerInfo();
+    assert.equal(info["default_model"], "opencode-go/hy4");
+    assert.deepEqual(info.models, [{
+      id: "opencode-go/hy4", name: "Hy4", status: "active", context: 1048576, max_output: 65536,
+      cost_per_mtok: { input: 0.834, output: 2.501, cache_read: 0.042 }, variants: ["none", "high"],
+    }]);
+    assert.deepEqual(info["usage_limits"], {
+      workspace: { name: "Personal" },
+      go: { weekly: { percent_used: 41, remaining_percent: 59, limited: false, resets_at: "2026-11-15T00:00:00.000Z" } },
+      budgets: [{
+        limit_usd: 20, spent_usd: 7.5, remaining_usd: 12.5, scope: "combined", per: "set", coverage: "models",
+        models: [{ model: "opencode-go/hy4", name: "Hy4", spent_usd: 7.5 }],
+        vendors: ["opencode"], picked: true, shared: false, resets_at: "2026-12-01T00:00:00.000Z",
+      }],
+    });
+    const text = JSON.stringify(info);
+    assert.equal(text.includes("org_secret") || text.includes("bud_secret"), false, "no workspace or budget ids, even inside URLs or unknown fields");
+    assert.equal(info["errors"], undefined);
+
+    fake.usageLimits = undefined;
+    const partial = await adapter.providerInfo();
+    assert.equal(partial.models?.length, 1, "a failing usage endpoint keeps the model list");
+    assert.match(String((partial["errors"] as Record<string, string>)["usage_limits"]), /500/);
+  } finally {
+    await adapter.closeAll();
+    fake.close();
+  }
+});
+
+test("v1: providerInfo reports live data as unsupported", async () => {
+  const adapter = new OpenCodeAdapter({ baseUrl: "http://127.0.0.1:9", protocol: "v1" });
+  const info = await adapter.providerInfo();
+  assert.equal(info["supported"], false);
+  await adapter.closeAll();
+});
+
+test("v2: reports running usage mid-turn, once per change", async () => {
+  const fake = new FakeV2();
+  const baseUrl = await fake.listen();
+  const adapter = new OpenCodeAdapter({ baseUrl, protocol: "v2", password: PASSWORD, ...fast });
+  try {
+    const turn = await adapter.spawn(request());
+    fake.push(assistant("msg_a1", [{ type: "text", text: "Working." }]));
+    const iterator = adapter.events(turn.agentId)[Symbol.asyncIterator]();
+    const first = await nextEvent(iterator, "usage.updated");
+    assert.deepEqual((first.data as { usage: unknown }).usage, { inputTokens: 10, outputTokens: 5, cachedInputTokens: 3, uncachedInputTokens: 11, costUsd: 0.25 });
+    await new Promise((resolve) => setTimeout(resolve, 120)); // several unchanged polls
+    fake.push(assistant("msg_a2", [{ type: "text", text: "Done." }]));
+    const second = await nextEvent(iterator, "usage.updated");
+    assert.deepEqual((second.data as { usage: unknown }).usage, { inputTokens: 20, outputTokens: 10, cachedInputTokens: 6, uncachedInputTokens: 22, costUsd: 0.5 });
+    fake.push({ id: "msg_idle", type: "idle", time: { created: Date.now() }, outcome: "succeeded" });
+    await nextEvent(iterator, "turn.completed");
+    const updates = adapter.buffer.read(turn.agentId).events.filter((event) => event.type === "usage.updated");
+    assert.equal(updates.length, 2, "an unchanged poll does not repeat the event");
+  } finally {
+    await adapter.closeAll();
+    fake.close();
+  }
+});
+
+test("v2: a hung usage endpoint times out on its own and the model list still comes back", async () => {
+  const fake = new FakeV2();
+  const baseUrl = await fake.listen();
+  fake.models = [{ id: "hy4", modelID: "hy4", providerID: "opencode-go" }];
+  fake.hangUsageLimits = true;
+  const adapter = new OpenCodeAdapter({ baseUrl, protocol: "v2", password: PASSWORD, ...fast, liveSectionTimeoutMs: 50 });
+  try {
+    const info = await adapter.providerInfo();
+    assert.deepEqual(info.models, [{ id: "opencode-go/hy4" }]);
+    assert.ok((info["errors"] as Record<string, string>)["usage_limits"], "the hung section is reported, not awaited");
   } finally {
     await adapter.closeAll();
     fake.close();

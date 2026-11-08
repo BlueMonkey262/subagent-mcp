@@ -103,6 +103,13 @@ A successful result currently resembles:
 {"type":"result","subtype":"success","is_error":false,"result":"final text","session_id":"<uuid>","num_turns":2,"stop_reason":"end_turn","permission_denials":[],"usage":{},"modelUsage":{},"total_cost_usd":0.0,"duration_ms":123,"duration_api_ms":100,"terminal_reason":"completed","uuid":"<event-uuid>"}
 ```
 
+Usage: `result.usage` is the turn total (`input_tokens`, `output_tokens`, `cache_read_input_tokens`,
+`cache_creation_input_tokens`) and `total_cost_usd` its cost. `input_tokens` excludes both cache reads
+and cache writes, so the adapter reports fresh input (`uncachedInputTokens`) as `input_tokens +
+cache_creation_input_tokens`. Mid-turn, each `assistant` message carries `message.id` and that API
+call's `message.usage`; stream-json repeats a message once per content block, so the adapter keeps
+the latest usage per message id and emits the sum as `usage.updated`.
+
 Do not equate `subtype: "success"` with every requested tool having run: the observed denial flow ended in a successful model turn while `permission_denials` contained the denied Bash tool use. Error result subtypes currently include `error_during_execution`, `error_max_turns`, `error_max_budget_usd`, and `error_max_structured_output_retries`, with an `errors` array. Also handle process exit, malformed/non-JSON output, and a missing result as adapter errors.
 
 ## Permission requests

@@ -80,6 +80,23 @@ export interface BackendAdapter {
   interrupt(agentId: string): Promise<void>;
   events(agentId: string, options?: EventOptions): AsyncIterable<AgentEvent>;
   approve(agentId: string, resolution: ApprovalResolution): Promise<void>;
+  /**
+   * Optional live view of what the backend itself reports: models it can run and plan/quota usage.
+   * Only backends with a queryable API implement it (OpenCode today); `list_models` surfaces it.
+   */
+  providerInfo?(signal?: AbortSignal): Promise<ProviderInfo>;
+}
+
+/** A model the backend reports as runnable, as `provider/model` (OpenCode) or the backend's own id. */
+export interface ProviderModel {
+  readonly id: string;
+  readonly [key: string]: unknown;
+}
+
+export interface ProviderInfo {
+  /** Every model the backend reports, when it reports models at all. */
+  readonly models?: readonly ProviderModel[];
+  readonly [key: string]: unknown;
 }
 
 export class AdapterRegistry {

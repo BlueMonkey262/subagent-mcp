@@ -16,6 +16,11 @@ export type NormalizedEventData = {
     readonly output?: unknown;
   };
   "approval.requested": ApprovalRequest;
+  /** Running usage of the turn in progress, so far. The turn's `turn.completed` usage supersedes it. */
+  "usage.updated": {
+    readonly turnId?: string;
+    readonly usage: Usage;
+  };
   "turn.completed": {
     readonly turnId: string;
     readonly status: "completed" | "interrupted" | "failed";

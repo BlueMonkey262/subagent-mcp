@@ -453,7 +453,10 @@ async function dispatch(supervisor: Supervisor, method: string, params: unknown)
         : supervisor.getAgentEvents(agent, since, undefined, options);
     }
     case "list_models":
-      return supervisor.listModels(isBackend(input["backend"]) ? input["backend"] : undefined);
+      return supervisor.listModels(
+        isBackend(input["backend"]) ? input["backend"] : undefined,
+        ...(typeof input["live"] === "boolean" ? [input["live"]] : []),
+      );
     case "shutdown": {
       const { active, waiting } = supervisor.concurrency();
       if (active > 0 || waiting > 0) {
