@@ -130,18 +130,32 @@ for a in agents:
         print(f"{row} {DIM}{elapsed(a['created_at'])}{RESET}{used}")
 
 # Host-written update cache; never network. One dim line if any project dir reports an available release.
-def _safe_ver(s):
-    return re.sub(r"[\x00-\x1f\x7f]", "", s) if isinstance(s, str) else None
+_SEMVER = re.compile(r"^v?(\d{1,9})\.(\d{1,9})\.(\d{1,9})$")  # stable releases only; bounded, no escapes
 
-for d in here:
+def _ver(s):
+    m = _SEMVER.match(s) if isinstance(s, str) and len(s) <= 24 else None
+    return tuple(int(x) for x in m.groups()) if m else None
+
+def _running_version():
+    """The installed version (this script lives in <repo>/mod), so a cache made for another version is ignored."""
     try:
-        data = json.load(open(os.path.join(d, ".subagents", "memory", "update.json")))
-        if data.get("available") is not True:
-            continue
-        current, latest = _safe_ver(data.get("current")), _safe_ver(data.get("latest"))
-        if current is None or latest is None:
-            continue
-        print(f"{DIM}subagent-mcp {latest} available (you have {current}){RESET}")
-        break
+        pkg = os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "package.json")
+        return _ver(json.load(open(pkg)).get("version"))
     except Exception:
-        pass
+        return None
+
+if os.environ.get("SUBAGENT_MCP_UPDATE_CHECK", "").strip().lower() not in ("0", "false"):
+    running = _running_version()
+    for d in here:
+        try:
+            data = json.load(open(os.path.join(d, ".subagents", "memory", "update.json")))
+            current, latest = _ver(data.get("current")), _ver(data.get("latest"))
+            if current is None or latest is None or latest <= current:
+                continue  # `available` is derived from the versions, not trusted
+            if running is not None and current != running:
+                continue
+            fmt = lambda v: ".".join(map(str, v))
+            print(f"{DIM}subagent-mcp {fmt(latest)} available (you have {fmt(current)}){RESET}")
+            break
+        except Exception:
+            pass

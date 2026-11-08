@@ -53,6 +53,7 @@ import { scanChildOutput } from "./safety/output.js";
 import { describeToolInput } from "./tool-describe.js";
 import { remainingAllowances, UsageLedger } from "./usage.js";
 import { MAX_CONTENT_CHARS, truncateText } from "./truncate.js";
+import { compareVersions, currentVersion, updateCheckDisabled } from "./update-check.js";
 
 /** Cap on one backend's live `providerInfo` query, so `list_models` never hangs on it. */
 const LIVE_INFO_TIMEOUT_MS = 30_000;
@@ -241,13 +242,15 @@ export class Supervisor {
   }
 
   async #updateNotice(): Promise<Readonly<Record<string, unknown>>> {
-    if (this.#updateCachePath === undefined) return {};
+    if (this.#updateCachePath === undefined || updateCheckDisabled()) return {};
     try {
       const parsed: unknown = JSON.parse(await readFile(this.#updateCachePath, "utf8"));
       if (typeof parsed !== "object" || parsed === null || !("available" in parsed) || parsed.available !== true
           || !("current" in parsed) || typeof parsed.current !== "string"
           || !("latest" in parsed) || typeof parsed.latest !== "string"
           || !("url" in parsed) || typeof parsed.url !== "string") return {};
+      // Only a notice computed for the version that is running, and only if it really is newer.
+      if (parsed.current !== currentVersion() || compareVersions(parsed.latest, parsed.current) <= 0) return {};
       return { update: { current: parsed.current, latest: parsed.latest, url: parsed.url } };
     } catch {
       return {};

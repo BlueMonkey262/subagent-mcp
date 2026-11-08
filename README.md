@@ -183,10 +183,11 @@ against the repository, tests, and the operator's actual request.
 ## Update notifications
 
 When update checks are enabled, the host looks up the latest GitHub release of
-`BlueMonkey262/subagent-mcp` at most once a day via the public API (a normal request; nothing else is
-sent). The result is cached at `<project>/.subagents/memory/update.json`. The status line shows a dim
+`BlueMonkey262/subagent-mcp` via the public API (a normal request; nothing else is sent). A result, including
+"no release yet", is cached for 24 hours; a failed request (offline, rate limit) retries on the next
+host start. The result is cached at `<project>/.subagents/memory/update.json`. The status line shows a dim
 notice when a newer release is available. Nothing is updated automatically. Opt out with
-`SUBAGENT_MCP_UPDATE_CHECK=0`. To update: `git fetch --tags`, `git checkout <tag>`, then
+`SUBAGENT_MCP_UPDATE_CHECK=0` (or `false`); that also removes the cached notice. To update: `git fetch --tags`, `git checkout <tag>`, then
 `npm ci && npm run build`, and restart. Rebuilding in a live checkout can drop a running session's host
 connection, so do it between sessions.
 

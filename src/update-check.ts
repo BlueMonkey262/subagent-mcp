@@ -75,10 +75,12 @@ export function compareVersions(a: string, b: string): number {
 
 /** Check GitHub for a newer stable release. All I/O and network failures are deliberately silent. */
 export async function checkForUpdate(options: UpdateCheckOptions): Promise<UpdateCache | undefined> {
-  const setting = (options.env ?? process.env).SUBAGENT_MCP_UPDATE_CHECK;
-  if (setting === "0" || setting?.toLowerCase() === "false") return undefined;
-
   const memoryDirectory = options.memoryDirectory ?? options.memoryDir;
+  if (updateCheckDisabled(options.env)) {
+    // Opting out also withdraws an old notice, so nothing keeps announcing it from a stale cache.
+    if (memoryDirectory !== undefined) await rm(join(memoryDirectory, "update.json"), { force: true }).catch(() => undefined);
+    return undefined;
+  }
   if (memoryDirectory === undefined) return undefined;
   const cachePath = join(memoryDirectory, "update.json");
   const now = options.now?.() ?? Date.now();
@@ -102,6 +104,8 @@ export async function checkForUpdate(options: UpdateCheckOptions): Promise<Updat
       }, options.timeoutMs ?? REQUEST_TIMEOUT_MS);
     });
     let response: Response;
+    let release: unknown = {};
+    let noRelease = false;
     try {
       response = await Promise.race([
         (options.fetch ?? globalThis.fetch)(UPDATE_URL, {
@@ -110,14 +114,15 @@ export async function checkForUpdate(options: UpdateCheckOptions): Promise<Updat
         }),
         timedOut,
       ]);
+      noRelease = response.status === 404;
+      if (!response.ok && !noRelease) return previous;
+      // The one deadline covers the body too (a server that sends headers and then stalls), and the body is capped.
+      if (!noRelease) release = JSON.parse(await Promise.race([readCapped(response), timedOut]));
     } finally {
       clearTimeout(timer);
     }
     const current = running;
     if (current === undefined) return previous;
-    const noRelease = response.status === 404;
-    if (!response.ok && !noRelease) return previous;
-    const release: unknown = noRelease ? {} : await response.json();
     if (!isRecord(release)) return previous;
 
     let latest: string | null = null;
@@ -149,6 +154,19 @@ export async function checkForUpdate(options: UpdateCheckOptions): Promise<Updat
   }
 }
 
+export function updateCheckDisabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  const setting = env.SUBAGENT_MCP_UPDATE_CHECK?.trim().toLowerCase();
+  return setting === "0" || setting === "false";
+}
+
+const MAX_BODY_BYTES = 256 * 1024;
+
+async function readCapped(response: Response): Promise<string> {
+  const text = await response.text();
+  if (text.length > MAX_BODY_BYTES) throw new Error("Update response too large");
+  return text;
+}
+
 function parseVersion(value: string): ParsedVersion | undefined {
   const match = /^v?(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?(?:\+[0-9A-Za-z.-]+)?$/.exec(value.trim());
   if (match === null) return undefined;
@@ -176,12 +194,15 @@ async function readCache(path: string): Promise<UpdateCache | undefined> {
         || !(typeof parsed["latest"] === "string" || parsed["latest"] === null)
         || !(typeof parsed["url"] === "string" || parsed["url"] === null)
         || typeof parsed["available"] !== "boolean") return undefined;
+    // `available` is derived, never trusted: a hand-edited or stale file cannot announce an older release.
+    const latest = parsed["latest"] === null ? undefined : normalizeVersion(parsed["latest"]);
+    const current = normalizeVersion(parsed["current"]);
     return {
       checked_at: parsed["checked_at"],
       current: parsed["current"],
       latest: parsed["latest"],
       url: parsed["url"],
-      available: parsed["available"],
+      available: latest !== undefined && current !== undefined && compareVersions(latest, current) > 0,
     };
   } catch {
     return undefined;

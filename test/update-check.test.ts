@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import { mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -39,7 +40,8 @@ async function putCache(directory: string, cache: UpdateCache): Promise<void> {
 }
 
 test("currentVersion reads the package version and semantic versions compare numerically", () => {
-  assert.equal(currentVersion(), "0.1.0");
+  const packaged = JSON.parse(readFileSync(new URL("../../package.json", import.meta.url), "utf8")) as { version: string };
+  assert.equal(currentVersion(), packaged.version);
   assert.equal(compareVersions("v1.2.3", "1.2.3"), 0);
   assert.equal(compareVersions("0.9.0", "0.10.0"), -1);
   assert.equal(compareVersions("2.0.0", "1.99.99"), 1);
@@ -222,5 +224,55 @@ test("no release published yet (404) is cached as no update, so it is not rechec
       fetch: async () => response({ message: "boom" }, 500),
     });
     assert.equal(other?.available, false, "a 5xx keeps the cached answer");
+  });
+});
+
+test("opting out (including padded values) removes a cached notice and never fetches", async () => {
+  await withMemory(async (directory) => {
+    await putCache(directory, {
+      checked_at: new Date(NOW).toISOString(), current: "0.1.0", latest: "0.2.0", url: "https://example.test/r", available: true,
+    });
+    let calls = 0;
+    for (const value of ["0", " 0 ", "FALSE", "false"]) {
+      await putCache(directory, {
+        checked_at: new Date(NOW).toISOString(), current: "0.1.0", latest: "0.2.0", url: "https://example.test/r", available: true,
+      });
+      const result = await checkForUpdate({
+        memoryDirectory: directory, now: () => NOW, current: "0.1.0", env: { SUBAGENT_MCP_UPDATE_CHECK: value },
+        fetch: async () => { calls += 1; return response(release("v0.2.0")); },
+      });
+      assert.equal(result, undefined);
+      assert.deepEqual(await readdir(directory), [], `cache removed for ${JSON.stringify(value)}`);
+    }
+    assert.equal(calls, 0);
+  });
+});
+
+test("a hand-edited cache cannot announce an older release: available is recomputed on read", async () => {
+  await withMemory(async (directory) => {
+    await putCache(directory, {
+      checked_at: new Date(NOW - 1_000).toISOString(), current: "0.2.0", latest: "0.1.0", url: "https://example.test/r", available: true,
+    });
+    const result = await checkForUpdate({ memoryDirectory: directory, now: () => NOW, current: "0.2.0", env: {}, fetch: async () => { throw new Error("no network"); } });
+    assert.equal(result?.available, false);
+  });
+});
+
+test("a server that sends headers and then stalls the body is cut off by the same deadline", async () => {
+  await withMemory(async (directory) => {
+    const stalled = async (): Promise<Response> => new Response(new ReadableStream({ start() { /* never closes */ } }), { status: 200 });
+    const started = Date.now();
+    const result = await checkForUpdate({ memoryDirectory: directory, now: () => NOW, current: "0.1.0", env: {}, timeoutMs: 30, fetch: stalled });
+    assert.equal(result, undefined);
+    assert.ok(Date.now() - started < 1_000);
+  });
+});
+
+test("an oversized response body is rejected without touching the cache", async () => {
+  await withMemory(async (directory) => {
+    const huge = async (): Promise<Response> => response(JSON.stringify({ tag_name: "v9.9.9", pad: "x".repeat(400_000) }));
+    const result = await checkForUpdate({ memoryDirectory: directory, now: () => NOW, current: "0.1.0", env: {}, fetch: huge });
+    assert.equal(result, undefined);
+    assert.deepEqual(await readdir(directory), []);
   });
 });
