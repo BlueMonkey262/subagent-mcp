@@ -433,7 +433,10 @@ async function dispatch(supervisor: Supervisor, method: string, params: unknown)
         : supervisor.getAgentEvents(agent, since);
     }
     case "list_models":
-      return supervisor.listModels(isBackend(input["backend"]) ? input["backend"] : undefined);
+      return supervisor.listModels(
+        isBackend(input["backend"]) ? input["backend"] : undefined,
+        ...(typeof input["live"] === "boolean" ? [input["live"]] : []),
+      );
     case "record_outcome": {
       const agent = requiredString(input, "agent");
       const verdict = requiredVerdict(input["verdict"]);

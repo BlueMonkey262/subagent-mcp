@@ -35,7 +35,7 @@ import { ApprovalCoordinator } from "./approval/coordinator.js";
 import type { ApprovalDecision } from "./approval/types.js";
 import { AGENT_NAMES } from "./agent-names.js";
 import type { AgentConfigSource } from "./config/registry.js";
-import type { Backend } from "./core/types.js";
+import type { Backend, Usage } from "./core/types.js";
 import type { ModelEntry } from "./config/schema.js";
 import { AgentCapacity, childDepthEnv } from "./core/limits.js";
 import { ConfigurationError, SubagentError } from "./core/errors.js";
@@ -44,6 +44,9 @@ import type { AgentEvent } from "./events/schema.js";
 import { scanChildOutput } from "./safety/output.js";
 import { RoutingStore, projectRoutingPaths, ensureProjectMemoryIgnored, type MemoryScope } from "./storage/routing.js";
 import { remainingAllowances, UsageLedger } from "./usage.js";
+
+/** Cap on one backend's live `providerInfo` query, so `list_models` never hangs on it. */
+const LIVE_INFO_TIMEOUT_MS = 30_000;
 
 export type ToolAgentState = "starting" | "running" | "needs_approval" | "completed" | "interrupted" | "failed";
 
@@ -74,6 +77,8 @@ interface AgentRecord {
   nameNote?: string;
   /** False for an agent restored after a host restart, until send_message starts the pump. */
   pumping: boolean;
+  /** Usage so far of the turn in progress, from `usage.updated`; cleared when the turn completes. */
+  liveUsage?: Usage;
   result?: string;
   usage?: Readonly<Record<string, unknown>>;
   lastError?: { readonly code: string; readonly message: string };
@@ -206,7 +211,51 @@ export class Supervisor {
     };
   }
 
-  listModels(backend?: Backend): Readonly<Record<string, unknown>> {
+  /**
+   * Roster, local usage, allowances and concurrency. With `live` (default: on when one `backend` is
+   * named), also asks each backend that has a live API (`providerInfo`: OpenCode, Codex) for the
+   * models it can run and its own plan usage, and flags roster entries the backend does not offer.
+   */
+  async listModels(backend?: Backend, live: boolean = backend !== undefined): Promise<Readonly<Record<string, unknown>>> {
+    const local = this.#localModels(backend);
+    if (!live) return local;
+    const adapters = this.#adapters.list().filter((adapter) =>
+      adapter.providerInfo !== undefined && (backend === undefined || adapter.backend === backend));
+    const entries = await Promise.all(adapters.map(async (adapter) =>
+      [adapter.backend, await this.#liveInfo(adapter)] as const));
+    if (entries.length === 0) return local;
+    const byBackend = Object.fromEntries(entries);
+    return { ...local, live: backend === undefined ? byBackend : byBackend[backend] };
+  }
+
+  async #liveInfo(adapter: BackendAdapter): Promise<Readonly<Record<string, unknown>>> {
+    const controller = new AbortController();
+    let timer: NodeJS.Timeout | undefined;
+    // Race as well as abort: an adapter stuck on a child that never started may not observe the signal.
+    const timedOut = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => {
+        const error = new Error(`${adapter.backend} live query timed out after ${LIVE_INFO_TIMEOUT_MS}ms`);
+        controller.abort(error);
+        reject(error);
+      }, LIVE_INFO_TIMEOUT_MS);
+      timer.unref();
+    });
+    try {
+      const info = await Promise.race([adapter.providerInfo!(controller.signal), timedOut]);
+      if (info.models === undefined) return info;
+      const offered = new Set(info.models.map((model) => model.id));
+      const roster = this.#registry.listModels(adapter.backend) as readonly ModelEntry[];
+      // Entries routed to a custom provider (e.g. endpoint models) are outside the backend's own catalog.
+      const missing = roster.filter((entry) => entry.provider === undefined && !offered.has(entry.name)).map((entry) => entry.name);
+      return { ...info, ...(missing.length === 0 ? {} : { roster_not_offered: missing }) };
+    } catch (error) {
+      return { error: error instanceof Error ? error.message : String(error) };
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  #localModels(backend?: Backend): Readonly<Record<string, unknown>> {
     const usage = this.#usage.snapshot();
     const allowances = this.#registry.allowances();
     const remaining = remainingAllowances(allowances, usage);
@@ -645,7 +694,12 @@ export class Supervisor {
             }
             continue;
           }
+          if (event.type === "usage.updated") {
+            record.liveUsage = { ...event.data.usage };
+            continue;
+          }
           if (event.type === "turn.completed") {
+            delete record.liveUsage;
             if (event.data.finalText !== undefined) record.result = scanChildOutput(event.data.finalText);
             if (event.data.usage !== undefined) record.usage = { ...event.data.usage };
             if (record.meta.history.some(h => h.turn_id === event.data.turnId)) continue;
@@ -791,10 +845,14 @@ export class Supervisor {
     };
   }
 
+  /** Completed turns plus, while one is running, the live usage of the turn in progress. */
   #totalUsage(record: AgentRecord) {
     const totals: Record<string, number | null> = {};
-    for (const key of ['inputTokens','outputTokens','cachedInputTokens','costUsd']) {
-      const usages = record.meta.history.map(h => (h.usage as Record<string, unknown> | undefined)?.[key]);
+    const live = record.liveUsage as Record<string, unknown> | undefined;
+    for (const key of ['inputTokens','outputTokens','cachedInputTokens','uncachedInputTokens','costUsd']) {
+      // A live turn only adds what it already reports (cost often arrives only at turn end).
+      const usages = [...record.meta.history.map(h => (h.usage as Record<string, unknown> | undefined)?.[key]),
+        ...(live?.[key] === undefined ? [] : [live[key]])];
       totals[key] = usages.length && usages.every(v => typeof v === 'number') ? (usages as number[]).reduce((a,b) => a+b, 0) : null;
     }
     return totals;
@@ -843,6 +901,7 @@ export class Supervisor {
       last_activity_at: record.meta.activityAt,
       current_activity: record.meta.activity ?? null,
       activity_source: record.meta.activity ? 'tool_event' : null,
+      cumulative_usage: this.#totalUsage(record),
       created_at: record.createdAt,
       updated_at: record.updatedAt,
     };

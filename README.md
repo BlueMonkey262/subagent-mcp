@@ -142,6 +142,31 @@ against the repository, tests, and the operator's actual request.
 - **Usage.** `list_models` includes per-backend and per-model counters (spawns, resumes, turns,
   failures, timeouts, tokens, cost), persisted under `.subagents/memory/`. Optional `allowances`
   in `models.yaml` produce a `remaining` object (allowance minus observed usage).
+- **Per-agent token counts.** `list_agents` reports each agent's `cumulative_usage`: its finished
+  turns plus the turn in progress. Claude, Codex and OpenCode 2.x report usage mid-turn (as
+  `usage.updated` events in `get_agent_events`); Cursor and Antigravity report it when a turn ends.
+  Usage fields:
+
+  | Field | Meaning |
+  |---|---|
+  | `inputTokens` | Input as the backend reports it. Codex includes cache reads; Claude, OpenCode and Cursor do not. |
+  | `cachedInputTokens` | Input served from the prompt cache. |
+  | `uncachedInputTokens` | Input processed fresh, including cache writes. Set for Claude, Codex, OpenCode and Cursor; Antigravity's semantics are unverified, so it is left unset. |
+  | `outputTokens`, `costUsd` | As reported. Codex reports no cost. |
+
+  Compare backends with `uncachedInputTokens` + `cachedInputTokens`, not `inputTokens`.
+- **Live models and plan usage.** `list_models` with a `backend` (or `live: true`) adds a `live`
+  section from that backend's own API. The `opencode` section, from the OpenCode 2.x server,
+  covers every model it can run (context, max output, cost per million tokens), the default model,
+  OpenCode Go rolling/weekly/monthly usage, and workspace budgets. The `codex` section, from a
+  short-lived `codex app-server`, covers the model catalog (reasoning efforts, default, hidden
+  models), the ChatGPT plan's rate-limit windows (5-hour and weekly) and credits, and recent daily
+  token totals. Each usage window reports `percent_used`, `remaining_percent` and `resets_at`.
+  `roster_not_offered` lists roster entries the backend doesn't offer, except entries routed to a
+  custom `provider`. These numbers come from the vendor's own account records and don't include
+  quotas on external API keys. If one section fails (for example, Codex plan limits under API-key
+  auth, or OpenCode's experimental usage endpoint), `live.errors` names it and the rest is still
+  returned. Emails and account IDs are removed from the output.
 - **Config hot-reload and reconnect.** The MCP process is a proxy. Agent processes live in a
   host for this working directory, so `/mcp` reconnect does not drop running agents, and edits
   to `.subagents/` are picked up without a restart. If no config is loaded, tool calls return

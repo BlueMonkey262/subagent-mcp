@@ -654,7 +654,7 @@ test("list_models reports per-backend usage counters", async () => {
   const agentId = spawned["agent_id"] as string;
   await waitUntil(() => supervisor.listAgents().some((agent) => agent["agent_id"] === agentId && agent["state"] === "completed"));
 
-  const listed = supervisor.listModels();
+  const listed = await supervisor.listModels();
   const usage = listed["usage"] as { codex: { spawns: number; turns: number; inputTokens: number; outputTokens: number; costUsd: number; models: Record<string, { inputTokens: number }> } };
   assert.equal(usage.codex.spawns, 1);
   assert.equal(usage.codex.turns, 1);
@@ -754,4 +754,56 @@ test("agent name pool is unique (case-insensitive) and includes philosophers and
   assert.equal(new Set(lowered).size, lowered.length);
   for (const name of ["Aristotle", "Kant", "Athena", "Odysseus"]) assert.ok(lowered.includes(name.toLowerCase()), name);
   for (const name of AGENT_NAMES) assert.match(name, /^[A-Za-z][A-Za-z-]*$/);
+});
+
+test("list_models adds live backend info (default on for a named backend) and flags roster models not offered", async () => {
+  const adapter = new FakeAdapter("codex");
+  let queried = 0;
+  Object.assign(adapter, {
+    providerInfo: async () => {
+      queried += 1;
+      return { models: [{ id: "other-model" }], usage_limits: { go: { weekly: { percent_used: 10 } } } };
+    },
+  });
+  const supervisor = new Supervisor({
+    registry: testRegistry([codexAgentConfig()]),
+    adapters: new AdapterRegistry([adapter]),
+    cwd: "/work",
+  });
+  assert.equal((await supervisor.listModels())["live"], undefined, "no backend named: live stays off");
+  assert.equal((await supervisor.listModels("codex", false))["live"], undefined);
+  assert.equal(queried, 0);
+
+  const listed = await supervisor.listModels("codex");
+  const live = listed["live"] as Record<string, unknown>;
+  assert.deepEqual(live["roster_not_offered"], ["fake-model"]);
+  assert.deepEqual(live["usage_limits"], { go: { weekly: { percent_used: 10 } } });
+
+  const all = await supervisor.listModels(undefined, true);
+  assert.ok((all["live"] as Record<string, unknown>)["codex"]);
+
+  Object.assign(adapter, { providerInfo: async () => { throw new Error("server down"); } });
+  const failed = await supervisor.listModels("codex", true);
+  assert.deepEqual(failed["live"], { error: "server down" });
+  assert.ok(failed["models"], "a live failure keeps the local roster");
+});
+
+test("list_agents cumulative_usage includes the turn in progress, then the completed turn's own usage", async () => {
+  const adapter = new FakeAdapter("codex");
+  const supervisor = new Supervisor({
+    registry: testRegistry([codexAgentConfig()]),
+    adapters: new AdapterRegistry([adapter]),
+    cwd: "/work",
+  });
+  const spawned = await supervisor.spawnAgent({ agent: "general", prompt: "work", description: "live usage", run_in_background: true });
+  const agentId = spawned["agent_id"] as string;
+  const usageOf = () => supervisor.listAgents().find((agent) => agent["agent_id"] === agentId)?.["cumulative_usage"] as Record<string, number | null> | undefined;
+
+  adapter.emit(agentId, "usage.updated", { turnId: "t1", usage: { inputTokens: 100, outputTokens: 7, cachedInputTokens: 40, uncachedInputTokens: 60 } });
+  await waitUntil(() => usageOf()?.["inputTokens"] === 100);
+  assert.deepEqual(usageOf(), { inputTokens: 100, outputTokens: 7, cachedInputTokens: 40, uncachedInputTokens: 60, costUsd: null });
+
+  adapter.emit(agentId, "turn.completed", { turnId: "t1", status: "completed", usage: { inputTokens: 120, outputTokens: 9, cachedInputTokens: 40, uncachedInputTokens: 80 } });
+  await waitUntil(() => supervisor.listAgents().some((agent) => agent["agent_id"] === agentId && agent["state"] === "completed"));
+  assert.deepEqual(usageOf(), { inputTokens: 120, outputTokens: 9, cachedInputTokens: 40, uncachedInputTokens: 80, costUsd: null }, "live usage is replaced, not added");
 });

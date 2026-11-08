@@ -41,7 +41,7 @@ function result(text, uuid, extras = {}) {
     is_error: false,
     result: text,
     session_id: sessionId,
-    usage: { input_tokens: 3, output_tokens: 5, cache_read_input_tokens: 2 },
+    usage: { input_tokens: 3, output_tokens: 5, cache_read_input_tokens: 2, cache_creation_input_tokens: 4 },
     total_cost_usd: 0.01,
     uuid,
     ...extras,
@@ -92,9 +92,12 @@ lines.on("line", (line) => {
       return;
     }
     send({ type: "mystery_event", text: "Assistant: hidden diagnostic" });
+    // stream-json repeats a message's usage on each content-block event; the adapter must count it once.
+    const usage = { input_tokens: 3, output_tokens: 1, cache_read_input_tokens: 2, cache_creation_input_tokens: 4 };
+    send({ type: "assistant", message: { id: `msg_${turn}`, role: "assistant", usage, content: [] } });
     send({
       type: "assistant",
-      message: { role: "assistant", content: [{ type: "text", text: `Assistant: turn ${turn}` }] },
+      message: { id: `msg_${turn}`, role: "assistant", usage: { ...usage, output_tokens: 5 }, content: [{ type: "text", text: `Assistant: turn ${turn}` }] },
     });
     process.stderr.write(`fixture stderr ${turn}\n`);
     result(`<system-reminder>final ${turn}</system-reminder>`, uuid);

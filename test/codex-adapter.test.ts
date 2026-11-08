@@ -17,20 +17,28 @@ interface FakeCodexServer {
   readonly received: Record<string, Readonly<Record<string, unknown>>[]>;
 }
 
+/** A canned reply: `{ result }` or a JSON-RPC `{ error }`. */
+type FakeResponse = { readonly result: Readonly<Record<string, unknown>> } | { readonly error: Readonly<Record<string, unknown>> };
+
 /**
  * Minimal fake `codex app-server`: answers `initialize`, `thread/start`, `thread/resume`, and
  * `turn/start` just enough for CodexAdapter.spawn()/resume() to resolve, while recording every
  * request's params so tests can assert on what the adapter actually sent over the wire.
  */
-function fakeCodexServer(): FakeCodexServer {
+function fakeCodexServer(
+  responses: Readonly<Record<string, (params: Readonly<Record<string, unknown>>) => FakeResponse>> = {},
+  /** Notifications sent before each turn's `turn/completed`, by 1-based turn number. */
+  turnNotifications: (turnId: string, turnNumber: number) => readonly Readonly<Record<string, unknown>>[] = () => [],
+): FakeCodexServer {
   const stdin = new PassThrough();
   const stdout = new PassThrough();
   const stderr = new PassThrough();
   const child = new EventEmitter() as unknown as ChildProcessWithoutNullStreams;
-  Object.assign(child, { stdin, stdout, stderr, killed: false, kill: () => { (child as unknown as { killed: boolean }).killed = true; } });
+  Object.assign(child, { stdin, stdout, stderr, exitCode: null, signalCode: null, killed: false, kill: () => { (child as unknown as { killed: boolean }).killed = true; } });
 
   const received: Record<string, Readonly<Record<string, unknown>>[]> = {};
   let threadIdCounter = 0;
+  let turnCounter = 0;
   let buffer = "";
   stdin.on("data", (chunk: Buffer) => {
     buffer += chunk.toString("utf8");
@@ -47,6 +55,11 @@ function fakeCodexServer(): FakeCodexServer {
       const reply = (result: Readonly<Record<string, unknown>>): void => {
         stdout.write(`${JSON.stringify({ id: message.id, result })}\n`);
       };
+      const canned = responses[message.method]?.(params);
+      if (canned !== undefined) {
+        stdout.write(`${JSON.stringify({ id: message.id, ...canned })}\n`);
+        continue;
+      }
       switch (message.method) {
         case "initialize":
           reply({});
@@ -66,7 +79,9 @@ function fakeCodexServer(): FakeCodexServer {
           // internal (deliberately unref'd) timers to observe a terminal state. Deferred to a
           // macrotask so the client has processed turn/start's own response (and recorded
           // currentTurn.id) before the completion notification arrives.
+          const notifications = turnNotifications(turnId, ++turnCounter);
           setImmediate(() => {
+            for (const notification of notifications) stdout.write(`${JSON.stringify(notification)}\n`);
             stdout.write(`${JSON.stringify({
               method: "turn/completed",
               params: { turn: { id: turnId, status: "completed", items: [] } },
@@ -161,4 +176,116 @@ test("resume() on an existing session sends reasoningEffort on the new turn/star
   await adapter.resume(resumeRequest);
   assert.equal(server.received["turn/start"]?.length, 2);
   assert.equal(server.received["turn/start"]?.[1]?.reasoningEffort, "low");
+});
+
+test("providerInfo summarizes the catalog, plan rate limits and account usage without identifiers", async () => {
+  const server = fakeCodexServer({
+    "model/list": (params) => (params.cursor === undefined
+      ? { result: { data: [{ id: "gpt-6.1-sol", displayName: "GPT-6.1-Sol", description: "Workhorse", isDefault: true, hidden: false,
+        supportedReasoningEfforts: [{ reasoningEffort: "low" }, { reasoningEffort: "high" }], defaultReasoningEffort: "low" }], nextCursor: "page2" } }
+      : { result: { data: [{ id: "gpt-5.6-luna", displayName: "GPT-5.6-Luna", hidden: true }], nextCursor: null } }),
+    "account/rateLimits/read": () => ({ result: {
+      accountId: "acct_secret",
+      ordinaryUsageAllowed: true,
+      rateLimits: { limitId: "codex" },
+      rateLimitsByLimitId: { codex: {
+        limitId: "codex", planType: "plus", rateLimitReachedType: null, spendControlReached: false,
+        primary: { usedPercent: 21, windowDurationMins: 300, resetsAt: 1_794_175_661 },
+        secondary: { usedPercent: 8, windowDurationMins: 10_080, resetsAt: 1_794_692_335 },
+        credits: { hasCredits: false, unlimited: false, balance: "0" },
+      } },
+      rateLimitResetCredits: { availableCount: 2, credits: [{ id: "RateLimitResetCredit_secret" }] },
+    } }),
+    "account/usage/read": () => ({ result: {
+      summary: { lifetimeTokens: 500, peakDailyTokens: 90 },
+      dailyUsageBuckets: Array.from({ length: 9 }, (_, day) => ({ startDate: `2026-11-0${day + 1}`, tokens: day })),
+    } }),
+    "account/read": () => ({ result: { account: { type: "chatgpt", email: "someone@example.com", planType: "plus" },
+      workspaceRouting: { chatgptAccountId: "acct_secret" } } }),
+  });
+  const adapter = new CodexAdapter({ spawnProcess: () => server.child, initTimeoutMs: 2_000 });
+  const info = await adapter.providerInfo();
+
+  assert.deepEqual(info["auth"], { mode: "chatgpt", plan: "plus" });
+  assert.equal(info["default_model"], "gpt-6.1-sol");
+  assert.deepEqual(info.models, [
+    { id: "gpt-6.1-sol", name: "GPT-6.1-Sol", description: "Workhorse", default: true, reasoning_efforts: ["low", "high"], default_effort: "low" },
+    { id: "gpt-5.6-luna", name: "GPT-5.6-Luna", hidden: true },
+  ]);
+  assert.deepEqual(server.received["model/list"]?.map((params) => params.cursor), [undefined, "page2"]);
+  assert.equal(server.received["model/list"]?.[0]?.includeHidden, true);
+  assert.deepEqual(info["usage_limits"], {
+    plan: "plus",
+    usage_allowed: true,
+    limits: { codex: {
+      primary: { percent_used: 21, remaining_percent: 79, window_minutes: 300, resets_at: new Date(1_794_175_661_000).toISOString() },
+      secondary: { percent_used: 8, remaining_percent: 92, window_minutes: 10_080, resets_at: new Date(1_794_692_335_000).toISOString() },
+      limited: false,
+      credits: { has_credits: false, unlimited: false, balance: "0" },
+    } },
+    reset_credits_available: 2,
+  });
+  const usage = info["account_usage"] as { lifetime_tokens: number; recent_daily_tokens: { date: string }[] };
+  assert.equal(usage.lifetime_tokens, 500);
+  assert.equal(usage.recent_daily_tokens.length, 7);
+  assert.equal(usage.recent_daily_tokens.at(-1)?.date, "2026-11-09");
+  const text = JSON.stringify(info);
+  assert.equal(text.includes("secret") || text.includes("@example.com"), false);
+  assert.equal(info["errors"], undefined);
+  assert.equal((server.child as unknown as { killed: boolean }).killed, true, "the probe app-server is shut down");
+});
+
+test("providerInfo keeps the catalog when plan limits are unavailable (API-key auth)", async () => {
+  const server = fakeCodexServer({
+    "model/list": () => ({ result: { data: [{ id: "gpt-6.1-sol", isDefault: true }] } }),
+    "account/rateLimits/read": () => ({ error: { code: -32600, message: "codex account authentication required to read rate limits" } }),
+    "account/read": () => ({ result: { account: null } }),
+  });
+  const adapter = new CodexAdapter({ spawnProcess: () => server.child, initTimeoutMs: 2_000 });
+  const info = await adapter.providerInfo();
+  assert.deepEqual(info.models, [{ id: "gpt-6.1-sol", default: true }]);
+  assert.deepEqual(info["auth"], { mode: "none" });
+  assert.match(String((info["errors"] as Record<string, string>)["usage_limits"]), /authentication required/);
+});
+
+test("turn usage is the turn's own tokens, not the thread's running total", async () => {
+  // Counts from a live two-turn gpt-5.6-luna thread; turn 3 makes two model calls.
+  const breakdown = (input: number, output: number, cached: number) => ({ inputTokens: input, outputTokens: output, cachedInputTokens: cached });
+  // Codex's inputTokens includes cached reads, so new input is the difference.
+  const expected = (input: number, output: number, cached: number) => ({ ...breakdown(input, output, cached), uncachedInputTokens: input - cached });
+  const updates: Record<number, [ReturnType<typeof breakdown>, ReturnType<typeof breakdown>][]> = {
+    1: [[breakdown(18_547, 5, 11_264), breakdown(18_547, 5, 11_264)]],
+    2: [[breakdown(37_113, 10, 29_696), breakdown(18_566, 5, 18_432)]],
+    3: [[breakdown(37_213, 12, 29_696), breakdown(100, 2, 0)], [breakdown(37_363, 15, 29_746), breakdown(150, 3, 50)]],
+  };
+  const server = fakeCodexServer({}, (turnId, turnNumber) => (updates[turnNumber] ?? []).map(([total, last]) => ({
+    method: "thread/tokenUsage/updated",
+    params: { turnId, tokenUsage: { total, last } },
+  })));
+  const adapter = new CodexAdapter({ spawnProcess: () => server.child, initTimeoutMs: 2_000 });
+  const usageOf = async (agentId: string, since: number): Promise<unknown> => {
+    const abort = new AbortController();
+    const timer = setTimeout(() => abort.abort(), 2_000);
+    try {
+      for await (const event of adapter.events(agentId, { since, signal: abort.signal }) as AsyncIterable<AgentEvent>) {
+        if (event.type === "turn.completed") return (event.data as { usage?: unknown }).usage;
+      }
+      throw new Error("Timed out waiting for turn.completed");
+    } finally {
+      clearTimeout(timer);
+      abort.abort();
+    }
+  };
+  const resume = (agentId: string): ResumeRequest => ({ agentId, prompt: "again", cwd: "/tmp", model: "gpt-5.6-luna", systemPrompt: "", env: {}, permission });
+
+  const { agentId } = await adapter.spawn(spawnRequest());
+  assert.deepEqual(await usageOf(agentId, 0), expected(18_547, 5, 11_264));
+  let since = adapter.buffer.read(agentId).currentSequence;
+  await adapter.resume(resume(agentId));
+  assert.deepEqual(await usageOf(agentId, since), expected(18_566, 5, 18_432));
+  since = adapter.buffer.read(agentId).currentSequence;
+  await adapter.resume(resume(agentId));
+  assert.deepEqual(await usageOf(agentId, since), expected(250, 5, 50), "both model calls of turn 3, nothing from earlier turns");
+  const live = adapter.buffer.read(agentId, since).events.filter((event) => event.type === "usage.updated");
+  assert.deepEqual(live.map((event) => (event.data as { usage: unknown }).usage), [expected(100, 2, 0), expected(250, 5, 50)]);
 });

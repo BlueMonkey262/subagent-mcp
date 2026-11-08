@@ -127,7 +127,7 @@ test("a turn stores the session_id, maps text/tools/result/usage, and exits afte
     const completed = events.find((event) => event.type === "turn.completed")?.data as unknown as { status: string; finalText?: string; usage?: Record<string, number> };
     assert.equal(completed.status, "completed");
     assert.equal(completed.finalText, "final 1");
-    assert.deepEqual(completed.usage, { inputTokens: 10, outputTokens: 4, cachedInputTokens: 2 });
+    assert.deepEqual(completed.usage, { inputTokens: 10, outputTokens: 4, cachedInputTokens: 2, uncachedInputTokens: 13 }, "new input = input + cache writes");
 
     const data = JSON.parse(await readFile(invocation, "utf8"));
     assert.equal(data.cwd, cwd);

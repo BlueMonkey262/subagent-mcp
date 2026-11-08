@@ -212,12 +212,25 @@ async function main(): Promise<void> {
       description:
         "Config-sourced model roster plus per-backend usage counters (spawns, resumes, turns, failures, timeouts, " +
         "tokens, and cost) and, when models.yaml sets allowances, how much of each allowance is left. Also reports " +
-        "the concurrency cap, the number of active agents, and how many spawns are waiting for a slot.",
-      inputSchema: { backend: z.enum(BACKENDS).optional() },
+        "the concurrency cap, the number of active agents, and how many spawns are waiting for a slot. " +
+        "With `live` (on by default when one `backend` is named), adds a `live` section from the backend's own API. " +
+        "OpenCode >= 2: every model the server can run (context, max output, USD cost per million tokens), its default " +
+        "model, OpenCode Go rolling/weekly/monthly usage and workspace budgets. Codex: the model catalog (reasoning " +
+        "efforts, default), the ChatGPT plan's rate-limit windows and credits, and recent account token totals. Usage " +
+        "windows report `percent_used`, `remaining_percent` and `resets_at`. `roster_not_offered` lists roster entries " +
+        "the backend does not offer; `errors` names any section that failed. Live usage is what the vendor's own " +
+        "account tracks, not quotas of external API keys. It may start `opencode serve` or a short-lived `codex app-server`.",
+      inputSchema: {
+        backend: z.enum(BACKENDS).optional(),
+        live: z.boolean().optional().describe("Query live model lists and plan usage (default: true when backend is set)"),
+      },
     },
-    async ({ backend }) => {
+    async ({ backend, live }) => {
       if (backend !== undefined && !isBackend(backend)) throw new Error(`Invalid backend: ${String(backend)}`);
-      return toContent(await call("list_models", backend === undefined ? {} : { backend }));
+      return toContent(await call("list_models", {
+        ...(backend === undefined ? {} : { backend }),
+        ...(live === undefined ? {} : { live }),
+      }));
     },
   );
 

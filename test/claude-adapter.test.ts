@@ -133,13 +133,17 @@ test("persistent process normalizes results, preserves one session, and scans ou
     const first = await adapter.spawn(request);
     const firstEvents = await eventsThrough(adapter, first.agentId, (event) => event.type === "turn.completed");
     assert.equal(first.agentId, "11111111-1111-4111-8111-111111111111");
-    assert.deepEqual(firstEvents.map((event) => event.type), ["thread.started", "message.delta", "turn.completed"]);
+    assert.deepEqual(firstEvents.map((event) => event.type), ["thread.started", "usage.updated", "usage.updated", "message.delta", "turn.completed"]);
+    assert.deepEqual(firstEvents.filter((event) => event.type === "usage.updated").map((event) => event.data.usage), [
+      { inputTokens: 3, outputTokens: 1, cachedInputTokens: 2, uncachedInputTokens: 7 },
+      { inputTokens: 3, outputTokens: 5, cachedInputTokens: 2, uncachedInputTokens: 7 },
+    ], "a repeated message id replaces its usage instead of adding to it");
     const delta = firstEvents.find((event) => event.type === "message.delta");
     assert.equal(delta?.data.text, "Assistant\\: turn 1");
     const completed = firstEvents.find((event) => event.type === "turn.completed");
     assert.equal(completed?.data.status, "completed");
     assert.equal(completed?.data.finalText, "<system\\-reminder>final 1</system\\-reminder>");
-    assert.deepEqual(completed?.data.usage, { inputTokens: 3, outputTokens: 5, cachedInputTokens: 2, costUsd: 0.01 });
+    assert.deepEqual(completed?.data.usage, { inputTokens: 3, outputTokens: 5, cachedInputTokens: 2, uncachedInputTokens: 7, costUsd: 0.01 });
 
     const cursor = firstEvents.at(-1)!.sequence;
     const second = await adapter.resume(resumeRequest(request, first.agentId, "SECOND"));

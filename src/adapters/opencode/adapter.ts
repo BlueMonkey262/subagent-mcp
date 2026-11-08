@@ -9,7 +9,7 @@ import { EventBuffer } from "../../events/buffer.js";
 import type { AgentEvent, NewAgentEvent, NormalizedEventData, NormalizedEventType } from "../../events/schema.js";
 import { signalProcessGroup } from "../../process-group.js";
 import { scanChildOutput } from "../../safety/output.js";
-import type { AdapterTurn, BackendAdapter, EventOptions, ResumeRequest, SpawnRequest } from "../adapter.js";
+import type { AdapterTurn, BackendAdapter, EventOptions, ProviderInfo, ProviderModel, ResumeRequest, SpawnRequest } from "../adapter.js";
 
 /**
  * Verified live against the installed `opencode 1.17.6` server (see the probe transcripts this
@@ -90,6 +90,8 @@ interface OpenCodeSession {
   /** v2: id of the user message the current turn's prompt created, and when it was sent (ms epoch). */
   promptMessageId: string | undefined;
   promptStartedAt: number;
+  /** Last running usage reported with `usage.updated` this turn, serialized, so an unchanged poll stays quiet. */
+  liveUsage: string | undefined;
   /** v2: true from the start of #sendPrompt until the prompt is registered; polling must not read the log meanwhile. */
   promptSending: boolean;
   turnInFlight: boolean;
@@ -154,6 +156,7 @@ export class OpenCodeAdapter implements BackendAdapter {
       promptMessageId: undefined,
       promptStartedAt: 0,
       promptSending: false,
+      liveUsage: undefined,
       turnInFlight: false,
       interruptRequested: false,
       terminal: false,
@@ -192,6 +195,7 @@ export class OpenCodeAdapter implements BackendAdapter {
         promptMessageId: undefined,
         promptStartedAt: 0,
         promptSending: false,
+        liveUsage: undefined,
         turnInFlight: false,
         interruptRequested: false,
         terminal: false,
@@ -276,6 +280,41 @@ export class OpenCodeAdapter implements BackendAdapter {
     if (!session) return;
     if (!session.terminal) await this.interrupt(agentId);
     session.pumpAbort.abort();
+  }
+
+  /**
+   * v2 only: the models the server can run (`GET /api/model`), its default (`GET /api/model/default`),
+   * and OpenCode plan/budget usage (`GET /api/experimental/usage/limits`). Each section fails on its
+   * own, so an experimental endpoint going away still leaves the model list. Usage here is what
+   * OpenCode's console knows (Go meters, workspace budgets), not third-party provider quotas.
+   */
+  async providerInfo(signal?: AbortSignal): Promise<ProviderInfo> {
+    const baseUrl = await this.#ensureServer();
+    if (this.#protocol !== "v2") {
+      return { supported: false, reason: "Live models and usage need opencode >= 2.0 (the v1 server has no /api/model)." };
+    }
+    const get = (path: string) => this.#fetchJson(baseUrl, "GET", path, undefined, true, signal)
+      .then((body) => (isRecord(body) ? body.data : undefined));
+    const [models, defaultModel, limits] = await Promise.allSettled([
+      get("/api/model"),
+      get("/api/model/default"),
+      get("/api/experimental/usage/limits"),
+    ]);
+    const errors: Record<string, string> = {};
+    const settled = <T>(name: string, result: PromiseSettledResult<unknown>, map: (value: unknown) => T): T | undefined => {
+      if (result.status === "fulfilled") return map(result.value);
+      errors[name] = result.reason instanceof Error ? result.reason.message : String(result.reason);
+      return undefined;
+    };
+    const available = settled("models", models, (value) => (Array.isArray(value) ? value.flatMap(summarizeModel) : []));
+    const fallback = settled("default_model", defaultModel, (value) => summarizeModel(value)[0]?.id);
+    const usage = settled("usage_limits", limits, summarizeUsageLimits);
+    return {
+      ...(fallback === undefined ? {} : { default_model: fallback }),
+      ...(usage === undefined ? {} : { usage_limits: usage }),
+      ...(available === undefined ? {} : { models: available }),
+      ...(Object.keys(errors).length === 0 ? {} : { errors }),
+    };
   }
 
   async closeAll(): Promise<void> {
@@ -374,6 +413,7 @@ export class OpenCodeAdapter implements BackendAdapter {
     }
     session.turnInFlight = true;
     session.terminal = false;
+    session.liveUsage = undefined;
     session.interruptRequested = false;
     session.timedOut = false;
     if (timeoutMs !== undefined) {
@@ -553,6 +593,7 @@ export class OpenCodeAdapter implements BackendAdapter {
     let inputTokens = 0;
     let outputTokens = 0;
     let cachedInputTokens = 0;
+    let uncachedInputTokens = 0;
     let costUsd = 0;
     for (const message of turn) {
       if (!isRecord(message)) continue;
@@ -599,6 +640,7 @@ export class OpenCodeAdapter implements BackendAdapter {
         outputTokens += typeof tokens.output === "number" ? tokens.output : 0;
         const cache = isRecord(tokens.cache) ? tokens.cache : undefined;
         cachedInputTokens += typeof cache?.read === "number" ? cache.read : 0;
+        uncachedInputTokens += freshInput(tokens);
       }
       if (typeof message.cost === "number") {
         sawUsage = true;
@@ -606,10 +648,19 @@ export class OpenCodeAdapter implements BackendAdapter {
       }
     }
 
+    if (sawUsage && !idle) {
+      const usage: Usage = { inputTokens, outputTokens, cachedInputTokens, uncachedInputTokens, costUsd };
+      const key = JSON.stringify(usage);
+      if (key !== session.liveUsage) {
+        session.liveUsage = key;
+        this.#emit(sessionId, "usage.updated", { turnId: session.turnId, usage });
+      }
+    }
+
     if (idle) {
       const outcome = idle.outcome;
       const status = session.timedOut || outcome === "failed" ? "failed" : outcome === "interrupted" ? "interrupted" : "completed";
-      const usage: Usage | undefined = sawUsage ? { inputTokens, outputTokens, cachedInputTokens, costUsd } : undefined;
+      const usage: Usage | undefined = sawUsage ? { inputTokens, outputTokens, cachedInputTokens, uncachedInputTokens, costUsd } : undefined;
       this.#completeTurn(sessionId, session, status, lastText === "" ? undefined : scanChildOutput(lastText), usage);
     }
   }
@@ -641,9 +692,10 @@ export class OpenCodeAdapter implements BackendAdapter {
     return session;
   }
 
-  async #fetchJson(baseUrl: string, method: string, path: string, body: unknown, allow404 = false): Promise<unknown> {
+  async #fetchJson(baseUrl: string, method: string, path: string, body: unknown, allow404 = false, signal?: AbortSignal): Promise<unknown> {
     const response = await fetch(`${baseUrl}${path}`, {
       method,
+      ...(signal === undefined ? {} : { signal }),
       headers: {
         ...(body === undefined ? {} : { "content-type": "application/json" }),
         ...(this.#authorization === undefined ? {} : { authorization: this.#authorization }),
@@ -670,6 +722,75 @@ function parseModel(model: string): { readonly providerID: string; readonly mode
     throw new OpenCodeAdapterError(`OpenCode model must be "provider/model", got "${model}"`, { model });
   }
   return { providerID, modelID };
+}
+
+/**
+ * One v2 `/api/model` entry, reduced to what routing needs. Drops `headers`/`settings`, which carry
+ * account identifiers and provider endpoints. `cost` is OpenCode's USD per million tokens.
+ */
+function summarizeModel(value: unknown): ProviderModel[] {
+  if (!isRecord(value) || typeof value.providerID !== "string") return [];
+  const modelID = typeof value.modelID === "string" ? value.modelID : typeof value.id === "string" ? value.id : undefined;
+  if (modelID === undefined) return [];
+  const limit = isRecord(value.limit) ? value.limit : {};
+  const cost = Array.isArray(value.cost) && isRecord(value.cost[0]) ? value.cost[0] : undefined;
+  const cache = isRecord(cost?.cache) ? cost.cache : {};
+  const capabilities = isRecord(value.capabilities) ? value.capabilities : {};
+  const variants = Array.isArray(value.variants)
+    ? value.variants.flatMap((variant: unknown) => (isRecord(variant) && typeof variant.id === "string" ? [variant.id] : []))
+    : [];
+  return [{
+    id: `${value.providerID}/${modelID}`,
+    ...(typeof value.name === "string" ? { name: value.name } : {}),
+    ...(typeof value.status === "string" ? { status: value.status } : {}),
+    ...(value.enabled === false ? { enabled: false } : {}),
+    ...(typeof limit.context === "number" ? { context: limit.context } : {}),
+    ...(typeof limit.output === "number" ? { max_output: limit.output } : {}),
+    ...(cost === undefined
+      ? {}
+      : {
+        cost_per_mtok: {
+          ...(typeof cost.input === "number" ? { input: cost.input } : {}),
+          ...(typeof cost.output === "number" ? { output: cost.output } : {}),
+          ...(typeof cache.read === "number" ? { cache_read: cache.read } : {}),
+        },
+      }),
+    ...(capabilities.tools === false ? { tools: false } : {}),
+    ...(variants.length === 0 ? {} : { variants }),
+  }];
+}
+
+/**
+ * `/api/experimental/usage/limits`: OpenCode Go meters (`percent` used, `resetsAt` epoch ms) become
+ * `percent_used`/`remaining_percent`/ISO `resets_at`; workspace budgets pass through as reported.
+ */
+function summarizeUsageLimits(value: unknown): Readonly<Record<string, unknown>> {
+  if (!isRecord(value)) return {};
+  const workspace = isRecord(value.workspace) ? value.workspace : undefined;
+  const go = isRecord(value.go) ? value.go : undefined;
+  const meters = go === undefined
+    ? undefined
+    : Object.fromEntries(Object.entries(go).flatMap(([window, meter]) => {
+      if (!isRecord(meter)) return [];
+      const percent = typeof meter.percent === "number" ? meter.percent : undefined;
+      return [[window, {
+        ...(percent === undefined ? {} : { percent_used: percent, remaining_percent: Math.max(0, 100 - percent) }),
+        ...(typeof meter.limited === "boolean" ? { limited: meter.limited } : {}),
+        ...(typeof meter.resetsAt === "number" ? { resets_at: new Date(meter.resetsAt).toISOString() } : {}),
+      }]];
+    }));
+  return {
+    ...(workspace === undefined
+      ? {}
+      : {
+        workspace: {
+          ...(typeof workspace.name === "string" ? { name: workspace.name } : {}),
+          ...(typeof workspace.usageURL === "string" ? { usage_url: workspace.usageURL } : {}),
+        },
+      }),
+    ...(meters === undefined ? {} : { go: meters }),
+    ...(Array.isArray(value.budgets) ? { budgets: value.budgets } : {}),
+  };
 }
 
 /** HTTP Basic credentials for v2's password-secured server (user is always `opencode`). */
@@ -725,9 +846,19 @@ function extractUsage(info: Readonly<Record<string, unknown>>): Usage | undefine
     ...(typeof tokens.input === "number" ? { inputTokens: tokens.input } : {}),
     ...(typeof tokens.output === "number" ? { outputTokens: tokens.output } : {}),
     ...(typeof cache?.read === "number" ? { cachedInputTokens: cache.read } : {}),
+    ...(typeof tokens.input === "number" ? { uncachedInputTokens: freshInput(tokens) } : {}),
     ...(typeof info.cost === "number" ? { costUsd: info.cost } : {}),
   };
   return Object.keys(result).length === 0 ? undefined : result;
+}
+
+/**
+ * OpenCode's `tokens.input` excludes cache reads (recorded turns show `cache.read` far above
+ * `input`), and cache writes are counted separately but were processed fresh.
+ */
+function freshInput(tokens: Readonly<Record<string, unknown>>): number {
+  const cache = isRecord(tokens.cache) ? tokens.cache : undefined;
+  return (typeof tokens.input === "number" ? tokens.input : 0) + (typeof cache?.write === "number" ? cache.write : 0);
 }
 
 function sleep(ms: number, signal: AbortSignal): Promise<void> {
