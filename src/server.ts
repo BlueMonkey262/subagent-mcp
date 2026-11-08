@@ -60,6 +60,9 @@ async function main(): Promise<void> {
         "spawn. When the concurrency cap is full the call waits for a free slot instead of failing. `model` is " +
         "required unless the named agent config pins one; there is no default model at any layer. Implementation " +
         "work that requires search, iteration, or verification should go to a subagent rather than being done inline. " +
+        "Roster entries `list_models` marks `blocked` (see its `model_policy`: disabled backends, blocked model " +
+        "patterns, or Claude models) are refused: pick another. If a Claude subagent is really needed while Claude " +
+        "models are blocked, ask the user for explicit approval and use your built-in Agent tool instead. " +
         ORCHESTRATOR_AUTHORITY_NOTICE,
       inputSchema: {
         agent: z.string().describe("Name of a configured agent in .subagents/<name>.md"),

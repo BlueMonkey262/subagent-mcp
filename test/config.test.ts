@@ -280,3 +280,36 @@ Work.
   const registry = await loadConfigRegistry({ agentsDirectory: agents, modelsFile: models });
   assert.deepEqual(registry.listModels("antigravity"), []);
 });
+
+test("the model policy is read from models.yaml, defaults open, and rejects bad values", async () => {
+  const { agents, models } = await fixture();
+  await writeFile(join(agents, "general.md"), `---
+name: general
+backend: codex
+description: General agent
+---
+Work.
+`);
+  const roster = `models:
+  claude: []
+  codex: [gpt-5.6-luna]
+  opencode: []
+  antigravity: []
+  cursor: []
+`;
+  await writeFile(models, roster);
+  const load = () => loadConfigRegistry({ agentsDirectory: agents, modelsFile: models });
+  assert.deepEqual((await load()).modelPolicy(), { blockClaudeModels: false, disabledBackends: [], blockModels: [] });
+  await writeFile(models, `blockClaudeModels: true\ndisabledBackends: [cursor, Antigravity]\nblockModels: ["*grok*", "codex:gpt-5.6-sol"]\n${roster}`);
+  assert.deepEqual((await load()).modelPolicy(), {
+    blockClaudeModels: true,
+    disabledBackends: ["cursor", "antigravity"],
+    blockModels: ["*grok*", "codex:gpt-5.6-sol"],
+  });
+  await writeFile(models, `blockClaudeModels: "yes"\n${roster}`);
+  await assert.rejects(load(), /blockClaudeModels must be true or false/);
+  await writeFile(models, `disabledBackends: [copilot]\n${roster}`);
+  await assert.rejects(load(), /"copilot" is not a backend/);
+  await writeFile(models, `blockModels: grok\n${roster}`);
+  await assert.rejects(load(), /blockModels must be an array/);
+});

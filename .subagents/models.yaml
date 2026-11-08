@@ -5,6 +5,12 @@
 #   cursor:
 #     maxSpawns: 20
 #     maxCostUsd: 5
+# Refuse agents before they start (README: "Blocking backends and models"). Each also has an
+# environment variable for every project: SUBAGENT_MCP_DISABLED_BACKENDS, SUBAGENT_MCP_BLOCK_MODELS,
+# SUBAGENT_MCP_BLOCK_CLAUDE_MODELS.
+# disabledBackends: [antigravity]
+# blockModels: ["*grok*", "codex:gpt-5.6-sol"]
+# blockClaudeModels: true   # Claude subagents go through Claude Code's own Agent tool instead
 
 models:
   claude:

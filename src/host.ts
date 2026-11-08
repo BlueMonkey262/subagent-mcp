@@ -354,7 +354,12 @@ export class HostClient {
       this.#pending.delete(message["id"]);
       if (isRecord(message["error"])) {
         const text = message["error"]["message"];
-        pending.reject(new Error(typeof text === "string" ? text : "subagent-mcp host request failed"));
+        const code = message["error"]["code"];
+        // The code leads the message so a model reading only the tool error text still sees it.
+        const body = typeof text === "string" ? text : "subagent-mcp host request failed";
+        const error = new Error(typeof code === "string" ? `${code}: ${body}` : body) as Error & { code?: string };
+        if (typeof code === "string") error.code = code;
+        pending.reject(error);
       } else {
         pending.resolve(message["result"]);
       }

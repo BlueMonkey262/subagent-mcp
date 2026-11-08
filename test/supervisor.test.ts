@@ -4,9 +4,10 @@ import test from "node:test";
 import { AdapterRegistry } from "../src/adapters/adapter.js";
 import { FakeAdapter } from "../src/adapters/fake.js";
 import { AGENT_NAMES } from "../src/agent-names.js";
-import { ConfigRegistry } from "../src/config/registry.js";
+import { ConfigRegistry, defaultServerLimits } from "../src/config/registry.js";
 import type { AgentConfig, ModelRoster } from "../src/config/schema.js";
 import { EventBuffer } from "../src/events/buffer.js";
+import type { Backend } from "../src/core/types.js";
 import { Supervisor } from "../src/supervisor.js";
 
 const permission = { allow: [], deny: [], default: "escalate" as const };
@@ -829,4 +830,85 @@ test("live usage: a late update for a finished turn is ignored, and an interrupt
   await waitUntil(() => agent()["state"] === "interrupted");
   assert.equal(usageOf()["inputTokens"], 120, "the interrupted turn keeps its 20 observed tokens");
   assert.equal(usageOf()["outputTokens"], 7);
+});
+
+test("blockClaudeModels refuses Claude spawns and resumes, allows endpoint models, and marks the roster", async () => {
+  const claude = new FakeAdapter("claude");
+  const codex = new FakeAdapter("codex");
+  const roster: ModelRoster = {
+    claude: [{ name: "claude-sonnet-5" }, { name: "nim/nemotron" }],
+    codex: [{ name: "fake-model" }],
+    opencode: [{ name: "opencode/claude-sonnet-5-5" }],
+    antigravity: [],
+    cursor: [],
+  };
+  const { model: _pinned, ...unpinned } = codexAgentConfig();
+  const agents: AgentConfig[] = [codexAgentConfig(), { ...unpinned, name: "claude-general", backend: "claude" }];
+  // Mutable so the block can be switched on mid-test, as a models.yaml reload would.
+  const limits = { ...defaultServerLimits(), modelPolicy: { blockClaudeModels: false, disabledBackends: [] as Backend[], blockModels: [] as string[] } };
+  const blocked = new Supervisor({ registry: new ConfigRegistry(agents, roster, limits), adapters: new AdapterRegistry([claude, codex]), cwd: "/work" });
+  assert.equal((await blocked.listModels(undefined, false))["model_policy"], undefined);
+  const earlier = await blocked.spawnAgent({ agent: "claude-general", model: "claude-sonnet-5", prompt: "hi", description: "before", run_in_background: true });
+  limits.modelPolicy = { ...limits.modelPolicy, blockClaudeModels: true };
+
+  await assert.rejects(
+    blocked.sendMessage({ agent: earlier["agent_id"] as string, prompt: "more" }),
+    /blocked in subagent-mcp/, "an agent started before the block cannot be resumed",
+  );
+  await assert.rejects(
+    blocked.spawnAgent({ agent: "claude-general", model: "claude-sonnet-5", prompt: "hi", description: "blocked" }),
+    (error: Error & { code?: string }) => error.code === "CLAUDE_MODEL_BLOCKED" && /built-in Agent tool/.test(error.message),
+  );
+  await assert.rejects(
+    blocked.spawnAgent({ agent: "claude-general", model: "claude-sonnet-5", prompt: "hi", description: "queued", depends_on: [earlier["agent_id"] as string] }),
+    /blocked in subagent-mcp/, "a dependent spawn is refused up front, not queued",
+  );
+  const viaEndpoint = await blocked.spawnAgent({ agent: "claude-general", model: "nim/nemotron", prompt: "hi", description: "endpoint", run_in_background: true });
+  assert.ok(viaEndpoint["agent_id"]);
+  assert.ok((await blocked.spawnAgent({ agent: "general", prompt: "hi", description: "codex", run_in_background: true }))["agent_id"]);
+
+  const listed = await blocked.listModels(undefined, false);
+  assert.deepEqual(listed["model_policy"], { claude_models_blocked: true, disabled_backends: [], block_models: [] });
+  const models = listed["models"] as Record<string, { name: string; blocked?: boolean; blocked_by?: string }[]>;
+  assert.deepEqual(models["claude"]?.map((entry) => [entry.name, entry.blocked === true]), [["claude-sonnet-5", true], ["nim/nemotron", false]]);
+  assert.equal(models["opencode"]?.[0]?.blocked_by, "blockClaudeModels");
+  assert.equal(models["codex"]?.[0]?.blocked, undefined);
+
+  // Disabling a backend and blocking a pattern, on top of the Claude block.
+  limits.modelPolicy = { blockClaudeModels: true, disabledBackends: ["codex"], blockModels: ["claude:nim/*"] };
+  await assert.rejects(blocked.spawnAgent({ agent: "general", prompt: "hi", description: "codex off" }),
+    (error: Error & { code?: string }) => error.code === "BACKEND_DISABLED");
+  await assert.rejects(blocked.spawnAgent({ agent: "claude-general", model: "nim/nemotron", prompt: "hi", description: "pattern" }),
+    (error: Error & { code?: string }) => error.code === "MODEL_BLOCKED");
+  const configs = blocked.listAgentConfigs().configs as { name: string; blocked?: boolean; blocked_by?: string }[];
+  assert.equal(configs.find((config) => config.name === "general")?.blocked_by, "disabledBackends");
+  assert.equal(configs.find((config) => config.name === "claude-general")?.blocked, undefined, "an unpinned config is judged per spawn");
+  assert.deepEqual(await blocked.listModels("codex"), { ...(await blocked.listModels("codex", false)), live: { disabled: true } },
+    "a disabled backend's live API is not queried");
+});
+
+test("the block is re-checked when a queued message is delivered and when a spawn gets its slot", async () => {
+  const claude = new FakeAdapter("claude");
+  const roster: ModelRoster = { claude: [{ name: "claude-sonnet-5" }], codex: [{ name: "fake-model" }], opencode: [], antigravity: [], cursor: [] };
+  const { model: _pinned, ...unpinned } = codexAgentConfig();
+  const agents: AgentConfig[] = [{ ...unpinned, name: "claude-general", backend: "claude" }];
+  const limits = { ...defaultServerLimits(), maxConcurrent: 1, modelPolicy: { blockClaudeModels: false, disabledBackends: [] as Backend[], blockModels: [] as string[] } };
+  const supervisor = new Supervisor({ registry: new ConfigRegistry(agents, roster, limits), adapters: new AdapterRegistry([claude]), cwd: "/work", maxConcurrent: 1 });
+
+  const first = await supervisor.spawnAgent({ agent: "claude-general", model: "claude-sonnet-5", prompt: "work", description: "running", run_in_background: true });
+  const agentId = first["agent_id"] as string;
+  // Accepted while allowed: a follow-up queued mid-turn, and a spawn waiting for the only slot.
+  await supervisor.sendMessage({ agent: agentId, prompt: "follow-up", run_in_background: true });
+  const waiting = supervisor.spawnAgent({ agent: "claude-general", model: "claude-sonnet-5", prompt: "second", description: "waiting", run_in_background: true })
+    .then(() => undefined, (error: unknown) => error);
+  limits.modelPolicy = { ...limits.modelPolicy, blockClaudeModels: true };
+
+  claude.emit(agentId, "turn.completed", { turnId: "t1", status: "completed" });
+  await waitUntil(() => supervisor.listAgents().some((agent) => agent["agent_id"] === agentId && agent["state"] === "completed"));
+  assert.equal(claude.resumeRequests.length, 0, "the queued message did not run");
+  const result = supervisor.getAgentResult(agentId) as { error?: { code: string } };
+  assert.equal(result.error?.code, "CLAUDE_MODEL_BLOCKED");
+  assert.match(String(await waiting), /blocked in subagent-mcp/, "the waiting spawn is refused once it gets the slot");
+  assert.equal(claude.spawnRequests.length, 1);
+  assert.equal(supervisor.concurrency().active, 0, "the refused spawn released its slot");
 });
