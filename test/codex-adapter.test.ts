@@ -365,6 +365,25 @@ test("a late update after turn/completed still advances the thread baseline for 
     { ...counts(50, 3, 0), uncachedInputTokens: 50 }, "230 - 180, not 230 - 100");
 });
 
+test("a straggler for the finished turn that lands after resume began still advances the baseline, and an older one never moves it back", async () => {
+  const server = fakeCodexServer({}, (turnId, turn) => turn === 1
+    ? [tokenUpdate(turnId, counts(100, 5, 0), counts(100, 5, 0))]
+    : [{ hold: true }]); // turn 2 stays open so the straggler arrives while it is the current turn
+  const adapter = new CodexAdapter({ spawnProcess: () => server.child, initTimeoutMs: 2_000 });
+  const { agentId, turnId: firstTurn } = await adapter.spawn(spawnRequest());
+  await waitForTurnCompleted(adapter, agentId);
+  const since = adapter.buffer.read(agentId).currentSequence;
+  const resumed = await adapter.resume({ agentId, prompt: "again", cwd: "/tmp", model: "gpt-5.6-luna", systemPrompt: "", env: {}, permission });
+  const out = server.child.stdout as PassThrough;
+  out.write(`${JSON.stringify(tokenUpdate(firstTurn, counts(180, 9, 0), counts(80, 4, 0)))}\n`); // straggler for turn 1
+  out.write(`${JSON.stringify(tokenUpdate(firstTurn, counts(120, 6, 0), counts(20, 1, 0)))}\n`); // older: must not regress
+  out.write(`${JSON.stringify(tokenUpdate(resumed.turnId, counts(230, 12, 0)))}\n`); // turn 2, no `last`
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  const usage = adapter.buffer.read(agentId, since).events.filter((event) => event.type === "usage.updated");
+  assert.deepEqual(usage.map((event) => (event.data as { usage: unknown }).usage), [{ ...counts(50, 3, 0), uncachedInputTokens: 50 }],
+    "turn 2 is charged 230 - 180; the straggler itself emits nothing");
+});
+
 test("without `last`, the previous total is the baseline; with neither, usage is left unreported", async () => {
   const server = fakeCodexServer({}, (turnId, turn) => turn === 1
     ? [tokenUpdate(turnId, counts(100, 5, 0))] // no `last`, nothing seen before: unknown
