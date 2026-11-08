@@ -4,14 +4,30 @@ export type PanelAgent = {
   backend: string
   model: string
   state: string
-  config: string
+  updated: string
+  tokensIn: number
+  tokensOut: number
 }
+
+/** What a confirmation is waiting on; null when nothing is. */
+export type PanelConfirm =
+  | { kind: 'stop'; agent: string }
+  | { kind: 'stopAll'; names: string[] }
+  | { kind: 'cleanup'; agent: string }
+  | { kind: 'update'; latest: string }
+  | null
 
 export type PanelState = {
   agents: PanelAgent[]
   selected: string | null
-  /** Last key or button the prototype saw, so a test run can confirm hotkeys work. */
-  lastAction: string
+  /** Digest lines for the selected agent, from get_agent_events summary. */
+  detail: string[]
+  detailFor: string | null
+  confirm: PanelConfirm
+  /** Newer release from .subagents/memory/update.json, if any. */
+  updateAvailable: string | null
+  /** Result of the last action, or why the server is not answering. */
+  message: string
   at: number
 }
 

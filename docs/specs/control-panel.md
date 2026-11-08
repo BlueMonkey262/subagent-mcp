@@ -62,8 +62,8 @@ question menus gate every write.
 - Right column: detail for the selected row. For an agent: the `summary: true` digest from
   `get_agent_events` (tool counts, last tool calls, message tail), then its result once finished.
   For a worktree: path, branch, whether it has unmerged commits or uncommitted changes.
-- Bottom key bar: `s` stop, `S` stop all, `a` approve/deny, `m` message/resume, `w` clean up
-  worktree, `i` init, `u` update, `Esc` close. Keys act on the selected row.
+- Bottom key bar: `s` stop, `x` stop all, `a` approve/deny, `m` message/resume, `w` clean up
+  worktree, `i` init, `u` update, `Esc` close. Keys act on the selected row. Hotkeys are single lowercase letters or digits and fire only while the pane has focus, so there is no shifted `S`.
 - Narrow terminals: no fallback needed. `/subagent-mcp` is a command the person typed, and a pane
   opened that way is placed at any width: docked beside the transcript in the fullscreen layout from
   110 columns, otherwise inline above the prompt. The render hook reads whether it was seated
@@ -78,7 +78,7 @@ question menus gate every write.
 | Key | Does | Confirmation |
 |---|---|---|
 | `s` | `stop_agent` on the selected running agent | yes |
-| `S` | `stop_agents` for every running agent | yes, shows the count |
+| `x` | `stop_agents` for every running agent | yes, shows the count |
 | `a` | shows the pending approval's details; approve or deny via `resolve_approval` | no extra step (the details screen is the confirmation) |
 | `m` | text input, then `send_message` (resumes a finished agent) | no |
 | `w` | `cleanup_worktree` on the selected worktree | yes; warns if there are unmerged commits or uncommitted changes |
