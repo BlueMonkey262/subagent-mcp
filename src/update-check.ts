@@ -83,8 +83,10 @@ export async function checkForUpdate(options: UpdateCheckOptions): Promise<Updat
   const cachePath = join(memoryDirectory, "update.json");
   const now = options.now?.() ?? Date.now();
   const previous = await readCache(cachePath);
+  const running = normalizeVersion(options.current ?? currentVersion());
   const checkedAt = previous === undefined ? Number.NaN : Date.parse(previous.checked_at);
-  if (previous !== undefined && Number.isFinite(checkedAt)
+  // A cache computed for another version (the user just updated) must not keep announcing an old comparison.
+  if (previous !== undefined && Number.isFinite(checkedAt) && previous.current === running
       && now - checkedAt >= 0 && now - checkedAt < (options.maxAgeMs ?? DAY_MS)) {
     return previous;
   }
@@ -111,15 +113,16 @@ export async function checkForUpdate(options: UpdateCheckOptions): Promise<Updat
     } finally {
       clearTimeout(timer);
     }
-    if (!response.ok) return previous;
-    const release: unknown = await response.json();
+    const current = running;
+    if (current === undefined) return previous;
+    const noRelease = response.status === 404;
+    if (!response.ok && !noRelease) return previous;
+    const release: unknown = noRelease ? {} : await response.json();
     if (!isRecord(release)) return previous;
 
-    const current = normalizeVersion(options.current ?? currentVersion());
-    if (current === undefined) return previous;
     let latest: string | null = null;
     let url: string | null = null;
-    if (release["draft"] !== true && release["prerelease"] !== true) {
+    if (!noRelease && release["draft"] !== true && release["prerelease"] !== true) {
       if (typeof release["tag_name"] !== "string" || typeof release["html_url"] !== "string") return previous;
       latest = normalizeVersion(release["tag_name"]) ?? null;
       if (latest === null) return previous;

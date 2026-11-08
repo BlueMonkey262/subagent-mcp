@@ -191,3 +191,36 @@ test("a stale cache is returned unchanged when its refresh fails", async () => {
     assert.deepEqual(JSON.parse(await readFile(join(directory, "update.json"), "utf8")), old);
   });
 });
+
+test("a fresh cache computed for another version is refetched (the user just updated)", async () => {
+  await withMemory(async (directory) => {
+    await putCache(directory, {
+      checked_at: new Date(NOW - 60_000).toISOString(), current: "0.1.0", latest: "0.2.0",
+      url: "https://example.test/r", available: true,
+    });
+    let calls = 0;
+    const result = await checkForUpdate({
+      memoryDirectory: directory, now: () => NOW, current: "0.2.0", env: {},
+      fetch: async () => { calls += 1; return response(release("v0.2.0")); },
+    });
+    assert.equal(calls, 1);
+    assert.equal(result?.available, false);
+    assert.equal(result?.current, "0.2.0");
+  });
+});
+
+test("no release published yet (404) is cached as no update, so it is not rechecked on every start", async () => {
+  await withMemory(async (directory) => {
+    let calls = 0;
+    const fetchNone = async () => { calls += 1; return response({ message: "Not Found" }, 404); };
+    const first = await checkForUpdate({ memoryDirectory: directory, now: () => NOW, current: "0.1.0", env: {}, fetch: fetchNone });
+    assert.deepEqual([first?.available, first?.latest, first?.url], [false, null, null]);
+    await checkForUpdate({ memoryDirectory: directory, now: () => NOW + 1_000, current: "0.1.0", env: {}, fetch: fetchNone });
+    assert.equal(calls, 1);
+    const other = await checkForUpdate({
+      memoryDirectory: directory, now: () => NOW + 2_000, current: "0.1.0", env: {},
+      fetch: async () => response({ message: "boom" }, 500),
+    });
+    assert.equal(other?.available, false, "a 5xx keeps the cached answer");
+  });
+});
