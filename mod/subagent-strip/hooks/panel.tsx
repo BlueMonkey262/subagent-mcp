@@ -85,7 +85,7 @@ export const registerPanel = (on: On) => {
   let timer: { cancel: () => void } | undefined
 
   on('command.run', { command: 'subagent-mcp' }, async $ => {
-    const opened = await $.ui.open({ id: PANE, title: 'Subagents', focus: true, closeOnEscape: true })
+    const opened = await $.ui.open({ id: PANE, title: 'Subagents', focus: true, closeOnEscape: true, rows: 16 })
 
     const refresh = async () => {
       try {
@@ -188,34 +188,40 @@ export const registerPanel = (on: On) => {
     }
 
     const wide = e.props.placement === 'dock' && e.props.bodyColumns >= 90
+    const select = (id: string) => update($, panel, s => ({ ...s, selected: id, detail: [], detailFor: id }))
+    const at = state.agents.findIndex(a => a.id === state.selected)
+    const move = (by: number) => {
+      const next = state.agents[Math.min(state.agents.length - 1, Math.max(0, at + by))]
+      return next === undefined ? undefined : select(next.id)
+    }
+    const detailLines = selected === undefined ? [] : state.detail
+    const row = (a: PanelAgent) => (
+      <Button key={`agent-${a.id}`} onPress={() => select(a.id)}>
+        {state.selected === a.id ? '> ' : '  '}
+        {a.name} <Text dimColor>{a.backend} {a.model} {a.state} {k(a.tokensIn)}in/{k(a.tokensOut)}out {ago(a.updated)}</Text>
+      </Button>
+    )
+    // Inline, the pane shows a window over the tree, so the key bar and message come first and the selected
+    // row's digest opens right under it; docked, the digest has its own column.
     const list = (
       <Box flexDirection="column">
         {state.agents.length === 0 && <Text dimColor>No agents.</Text>}
         {state.agents.map(a => (
-          <Button key={`agent-${a.id}`} onPress={() => update($, panel, s => ({ ...s, selected: a.id, detail: [], detailFor: a.id }))}>
-            {state.selected === a.id ? '> ' : '  '}
-            {a.name} <Text dimColor>{a.backend} {a.model} {a.state} {k(a.tokensIn)}in/{k(a.tokensOut)}out {ago(a.updated)}</Text>
-          </Button>
+          <Box key={`g-${a.id}`} flexDirection="column">
+            {row(a)}
+            {!wide && state.selected === a.id && detailLines.map((line, i) => <Text key={`d${i}`} dimColor>{'    ' + line}</Text>)}
+          </Box>
         ))}
       </Box>
     )
     const detail = (
       <Box flexDirection="column">
-        {selected === undefined ? <Text dimColor>Select an agent.</Text> : state.detail.map((line, i) => <Text key={`d${i}`} dimColor={i > 0}>{line}</Text>)}
+        {selected === undefined ? <Text dimColor>Select an agent.</Text> : detailLines.map((line, i) => <Text key={`d${i}`} dimColor={i > 0}>{line}</Text>)}
       </Box>
     )
 
     return (
       <Box flexDirection="column">
-        {wide ? (
-          <Box>
-            <Box flexDirection="column" width={Math.floor(e.props.bodyColumns / 2)}>{list}</Box>
-            <Box flexDirection="column">{detail}</Box>
-          </Box>
-        ) : (
-          <Box flexDirection="column">{list}<Text> </Text>{detail}</Box>
-        )}
-        <Text> </Text>
         <Box>
           {selected !== undefined && isRunning(selected) && (
             <Button key="stop" hotkey="s" plain onPress={() => ask({ kind: 'stop', agent: selected.name })}>stop</Button>
@@ -246,8 +252,20 @@ export const registerPanel = (on: On) => {
               update to {state.updateAvailable}
             </Button>
           )}
+          <Text>  </Text>
+          <Button key="down" hotkey="j" plain onPress={() => move(1)}>next</Button>
+          <Text>  </Text>
+          <Button key="up" hotkey="k" plain onPress={() => move(-1)}>prev</Button>
         </Box>
         {state.message !== '' && <Text dimColor>{state.message}</Text>}
+        {wide ? (
+          <Box>
+            <Box flexDirection="column" width={Math.floor(e.props.bodyColumns / 2)}>{list}</Box>
+            <Box flexDirection="column">{detail}</Box>
+          </Box>
+        ) : (
+          list
+        )}
       </Box>
     )
   })
