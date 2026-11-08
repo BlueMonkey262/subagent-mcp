@@ -32,6 +32,17 @@ export type NormalizedEventData = {
 
 export type NormalizedEventType = keyof NormalizedEventData;
 
+/** Runtime list of event type names, for validating user input (e.g. a zod enum). Keep in sync with `NormalizedEventData`. */
+export const NORMALIZED_EVENT_TYPES = [
+  "thread.started",
+  "message.delta",
+  "tool.start",
+  "tool.end",
+  "approval.requested",
+  "turn.completed",
+  "error",
+] as const satisfies readonly NormalizedEventType[];
+
 export type NewAgentEvent<T extends NormalizedEventType = NormalizedEventType> = {
   readonly [K in T]: {
     readonly type: K;

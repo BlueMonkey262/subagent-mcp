@@ -13,6 +13,8 @@ import { CursorAdapter } from "./adapters/cursor/adapter.js";
 import { OpenCodeAdapter } from "./adapters/opencode/adapter.js";
 import { LiveConfig } from "./config/live.js";
 import { isBackend } from "./core/types.js";
+import type { EventReadOptions } from "./events/buffer.js";
+import type { NormalizedEventType } from "./events/schema.js";
 import type { ListAgentsInput, AgentSnapshot, SendMessageInput, SpawnAgentInput, Supervisor } from "./supervisor.js";
 import { Supervisor as SupervisorClass, defaultProjectRouting } from "./supervisor.js";
 import { UsageLedger } from "./usage.js";
@@ -427,11 +429,15 @@ async function dispatch(supervisor: Supervisor, method: string, params: unknown)
     }
     case "get_agent_events": {
       const agent = requiredString(input, "agent");
-      if (input["summary"] === true) return supervisor.summarizeAgentEvents(agent);
       const since = typeof input["since"] === "number" ? input["since"] : 0;
+      if (input["summary"] === true) return supervisor.summarizeAgentEvents(agent, 5, since);
+      const types = Array.isArray(input["types"]) ? (input["types"] as NormalizedEventType[]) : undefined;
+      const coalesce = input["coalesce"] === true;
+      const options: EventReadOptions | undefined =
+        types !== undefined || coalesce ? { ...(types !== undefined ? { types } : {}), ...(coalesce ? { coalesce } : {}) } : undefined;
       return typeof input["limit"] === "number"
-        ? supervisor.getAgentEvents(agent, since, input["limit"])
-        : supervisor.getAgentEvents(agent, since);
+        ? supervisor.getAgentEvents(agent, since, input["limit"], options)
+        : supervisor.getAgentEvents(agent, since, undefined, options);
     }
     case "list_models":
       return supervisor.listModels(isBackend(input["backend"]) ? input["backend"] : undefined);
