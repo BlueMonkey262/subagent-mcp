@@ -14,6 +14,9 @@ import type { AgentConfig, ModelRoster } from "../src/config/schema.js";
 import { buildInfo, connectHost, HOST_PROTOCOL, hostDisposition, hostPaths, HostClient, HostSession, serveHost } from "../src/host.js";
 import { Supervisor } from "../src/supervisor.js";
 
+// Daemon integration tests must never contact the release API.
+process.env.SUBAGENT_MCP_UPDATE_CHECK = "0";
+
 const permission = { allow: [], deny: [], default: "escalate" as const };
 const serverPath = fileURLToPath(new URL("../src/server.js", import.meta.url));
 
