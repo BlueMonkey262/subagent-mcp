@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile } from "node:fs/promises";
+import { mkdtemp, readFile, realpath } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -86,7 +86,7 @@ test("buildAntigravityArguments is explicit, validates effort, and resumes by co
 });
 
 test("persistent process normalizes events and warm-resumes the same conversation", async () => {
-  const cwd = await mkdtemp(path.join(os.tmpdir(), "antigravity-adapter-normal-"));
+  const cwd = await realpath(await mkdtemp(path.join(os.tmpdir(), "antigravity-adapter-normal-")));
   const invocation = path.join(cwd, "invocation.json");
   const transcript = path.join(cwd, "stdin.jsonl");
   const adapter = fixtureAdapter(cwd, { ANTIGRAVITY_FIXTURE_INVOCATION: invocation, ANTIGRAVITY_FIXTURE_TRANSCRIPT: transcript });
@@ -118,7 +118,7 @@ test("persistent process normalizes events and warm-resumes the same conversatio
 
 test("interrupt, malformed output, and cold resume reconcile into normalized terminal events", async (t) => {
   await t.test("interrupt", async () => {
-    const cwd = await mkdtemp(path.join(os.tmpdir(), "antigravity-adapter-interrupt-"));
+    const cwd = await realpath(await mkdtemp(path.join(os.tmpdir(), "antigravity-adapter-interrupt-")));
     const adapter = fixtureAdapter(cwd);
     try {
       const turn = await adapter.spawn(spawnRequest(cwd, "HANG"));
@@ -132,7 +132,7 @@ test("interrupt, malformed output, and cold resume reconcile into normalized ter
   });
 
   await t.test("malformed", async () => {
-    const cwd = await mkdtemp(path.join(os.tmpdir(), "antigravity-adapter-malformed-"));
+    const cwd = await realpath(await mkdtemp(path.join(os.tmpdir(), "antigravity-adapter-malformed-")));
     const adapter = fixtureAdapter(cwd);
     try {
       const turn = await adapter.spawn(spawnRequest(cwd, "MALFORMED"));
@@ -145,7 +145,7 @@ test("interrupt, malformed output, and cold resume reconcile into normalized ter
   });
 
   await t.test("process exit", async () => {
-    const cwd = await mkdtemp(path.join(os.tmpdir(), "antigravity-adapter-exit-"));
+    const cwd = await realpath(await mkdtemp(path.join(os.tmpdir(), "antigravity-adapter-exit-")));
     const adapter = fixtureAdapter(cwd);
     try {
       const turn = await adapter.spawn(spawnRequest(cwd, "EXIT_EARLY"));
@@ -158,7 +158,7 @@ test("interrupt, malformed output, and cold resume reconcile into normalized ter
   });
 
   await t.test("cold resume", async () => {
-    const cwd = await mkdtemp(path.join(os.tmpdir(), "antigravity-adapter-resume-"));
+    const cwd = await realpath(await mkdtemp(path.join(os.tmpdir(), "antigravity-adapter-resume-")));
     const invocation = path.join(cwd, "invocation.json");
     const adapter = fixtureAdapter(cwd, { ANTIGRAVITY_FIXTURE_INVOCATION: invocation });
     const request = spawnRequest(cwd, "FIRST");
