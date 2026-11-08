@@ -34,7 +34,7 @@ interface PendingTask {
 }
 
 
-import { mkdir, rename, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
 
 import { AdapterRegistry, type BackendAdapter } from "./adapters/adapter.js";
@@ -161,6 +161,8 @@ export interface SupervisorOptions {
   /** Overrides the registry's Codex resume idle limit. */
   readonly codexResumeIdleMs?: number;
   readonly usage?: UsageLedger;
+  /** Update cache written by the host's background release check. */
+  readonly updateCachePath?: string;
 }
 
 export class SupervisorError extends SubagentError {
@@ -186,6 +188,7 @@ export class Supervisor {
   readonly #onDetachedSettled: ((result: Readonly<Record<string, unknown>>) => void) | undefined;
   readonly #codexResumeIdleMs: number | undefined;
   readonly #usage: UsageLedger;
+  readonly #updateCachePath: string | undefined;
   #persistencePath: string | undefined;
   #resultsStore: AppendOnlyJsonlStore<Record<string, unknown>> | undefined;
   #nameCursor = 0;
@@ -201,6 +204,7 @@ export class Supervisor {
     this.#onDetachedSettled = options.onDetachedSettled;
     this.#codexResumeIdleMs = options.codexResumeIdleMs;
     this.#usage = options.usage ?? new UsageLedger();
+    this.#updateCachePath = options.updateCachePath;
     this.#capacity = new AgentCapacity(options.maxConcurrent ?? options.registry.maxConcurrent());
     this.#approvals = new ApprovalCoordinator({
       adapterFor: (request) => this.#adapters.get(request.backend),
@@ -225,7 +229,7 @@ export class Supervisor {
    * models it can run and its own plan usage, and flags roster entries the backend does not offer.
    */
   async listModels(backend?: Backend, live: boolean = backend !== undefined): Promise<Readonly<Record<string, unknown>>> {
-    const local = this.#localModels(backend);
+    const local = { ...this.#localModels(backend), ...await this.#updateNotice() };
     if (!live) return local;
     const adapters = this.#adapters.list().filter((adapter) =>
       adapter.providerInfo !== undefined && (backend === undefined || adapter.backend === backend));
@@ -234,6 +238,20 @@ export class Supervisor {
     if (entries.length === 0) return local;
     const byBackend = Object.fromEntries(entries);
     return { ...local, live: backend === undefined ? byBackend : byBackend[backend] };
+  }
+
+  async #updateNotice(): Promise<Readonly<Record<string, unknown>>> {
+    if (this.#updateCachePath === undefined) return {};
+    try {
+      const parsed: unknown = JSON.parse(await readFile(this.#updateCachePath, "utf8"));
+      if (typeof parsed !== "object" || parsed === null || !("available" in parsed) || parsed.available !== true
+          || !("current" in parsed) || typeof parsed.current !== "string"
+          || !("latest" in parsed) || typeof parsed.latest !== "string"
+          || !("url" in parsed) || typeof parsed.url !== "string") return {};
+      return { update: { current: parsed.current, latest: parsed.latest, url: parsed.url } };
+    } catch {
+      return {};
+    }
   }
 
   async #liveInfo(adapter: BackendAdapter): Promise<Readonly<Record<string, unknown>>> {

@@ -20,6 +20,7 @@ import type { NormalizedEventType } from "./events/schema.js";
 import type { ListAgentsInput, AgentSnapshot, SendMessageInput, SpawnAgentInput, Supervisor } from "./supervisor.js";
 import { Supervisor as SupervisorClass } from "./supervisor.js";
 import { ensureProjectMemoryIgnored } from "./storage/routing.js";
+import { checkForUpdate } from "./update-check.js";
 import { UsageLedger } from "./usage.js";
 
 export const HOST_PROTOCOL = 2;
@@ -407,6 +408,7 @@ export async function runHost(): Promise<void> {
     adapters: new AdapterRegistry([claude, codex, opencode, antigravity, cursor]),
     cwd,
     usage,
+    updateCachePath: join(paths.directory, "update.json"),
     maxConcurrent: live.maxConcurrent(),
     onDetachedSettled: (result) => endpoint?.notify({ event: "detached", data: result }),
   });
@@ -419,12 +421,20 @@ export async function runHost(): Promise<void> {
   await supervisor.recoverResults();
   supervisor.restorePending(pending);
 
+  const runUpdateCheck = (): void => {
+    void checkForUpdate({ memoryDirectory: paths.directory }).catch(() => undefined);
+  };
+  runUpdateCheck();
+  const updateTimer = setInterval(runUpdateCheck, 24 * 60 * 60 * 1_000);
+  updateTimer.unref();
+
   let shuttingDown = false;
   let idleTimer: NodeJS.Timeout | undefined;
   const shutdown = async (): Promise<void> => {
     if (shuttingDown) return;
     shuttingDown = true;
     if (idleTimer !== undefined) clearTimeout(idleTimer);
+    clearInterval(updateTimer);
     live.close();
     await Promise.all([
       claude.closeAll(),
