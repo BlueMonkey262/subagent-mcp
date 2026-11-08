@@ -1,4 +1,8 @@
 import assert from "node:assert/strict";
+import { currentVersion } from "../src/update-check.js";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
 
 import { AdapterRegistry } from "../src/adapters/adapter.js";
@@ -1059,6 +1063,45 @@ test("list_models adds live backend info (default on for a named backend) and fl
   const failed = await supervisor.listModels("codex", true);
   assert.deepEqual(failed["live"], { error: "server down" });
   assert.ok(failed["models"], "a live failure keeps the local roster");
+});
+
+test("list_models adds only an available cached update", async () => {
+  const running = currentVersion(); // the notice only counts for the version that is running
+  const directory = await mkdtemp(join(tmpdir(), "subagent-model-update-"));
+  const updateCachePath = join(directory, "update.json");
+  const supervisor = new Supervisor({
+    registry: testRegistry([codexAgentConfig()]),
+    adapters: new AdapterRegistry([new FakeAdapter("codex")]),
+    cwd: "/work",
+    updateCachePath,
+  });
+  try {
+    await writeFile(updateCachePath, JSON.stringify({
+      checked_at: "2026-11-08T00:00:00.000Z",
+      current: running,
+      latest: null,
+      url: null,
+      available: false,
+    }));
+    assert.equal((await supervisor.listModels(undefined, false))["update"], undefined);
+
+    await writeFile(updateCachePath, JSON.stringify({
+      checked_at: "2026-11-08T00:00:00.000Z",
+      current: running,
+      latest: "99.0.0",
+      url: "https://example.test/release",
+      available: true,
+    }));
+    assert.deepEqual((await supervisor.listModels(undefined, false))["update"], {
+      current: running, latest: "99.0.0", url: "https://example.test/release",
+    });
+    await writeFile(updateCachePath, JSON.stringify({
+      checked_at: "2026-11-08T00:00:00.000Z", current: "0.0.1", latest: "99.0.0", url: "https://example.test/release", available: true,
+    }));
+    assert.equal((await supervisor.listModels(undefined, false))["update"], undefined, "cache made for another version");
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
 });
 
 test("list_agents cumulative_usage includes the turn in progress, then the completed turn's own usage", async () => {
