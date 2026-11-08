@@ -1,5 +1,6 @@
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
+import { realpathSync } from "node:fs";
 import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { createConnection, createServer, type Server, type Socket } from "node:net";
 import { tmpdir } from "node:os";
@@ -37,7 +38,9 @@ export interface HostPaths {
 
 export function hostPaths(cwd: string): HostPaths {
   const directory = join(resolve(cwd), ".subagents", "memory");
-  const hash = createHash("sha256").update(resolve(cwd)).digest("hex").slice(0, 16);
+  // Hash the canonical path: on macOS /tmp and /var are symlinks into /private, and a spawned
+  // host's process.cwd() reports the resolved path, so the client must hash the same string.
+  const hash = createHash("sha256").update(canonicalPath(cwd)).digest("hex").slice(0, 16);
   return {
     socketPath: join(tmpdir(), `subagent-mcp-${hash}.sock`),
     directory,
@@ -47,6 +50,14 @@ export function hostPaths(cwd: string): HostPaths {
     lockPath: join(directory, "host.lock"),
     logPath: join(directory, "host.log"),
   };
+}
+
+function canonicalPath(path: string): string {
+  try {
+    return realpathSync(path);
+  } catch {
+    return resolve(path);
+  }
 }
 
 export interface RunningHost {
