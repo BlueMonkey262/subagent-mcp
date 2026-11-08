@@ -107,7 +107,9 @@ export class EventBuffer {
     const page = limit === undefined ? groups : groups.slice(0, limit);
     const events = page.map((group) => group.event);
     const currentSequence = this.#lastSequence.get(agentId) ?? since;
-    const nextSequence = page.at(-1)?.lastSequence ?? since;
+    // A filter can consume events without returning any; advance past them so a caller looping on
+    // nextSequence can't stall behind trailing events that will never match.
+    const nextSequence = page.at(-1)?.lastSequence ?? (options?.types !== undefined ? Math.max(since, currentSequence) : since);
     return {
       events,
       nextSequence,

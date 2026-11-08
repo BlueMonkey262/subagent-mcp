@@ -73,6 +73,29 @@ test("spawn auto-assigns a memorable name and exposes it everywhere", async () =
   assert.ok(Array.isArray(summary["recent_tools"]));
 });
 
+test("summary keeps the finished turn's message and reports a tool.end whose start preceded since", async () => {
+  const adapter = new FakeAdapter("codex");
+  const supervisor = new Supervisor({
+    registry: testRegistry([codexAgentConfig()]),
+    adapters: new AdapterRegistry([adapter]),
+    cwd: "/work",
+  });
+  adapter.queueScript([]);
+  const id = String((await supervisor.spawnAgent({ agent: "general", prompt: "x", description: "x", run_in_background: true }))["agent_id"]);
+  adapter.emit(id, "tool.start", { toolCallId: "t1", toolName: "Bash", input: { command: "npm test" } });
+  const mid = Number(supervisor.summarizeAgentEvents(id)["currentSequence"]);
+  adapter.emit(id, "tool.end", { toolCallId: "t1", toolName: "Bash", status: "completed" });
+  adapter.emit(id, "message.delta", { text: "Final answer here." });
+  adapter.emit(id, "turn.completed", { turnId: "t", status: "completed" });
+  await waitUntil(() => supervisor.listAgents().find((a) => a["agent_id"] === id)?.["state"] === "completed");
+
+  const all = supervisor.summarizeAgentEvents(id);
+  assert.equal(all["latest_message"], "Final answer here.");
+  const recent = supervisor.summarizeAgentEvents(id, 5, mid);
+  assert.deepEqual((recent["recent_tools"] as { tool: string; status: string }[]).map((c) => [c.tool, c.status]), [["Bash", "completed"]]);
+  assert.equal(recent["latest_message"], "Final answer here.");
+});
+
 test("concurrent unnamed spawns receive unique names", async () => {
   const adapter = new FakeAdapter("codex");
   const supervisor = new Supervisor({

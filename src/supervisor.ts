@@ -635,6 +635,7 @@ export class Supervisor {
     const calls: Call[] = [];
     const byId = new Map<string, Call>();
     let message = "";
+    let messageClosed = false;
     let errors = 0;
     let turns = 0;
     for (const event of read.events) {
@@ -646,12 +647,22 @@ export class Supervisor {
       } else if (event.type === "tool.end") {
         const call = byId.get(event.data.toolCallId);
         if (call) call.status = event.data.status;
+        else {
+          // its tool.start was before `since`: still report that it ended
+          const ended: Call = { sequence: event.sequence, tool: event.data.toolName ?? "tool", status: event.data.status };
+          byId.set(event.data.toolCallId, ended);
+          calls.push(ended);
+          tools[ended.tool] = (tools[ended.tool] ?? 0) + 1;
+        }
       } else if (event.type === "message.delta") {
+        if (messageClosed) { message = ""; messageClosed = false; }
         message += event.data.text;
         if (message.length > 4000) message = message.slice(-2000);
       } else if (event.type === "turn.completed") {
         turns += 1;
-        message = "";
+        // keep the finished turn's text as the latest message; a later delta starts a new one
+        if (typeof event.data.finalText === "string" && event.data.finalText !== "") message = event.data.finalText;
+        messageClosed = true;
       } else if (event.type === "error") {
         errors += 1;
       }

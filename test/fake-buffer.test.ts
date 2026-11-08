@@ -134,7 +134,7 @@ test("types filters events, and limit/nextSequence/hasMore account for the filte
   // A `since` that lands only on filtered-out events must not re-return them or go backwards.
   const caughtUp = buffer.read("a", nextPage.nextSequence, 1, { types: ["tool.start", "tool.end"] });
   assert.deepEqual(caughtUp.events, []);
-  assert.equal(caughtUp.nextSequence, 4);
+  assert.equal(caughtUp.nextSequence, 6, "advances past trailing filtered-out events so a loop on nextSequence terminates");
 });
 
 test("coalesce merges consecutive message.delta events on read without changing what's stored", () => {
@@ -174,4 +174,16 @@ test("coalesce merges consecutive message.delta events on read without changing 
   assert.equal(nextPage.events[0]?.type === "message.delta" ? nextPage.events[0].data.text : undefined, "de");
   assert.equal(nextPage.nextSequence, 6);
   assert.equal(nextPage.hasMore, undefined);
+});
+
+test("a type filter that matches nothing new still advances nextSequence to the current sequence", () => {
+  const buffer = new EventBuffer();
+  const base = { agentId: "a", backend: "codex" as const };
+  buffer.append({ ...base, type: "tool.start", data: { toolCallId: "1", toolName: "Bash", input: {} } });
+  const last = buffer.append({ ...base, type: "message.delta", data: { text: "x" } });
+  const first = buffer.read("a", 0, undefined, { types: ["tool.start"] });
+  assert.equal(first.events.length, 1);
+  const follow = buffer.read("a", first.nextSequence, undefined, { types: ["tool.start"] });
+  assert.equal(follow.events.length, 0);
+  assert.equal(follow.nextSequence, last.sequence);
 });

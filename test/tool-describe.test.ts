@@ -7,8 +7,9 @@ test("a `pattern` input is reported as the target, verbatim", () => {
   assert.deepEqual(describeToolInput({ pattern: "describeToolInput" }), { target: "describeToolInput" });
   // Search tools that spell the same field differently still land on `pattern`.
   assert.deepEqual(describeToolInput({ pattern: "TODO|FIXME" }), { target: "TODO|FIXME" });
-  // `pattern` loses to the earlier file/command names, so a search with a file is still a file.
-  assert.deepEqual(describeToolInput({ pattern: "TODO", file_path: "src/a.ts" }), { target: "src/a.ts" });
+  // What was searched for beats where it ran: a grep in src/ reports its pattern, not the directory.
+  assert.deepEqual(describeToolInput({ pattern: "TODO", path: "src/" }), { target: "TODO" });
+  assert.deepEqual(describeToolInput({ glob_pattern: "**/*.ts", path: "/work" }), { target: "**/*.ts" });
 });
 
 test("a command longer than 160 characters is clipped to 160 characters ending in an ellipsis", () => {
@@ -62,4 +63,28 @@ test("null and non-object tool inputs describe nothing", () => {
   assert.deepEqual(describeToolInput(null), {});
   assert.deepEqual(describeToolInput(undefined), {});
   assert.deepEqual(describeToolInput(["npm test"]), {});
+});
+
+test("harness-specific shapes: Antigravity CommandLine, Cursor strReplace/applyPatch", () => {
+  assert.deepEqual(describeToolInput({ CommandLine: "echo fixture" }), { target: "echo fixture" });
+  assert.deepEqual(
+    describeToolInput({ path: "a.ts", strReplace: { oldText: "x", newText: "y" } }),
+    { target: "a.ts", preview: "-x\n+y" },
+  );
+  const patched = describeToolInput({ path: "b.ts", applyPatch: { patchContent: "--- a\n+++ b\n-old\n+new\n context" } });
+  assert.equal(patched.preview, "-old\n+new");
+});
+
+test("a lone side of an edit adds no bare marker line", () => {
+  assert.equal(describeToolInput({ file_path: "a.ts", old_string: "gone" }).preview, "-gone");
+  assert.equal(describeToolInput({ file_path: "a.ts", content: "line1\nline2" }).preview, "+line1\n+line2");
+  assert.equal(describeToolInput({ file_path: "a.ts", old_string: "", new_string: "" }).preview, undefined);
+});
+
+test("huge inputs are only read by a bounded prefix", () => {
+  const huge = "line\n".repeat(2_000_000);
+  const started = Date.now();
+  const described = describeToolInput({ file_path: "big.txt", old_string: huge, new_string: huge });
+  assert.ok(Date.now() - started < 500);
+  assert.equal(described.preview?.split("\n").length, 6);
 });
