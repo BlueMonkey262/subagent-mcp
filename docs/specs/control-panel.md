@@ -13,13 +13,22 @@ Status: draft for review. Nothing here is built.
    `~/.claude/commands/`. Nothing is installed outside the repo.
 
 Non-goals: replacing the status-line rows (they stay), changing how the server resolves config,
-auto-updating anything, a panel for terminals that cannot seat a pane (see Open questions).
+auto-updating anything.
 
 ## Where it lives
 
 The `mod/subagent-strip` plugin, which `bin/subagent-mcp` already loads through
-`CLAUDE_CODE_PLUGIN_DIRS`. So the panel exists only in sessions started with the launcher; a plain
-`claude` session has no `/subagent-mcp` command. The poller that feeds the status line also
+`CLAUDE_CODE_PLUGIN_DIRS`. Decided: the panel exists only in sessions started with the launcher.
+A plain `claude` session must have no mod, no MCP server and no `/subagent-mcp` command.
+
+That is a requirement on the install, not only on the mod. Today SETUP.md step 3 registers the
+server with `claude mcp add -s user`, which makes it available to plain `claude` too. To meet the
+requirement the launcher must supply the server itself (for example `--mcp-config` pointing at
+`bin/run-server.sh`, not strict, so the person's other servers stay) and SETUP.md must stop
+registering it at user scope; UPDATING.md must migrate existing installs by removing the user-scope
+entry. Needs verifying that `--dangerously-load-development-channels server:subagent-mcp` accepts a
+server that comes from `--mcp-config`. The `statusLine` entry in `settings.json` is global; with
+no mod running it finds no live file and prints nothing, which is acceptable. The poller that feeds the status line also
 feeds the panel (one `list_agents` poll, shared), so the panel adds no extra server load.
 
 Implementation surface (plugin API on this Claude Code build; verify at build time):
@@ -35,21 +44,15 @@ Implementation surface (plugin API on this Claude Code build; verify at build ti
 
 ## Delivering the `i` and `u` prompts
 
-The panel cannot interview anyone itself, so `i` and `u` must put a prompt in front of Claude.
-Two mechanisms exist:
+Decided: `$.prompt.submit({ text })`. The mod submits a fixed setup prompt as a turn once the session
+is idle, with the plugin as its origin, and Claude does the work. No server change and no new
+channel event. A channel message was considered and rejected: it needs a new server tool and an
+event that reads as the person's instruction, for no gain. If the model should read the prompt as
+the person's own words, pass `asUser: true`.
 
-- **Channel message (requested approach).** The panel asks the server to push the setup prompt
-  over the existing `subagent-mcp` channel, the same path that delivers agent completion events.
-  Needs a small new server tool or host call (for example `send_setup_prompt`) and a channel event
-  type that is clearly the person's request, not subagent output (agent results are advisory; this
-  must read as an instruction from the user).
-- **`$.prompt.submit({ text })` (found in the plugin API).** The mod submits a prompt directly as a
-  turn, once the session is idle, with the plugin as its origin; `asUser: true` makes the model
-  read it as the person's own words. No server change.
-
-Both land in the conversation as a new turn. Default in this draft: channel message, per the
-author's decision; `$.prompt.submit` is the fallback if the channel path proves awkward (it needs
-no server work, so it is cheaper to build first). See open question 7.
+`u` shows a confirmation in the panel first ("Update to vX.Y.Z? Claude will build it and
+restart the host."); only a yes submits the prompt. `i` submits immediately, since Claude's own
+question menus gate every write.
 
 ## Layout: list + detail split
 
@@ -61,6 +64,12 @@ no server work, so it is cheaper to build first). See open question 7.
   For a worktree: path, branch, whether it has unmerged commits or uncommitted changes.
 - Bottom key bar: `s` stop, `S` stop all, `a` approve/deny, `m` message/resume, `w` clean up
   worktree, `i` init, `u` update, `Esc` close. Keys act on the selected row.
+- Narrow terminals: no fallback needed. `/subagent-mcp` is a command the person typed, and a pane
+  opened that way is placed at any width: docked beside the transcript in the fullscreen layout from
+  110 columns, otherwise inline above the prompt. The render hook reads whether it was seated
+  `dock` or `inline` and uses the split layout when docked, and a single column (agent list, with
+  Enter expanding the selected agent's digest in place) when inline. Never open the pane unasked
+  (a timer or `session.start`), because unasked panes wait undrawn below 144 columns.
 - Update row: when `.subagents/memory/update.json` reports a newer release, a dim notice shows at
   the top of the list and `u` is highlighted.
 
@@ -118,9 +127,11 @@ Procedure outline:
    `npm run build`, `npm test`. Report results; stop on any failure.
 3. Migration notes: apply any steps the release's notes list (config keys added or renamed). Each
    release that changes `models.yaml` or agent-config semantics must add a note to UPDATING.md.
-4. Swap: the one step that touches the live install. Claude tells the person to exit the session
-   and gives the exact commands (checkout the tag, `npm ci && npm run build`), or runs them if the
-   person confirms they are between sessions. Then restart with `subagent-mcp`.
+4. Swap: the one step that touches the live install. Decided: Claude runs it, after the panel's
+   confirmation (before the prompt is sent) and after step 2 passes. Claude checks out the tag in
+   the install repo, runs `npm ci && npm run build`, then calls `restart_host` so the session picks
+   up the new code. A rebuild can still drop the host connection; if it does, Claude says so and
+   `/mcp` reconnects. The step is last so a failure earlier leaves the old install untouched.
 5. After restart, `/subagent-mcp` then `i` is the way to review roster changes the release made.
 
 ## Distribution and updates of the panel itself
@@ -141,15 +152,15 @@ file install. `plugin.json` version bumps with the panel. SETUP.md gains one lin
 
 ## Open questions
 
-1. **Narrow terminals.** Panes seat only above a width threshold (about 110 columns). Fallback when
-   the terminal is narrower: nothing (command reports why), or a text menu using question prompts?
-2. **Key handling in a pane.** The plugin API exposes key events and buttons, but the exact
-   mechanism for per-key shortcuts inside a pane needs confirming against the types before build.
-3. **`/subagent-mcp` outside the launcher.** Plain `claude` sessions have no command. Acceptable?
-4. **`u` swap step.** Run by Claude after an explicit "I'm between sessions", or always handed to
-   the person as commands? The outline above uses the latter by default.
-5. **Policy section of `i` before #7 merges.** Skip silently (as drafted), or gate the whole flow
-   on #7?
-7. **Prompt delivery.** Channel message needs a server change and a user-instruction channel
-   event; `$.prompt.submit` needs neither. Confirm the channel route is worth the extra surface.
-6. **PR #7 conflicts.** The spec's policy step assumes #7 gets rebased and merged first.
+Resolved: narrow terminals (above), outside-launcher behavior (above), swap step (above), prompt
+delivery (above), PR #7 ordering (#7 is rebased and merged first, so `i` always offers the policy
+section and may assume the running server supports it).
+
+1. **Per-key shortcuts in a pane.** The plugin API has key events (`onKey` on a client, `key` on a
+   mounted drawing) and Buttons, but how a pane receives keys while the prompt box has focus is
+   unconfirmed. Resolve with a throwaway prototype pane before building the real one; fall back to
+   Buttons/Select inside the pane if bare letters collide with typing.
+2. **Launcher-supplied MCP server.** Verify `--mcp-config` plus the development-channels flag works
+   as described under "Where it lives", and that plain `claude` then sees nothing.
+3. **`restart_host` after a rebuild.** Confirm it reconnects cleanly to the freshly built code in
+   the same session; if not, `u` ends by telling the person to restart the session.
