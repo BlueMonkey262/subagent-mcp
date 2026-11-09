@@ -148,7 +148,7 @@ export const registerPanel = (on: On) => {
   })
 
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
-    const { Box, Text, Button } = $.ui.resolve(e)
+    const { Box, Text, Button, Input } = $.ui.resolve(e)
     const state = await read($, panel)
     const selected = state.agents.find(a => a.id === state.selected)
     const running = state.agents.filter(isRunning)
@@ -165,6 +165,25 @@ export const registerPanel = (on: On) => {
     }
 
     const c = state.confirm
+    if (c !== null && c.kind === 'message') {
+      const agent = c.agent
+      return (
+        <Box flexDirection="column">
+          <Text bold>Message {agent}</Text>
+          <Input
+            key="message"
+            autoFocus
+            placeholder="Resume with... (Enter sends, Esc cancels typing)"
+            submitLabel="send"
+            onSubmit={async text => {
+              if (text.trim() === '') return
+              await run(`Message ${agent}`, 'send_message', { agent, prompt: text, run_in_background: true })
+            }}
+          />
+          <Button key="cancel" hotkey="n" plain onPress={() => say('Cancelled.')}>cancel</Button>
+        </Box>
+      )
+    }
     if (c !== null) {
       const question =
         c.kind === 'stop' ? `Stop ${c.agent}?`
@@ -256,6 +275,8 @@ export const registerPanel = (on: On) => {
             <Button key="cleanup" hotkey="w" plain onPress={() => ask({ kind: 'cleanup', agent: selected.name })}>clean worktree</Button>
           )}
           {selected !== undefined && !isRunning(selected) && <Text>  </Text>}
+          {selected !== undefined && <Button key="message" hotkey="m" plain onPress={() => ask({ kind: 'message', agent: selected.name })}>message</Button>}
+          {selected !== undefined && <Text>  </Text>}
           <Button
             key="init"
             hotkey="i"

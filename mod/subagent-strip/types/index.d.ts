@@ -17,6 +17,7 @@ export type PanelConfirm =
   | { kind: 'stopAll'; names: string[] }
   | { kind: 'cleanup'; agent: string }
   | { kind: 'update'; latest: string }
+  | { kind: 'message'; agent: string }
   | null
 
 export type PanelState = {
