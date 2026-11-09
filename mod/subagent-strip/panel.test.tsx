@@ -1,5 +1,7 @@
 import { expect, test } from 'claude-code/testing'
 
+import { readDisabled, writeDisabled } from './hooks/policy'
+
 const PANE = {
   plugin: 'subagent-strip',
   component: 'Pane',
@@ -36,7 +38,7 @@ const server = (on: Parameters<Parameters<typeof test>[1]>[1], agents: Record<st
   on('command.register', () => ({ value: { command: 'subagent-mcp' } }))
   on('ui.open', () => ({ value: { isPlaced: true } }))
   on('session.start', (_, e) => ({ cwd: e.cwd }))
-  on('fs.read', () => ({ value: JSON.stringify(update) }))
+  on('fs.read', () => ({ value: typeof update === 'string' ? update : JSON.stringify(update) }))
   return calls
 }
 
@@ -179,4 +181,53 @@ test('the pane says so when it does not hold the keys', async ($, on) => {
   const focused = await $.ui.mount(PANE)
   expect(await focused.find({ type: 'Text', text: /Keys go to the chat/ })).toBeFalsy()
   await focused.unmount()
+})
+
+const YAML = `# comment kept
+# disabledBackends: [antigravity]
+
+models:
+  claude:
+    - name: a
+`
+
+test('running agents lead and show what they are doing; older finished ones are folded', async ($, on) => {
+  const done = Array.from({ length: 8 }, (_, i) => agent({ name: `Old${i}`, state: 'completed' }))
+  server(on, [...done, agent({ name: 'Busy', state: 'running', current_activity: 'Bash npm test' })])
+  await open($)
+
+  const ui = await $.ui.mount(PANE)
+  expect(await ui.find({ type: 'Text', text: /Bash npm test/ })).toBeTruthy()
+  expect(await ui.find({ key: 'agent-id-Old4' })).toBeTruthy()
+  expect(await ui.find({ key: 'agent-id-Old5' })).toBeFalsy()
+
+  await ui.press({ key: 'all' })
+  expect(await ui.find({ key: 'agent-id-Old7' })).toBeTruthy()
+  await ui.unmount()
+})
+
+test('a backend key rewrites only the disabledBackends line and keeps a copy', async ($, on) => {
+  server(on, [agent({ name: 'Ada', state: 'completed' })], YAML)
+  const writes: { path: string; text: string }[] = []
+  on('fs.write', (_, e) => (writes.push({ path: String((e as { path?: string }).path), text: String((e as { text?: string }).text) }), { value: undefined }))
+  await open($)
+
+  const ui = await $.ui.mount(PANE)
+  await ui.press({ key: 'backend-cursor' })
+  const main = writes.find(w => w.path.endsWith('models.yaml'))
+  expect(writes.some(w => w.path.endsWith('models.yaml.bak') && w.text === YAML)).toBe(true)
+  expect(main?.text).toContain('disabledBackends: [cursor]')
+  expect(main?.text).toContain('# comment kept')
+  expect(main?.text).toContain('# disabledBackends: [antigravity]')
+  await ui.unmount()
+})
+
+test('the line editor handles lists, empty lists and what it will not touch', () => {
+  expect(readDisabled(YAML)).toEqual([])
+  expect(readDisabled('disabledBackends: [cursor, "codex"] # why\nmodels:\n')).toEqual(['cursor', 'codex'])
+  expect(readDisabled('disabledBackends:\n  - cursor\nmodels:\n')).toBeNull()
+  const on = writeDisabled('disabledBackends: [cursor]\nmodels:\n', ['cursor', 'codex'])
+  expect(on).toEqual({ ok: true, text: 'disabledBackends: [cursor, codex]\nmodels:\n' })
+  expect(writeDisabled('disabledBackends:\n  - cursor\nmodels:\n', []).ok).toBe(false)
+  expect(writeDisabled('nothing here', ['cursor']).ok).toBe(false)
 })
