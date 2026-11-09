@@ -26,7 +26,7 @@ const agent = (over: Record<string, unknown>) => ({
 })
 
 // Answers the server calls the panel makes and records them.
-const server = (on: Parameters<Parameters<typeof test>[1]>[1], agents: Record<string, unknown>[]) => {
+const server = (on: Parameters<Parameters<typeof test>[1]>[1], agents: Record<string, unknown>[], update: unknown = {}) => {
   const calls: { tool: string; args: Record<string, unknown> }[] = []
   on('mcp.call', (_, e) => {
     calls.push({ tool: e.tool, args: e.args })
@@ -36,7 +36,7 @@ const server = (on: Parameters<Parameters<typeof test>[1]>[1], agents: Record<st
   on('command.register', () => ({ value: { command: 'subagent-mcp' } }))
   on('ui.open', () => ({ value: { isPlaced: true } }))
   on('session.start', (_, e) => ({ cwd: e.cwd }))
-  on('fs.read', () => ({ value: '{}' }))
+  on('fs.read', () => ({ value: JSON.stringify(update) }))
   return calls
 }
 
@@ -125,4 +125,58 @@ test('init closes the pane, then hands the interview prompt to Claude', async ($
   await ui.press({ key: 'init' })
   expect(order).toEqual(['close', 'submit:Run the suba'])
   await ui.unmount()
+})
+
+const UPDATE = { available: true, latest: '9.9.9' }
+
+test('update asks first, then closes the pane and submits, leaving no stale confirmation', async ($, on) => {
+  server(on, [agent({ name: 'Ada', state: 'completed' })], UPDATE)
+  const order: string[] = []
+  on('ui.close', () => (order.push('close'), { value: undefined }))
+  on('prompt.submit', (_, e) => (order.push('submit'), { text: String((e as { text?: string }).text) }))
+  await open($)
+
+  let ui = await $.ui.mount(PANE)
+  await ui.press({ key: 'update' })
+  expect(await ui.find({ type: 'Text', text: /Update to 9\.9\.9\?/ })).toBeTruthy()
+  expect(order).toEqual([])
+
+  await ui.press({ key: 'yes' })
+  expect(order).toEqual(['close', 'submit'])
+  await ui.unmount()
+
+  // Reopened, the pane shows the list again, not the old question.
+  ui = await $.ui.mount(PANE)
+  expect(await ui.find({ type: 'Text', text: /Update to 9\.9\.9\?/ })).toBeFalsy()
+  expect(await ui.find({ key: 'message' })).toBeTruthy()
+  await ui.unmount()
+})
+
+test('a failed prompt submit is reported as a toast', async ($, on) => {
+  server(on, [agent({ name: 'Ada', state: 'completed' })])
+  const toasts: string[] = []
+  on('ui.toast', (_, e) => (toasts.push(String((e as { text?: string }).text)), { value: undefined }))
+  on('ui.close', () => ({ value: undefined }))
+  on('prompt.submit', () => {
+    throw new Error('no composer')
+  })
+  await open($)
+
+  const ui = await $.ui.mount(PANE)
+  await ui.press({ key: 'init' })
+  expect(toasts.join(' ')).toMatch(/Could not send the prompt to Claude/)
+  await ui.unmount()
+})
+
+test('the pane says so when it does not hold the keys', async ($, on) => {
+  server(on, [agent({ name: 'Ada', state: 'completed' })])
+  await open($)
+
+  const unfocused = await $.ui.mount({ ...PANE, props: { ...PANE.props, isFocused: false } })
+  expect(await unfocused.find({ type: 'Text', text: /Keys go to the chat/ })).toBeTruthy()
+  await unfocused.unmount()
+
+  const focused = await $.ui.mount(PANE)
+  expect(await focused.find({ type: 'Text', text: /Keys go to the chat/ })).toBeFalsy()
+  await focused.unmount()
 })

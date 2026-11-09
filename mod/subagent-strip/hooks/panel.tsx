@@ -83,8 +83,11 @@ export function declarePanelCommand($: EngineInterface) {
 
 export const registerPanel = (on: On) => {
   let timer: { cancel: () => void } | undefined
+  // Bumped by every open and every hand-off; a late refresh checks it before reclaiming focus.
+  let epoch = 0
 
   on('command.run', { command: 'subagent-mcp' }, async $ => {
+    const mine = ++epoch
     const opened = await $.ui.open({ id: PANE, title: 'Subagents', focus: true, closeOnEscape: true, rows: 16 })
 
     const refresh = async () => {
@@ -145,7 +148,8 @@ export const registerPanel = (on: On) => {
     // dialog up) is fine: the pane then shows its hint.
     void refresh().then(async () => {
       const state = await read($, panel)
-      if (state.selected !== null) await $.ui.focus({ requestId: PANE, key: `agent-${state.selected}` }).catch(() => undefined)
+      // Skip when the pane was closed or reopened meanwhile, or shows a confirmation or input (no agent row).
+      if (mine === epoch && state.confirm === null && state.selected !== null) await $.ui.focus({ requestId: PANE, key: `agent-${state.selected}` }).catch(() => undefined)
     })
 
     return {
@@ -173,9 +177,19 @@ export const registerPanel = (on: On) => {
     // The setup and update flows run in the conversation, so the pane closes first: the person's attention
     // belongs to Claude's questions, not the panel.
     const handOff = async (text: string) => {
+      await update($, panel, s => ({ ...s, confirm: null, message: '', at: Date.now() }))
+      try {
+        await $.ui.close({ id: PANE })
+      } catch (error) {
+        return say(`Could not close the panel: ${str((error as Error).message).slice(0, 80)}`)
+      }
       timer?.cancel()
-      await $.ui.close({ id: PANE })
-      await $.prompt.submit({ text })
+      epoch += 1
+      try {
+        await $.prompt.submit({ text })
+      } catch (error) {
+        $.ui.toast(`Could not send the prompt to Claude: ${str((error as Error).message).slice(0, 80)}`)
+      }
     }
 
     const c = state.confirm
@@ -270,7 +284,7 @@ export const registerPanel = (on: On) => {
     return (
       <Box flexDirection="column">
         {!e.props.isFocused && (
-          <Text color="yellow">Keys go to the chat. Click here, or run /subagent-mcp again, to use the panel.</Text>
+          <Text color="yellow">Keys go to the chat. Run /subagent-mcp again to use the panel.</Text>
         )}
         <Box>
           {pending !== undefined && <Button key="allow" hotkey="a" plain onPress={() => decide('allow')}>allow</Button>}
