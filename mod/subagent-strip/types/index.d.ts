@@ -7,6 +7,8 @@ export type PanelAgent = {
   updated: string
   tokensIn: number
   tokensOut: number
+  /** What the agent is doing right now (list_agents current_activity), while it runs. */
+  activity?: string
   /** Set while the agent is waiting on an approval. */
   approval?: { requestId: string; tool: string; command: string }
 }
@@ -32,6 +34,11 @@ export type PanelState = {
   /** Result of the last action, or why the server is not answering. */
   message: string
   at: number
+  /** Show every agent instead of the running ones and the most recent finished. */
+  showAll: boolean
+  /** Backends the server refuses, and which of them come from the environment (not editable here). */
+  disabled: string[]
+  locked: string[]
 }
 
 declare module 'claude-code' {

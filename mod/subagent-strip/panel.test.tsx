@@ -1,5 +1,7 @@
 import { expect, test } from 'claude-code/testing'
 
+import { readDisabled, writeDisabled } from './hooks/policy'
+
 const PANE = {
   plugin: 'subagent-strip',
   component: 'Pane',
@@ -26,7 +28,7 @@ const agent = (over: Record<string, unknown>) => ({
 })
 
 // Answers the server calls the panel makes and records them.
-const server = (on: Parameters<Parameters<typeof test>[1]>[1], agents: Record<string, unknown>[]) => {
+const server = (on: Parameters<Parameters<typeof test>[1]>[1], agents: Record<string, unknown>[], update: unknown = {}) => {
   const calls: { tool: string; args: Record<string, unknown> }[] = []
   on('mcp.call', (_, e) => {
     calls.push({ tool: e.tool, args: e.args })
@@ -36,7 +38,7 @@ const server = (on: Parameters<Parameters<typeof test>[1]>[1], agents: Record<st
   on('command.register', () => ({ value: { command: 'subagent-mcp' } }))
   on('ui.open', () => ({ value: { isPlaced: true } }))
   on('session.start', (_, e) => ({ cwd: e.cwd }))
-  on('fs.read', () => ({ value: '{}' }))
+  on('fs.read', () => ({ value: typeof update === 'string' ? update : JSON.stringify(update) }))
   return calls
 }
 
@@ -106,4 +108,126 @@ test('message sends the typed text to the selected agent in the background', asy
     { agent: 'Ada', prompt: 'continue please', run_in_background: true },
   ])
   await ui.unmount()
+})
+
+test('init closes the pane, then hands the interview prompt to Claude', async ($, on) => {
+  server(on, [agent({ name: 'Ada', state: 'completed' })])
+  const order: string[] = []
+  on('ui.close', () => {
+    order.push('close')
+    return { value: undefined }
+  })
+  on('prompt.submit', (_, e) => {
+    order.push('submit:' + String((e as { text?: string }).text).slice(0, 12))
+    return { text: String((e as { text?: string }).text) }
+  })
+  await open($)
+
+  const ui = await $.ui.mount(PANE)
+  await ui.press({ key: 'init' })
+  expect(order).toEqual(['close', 'submit:Run the suba'])
+  await ui.unmount()
+})
+
+const UPDATE = { available: true, latest: '9.9.9' }
+
+test('update asks first, then closes the pane and submits, leaving no stale confirmation', async ($, on) => {
+  server(on, [agent({ name: 'Ada', state: 'completed' })], UPDATE)
+  const order: string[] = []
+  on('ui.close', () => (order.push('close'), { value: undefined }))
+  on('prompt.submit', (_, e) => (order.push('submit'), { text: String((e as { text?: string }).text) }))
+  await open($)
+
+  let ui = await $.ui.mount(PANE)
+  await ui.press({ key: 'update' })
+  expect(await ui.find({ type: 'Text', text: /Update to 9\.9\.9\?/ })).toBeTruthy()
+  expect(order).toEqual([])
+
+  await ui.press({ key: 'yes' })
+  expect(order).toEqual(['close', 'submit'])
+  await ui.unmount()
+
+  // Reopened, the pane shows the list again, not the old question.
+  ui = await $.ui.mount(PANE)
+  expect(await ui.find({ type: 'Text', text: /Update to 9\.9\.9\?/ })).toBeFalsy()
+  expect(await ui.find({ key: 'message' })).toBeTruthy()
+  await ui.unmount()
+})
+
+test('a failed prompt submit is reported as a toast', async ($, on) => {
+  server(on, [agent({ name: 'Ada', state: 'completed' })])
+  const toasts: string[] = []
+  on('ui.toast', (_, e) => (toasts.push(String((e as { text?: string }).text)), { value: undefined }))
+  on('ui.close', () => ({ value: undefined }))
+  on('prompt.submit', () => {
+    throw new Error('no composer')
+  })
+  await open($)
+
+  const ui = await $.ui.mount(PANE)
+  await ui.press({ key: 'init' })
+  expect(toasts.join(' ')).toMatch(/Could not send the prompt to Claude/)
+  await ui.unmount()
+})
+
+test('the pane says so when it does not hold the keys', async ($, on) => {
+  server(on, [agent({ name: 'Ada', state: 'completed' })])
+  await open($)
+
+  const unfocused = await $.ui.mount({ ...PANE, props: { ...PANE.props, isFocused: false } })
+  expect(await unfocused.find({ type: 'Text', text: /Keys go to the chat/ })).toBeTruthy()
+  await unfocused.unmount()
+
+  const focused = await $.ui.mount(PANE)
+  expect(await focused.find({ type: 'Text', text: /Keys go to the chat/ })).toBeFalsy()
+  await focused.unmount()
+})
+
+const YAML = `# comment kept
+# disabledBackends: [antigravity]
+
+models:
+  claude:
+    - name: a
+`
+
+test('running agents lead and show what they are doing; older finished ones are folded', async ($, on) => {
+  const done = Array.from({ length: 8 }, (_, i) => agent({ name: `Old${i}`, state: 'completed' }))
+  server(on, [...done, agent({ name: 'Busy', state: 'running', current_activity: 'Bash npm test' })])
+  await open($)
+
+  const ui = await $.ui.mount(PANE)
+  expect(await ui.find({ type: 'Text', text: /Bash npm test/ })).toBeTruthy()
+  expect(await ui.find({ key: 'agent-id-Old4' })).toBeTruthy()
+  expect(await ui.find({ key: 'agent-id-Old5' })).toBeFalsy()
+
+  await ui.press({ key: 'all' })
+  expect(await ui.find({ key: 'agent-id-Old7' })).toBeTruthy()
+  await ui.unmount()
+})
+
+test('a backend key rewrites only the disabledBackends line and keeps a copy', async ($, on) => {
+  server(on, [agent({ name: 'Ada', state: 'completed' })], YAML)
+  const writes: { path: string; text: string }[] = []
+  on('fs.write', (_, e) => (writes.push({ path: String((e as { path?: string }).path), text: String((e as { text?: string }).text) }), { value: undefined }))
+  await open($)
+
+  const ui = await $.ui.mount(PANE)
+  await ui.press({ key: 'backend-cursor' })
+  const main = writes.find(w => w.path.endsWith('models.yaml'))
+  expect(writes.some(w => w.path.endsWith('models.yaml.bak') && w.text === YAML)).toBe(true)
+  expect(main?.text).toContain('disabledBackends: [cursor]')
+  expect(main?.text).toContain('# comment kept')
+  expect(main?.text).toContain('# disabledBackends: [antigravity]')
+  await ui.unmount()
+})
+
+test('the line editor handles lists, empty lists and what it will not touch', () => {
+  expect(readDisabled(YAML)).toEqual([])
+  expect(readDisabled('disabledBackends: [cursor, "codex"] # why\nmodels:\n')).toEqual(['cursor', 'codex'])
+  expect(readDisabled('disabledBackends:\n  - cursor\nmodels:\n')).toBeNull()
+  const on = writeDisabled('disabledBackends: [cursor]\nmodels:\n', ['cursor', 'codex'])
+  expect(on).toEqual({ ok: true, text: 'disabledBackends: [cursor, codex]\nmodels:\n' })
+  expect(writeDisabled('disabledBackends:\n  - cursor\nmodels:\n', []).ok).toBe(false)
+  expect(writeDisabled('nothing here', ['cursor']).ok).toBe(false)
 })

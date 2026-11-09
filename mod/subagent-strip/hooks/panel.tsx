@@ -4,6 +4,7 @@ import { atom, read, update } from 'claude-code'
 import type { EngineInterface, On } from 'claude-code'
 
 import type { PanelAgent, PanelState } from '../types'
+import { BACKENDS, readDisabled, writeDisabled } from './policy'
 
 const PANE = 'subagent-mcp'
 const SERVER = 'subagent-mcp'
@@ -21,8 +22,11 @@ const panel = atom(
     updateAvailable: null,
     message: 'Connecting to subagent-mcp...',
     at: 0,
+    showAll: false,
+    disabled: [],
+    locked: [],
   } as PanelState,
-  { shape: 'panel-2' },
+  { shape: 'panel-3' },
 )
 
 const INIT_PROMPT =
@@ -44,6 +48,8 @@ const ago = (iso: string) => {
   const s = Math.max(0, Math.round((Date.now() - Date.parse(iso)) / 1000))
   return s < 60 ? `${s}s` : s < 3600 ? `${Math.floor(s / 60)}m` : `${Math.floor(s / 3600)}h`
 }
+const RECENT = 5
+const MODELS_FILE = '.subagents/models.yaml'
 const isRunning = (a: PanelAgent) => RUNNING.includes(a.state)
 
 type Dollar = Pick<EngineInterface, 'mcp' | 'fs'>
@@ -81,10 +87,35 @@ export function declarePanelCommand($: EngineInterface) {
   })
 }
 
+// What the server refuses (list_models reports it, environment variables included) against what the
+// project's models.yaml says; the difference is locked, because only the file can be edited here.
+async function loadPolicy($: EngineInterface) {
+  let live: string[] = []
+  let file: string[] = []
+  try {
+    const models = await callTool($, 'list_models')
+    const policy = (models['model_policy'] ?? {}) as Record<string, unknown>
+    live = ((policy['disabled_backends'] as unknown[] | undefined) ?? []).map(str)
+  } catch {
+    // keep what the file says
+  }
+  try {
+    file = readDisabled(await $.fs.read(MODELS_FILE)) ?? []
+  } catch {
+    file = []
+  }
+  const disabled = [...new Set([...live, ...file])]
+  const locked = disabled.filter(b => !file.includes(b))
+  await update($, panel, s => ({ ...s, disabled, locked }))
+}
+
 export const registerPanel = (on: On) => {
   let timer: { cancel: () => void } | undefined
+  // Bumped by every open and every hand-off; a late refresh checks it before reclaiming focus.
+  let epoch = 0
 
   on('command.run', { command: 'subagent-mcp' }, async $ => {
+    const mine = ++epoch
     const opened = await $.ui.open({ id: PANE, title: 'Subagents', focus: true, closeOnEscape: true, rows: 16 })
 
     const refresh = async () => {
@@ -101,11 +132,14 @@ export const registerPanel = (on: On) => {
             updated: str(a['updated_at']),
             tokensIn: num(usage['inputTokens']),
             tokensOut: num(usage['outputTokens']),
+            ...(typeof a['current_activity'] === 'string' && a['current_activity'] !== '' ? { activity: a['current_activity'] } : {}),
             ...(a['request_id'] === undefined || a['request_id'] === null
               ? {}
               : { approval: { requestId: str(a['request_id']), tool: str(a['tool_name']), command: str(a['command'] ?? JSON.stringify(a['input'] ?? '')).slice(0, 200) } }),
           }
         })
+        // Running agents lead; the server's order (newest first) holds within each group.
+        agents.sort((x, y) => Number(isRunning(y)) - Number(isRunning(x)))
         let latest: string | null = null
         try {
           const cache = JSON.parse(await $.fs.read('.subagents/memory/update.json')) as { available?: boolean; latest?: string | null }
@@ -138,9 +172,18 @@ export const registerPanel = (on: On) => {
       }
     }
 
+    void loadPolicy($)
+
     timer?.cancel()
     timer = $.clock.every(POLL_MS, refresh)
-    void refresh()
+    // Running the command again while the pane is open reclaims the keys: the open above asks for focus,
+    // and the ring is put on the selected row once the list is drawn. A refusal (text in the prompt, a
+    // dialog up) is fine: the pane then shows its hint.
+    void refresh().then(async () => {
+      const state = await read($, panel)
+      // Skip when the pane was closed or reopened meanwhile, or shows a confirmation or input (no agent row).
+      if (mine === epoch && state.confirm === null && state.selected !== null) await $.ui.focus({ requestId: PANE, key: `agent-${state.selected}` }).catch(() => undefined)
+    })
 
     return {
       text: opened.isPlaced ? 'Subagent panel opened.' : `Subagent panel is waiting: ${opened.reason}`,
@@ -161,6 +204,24 @@ export const registerPanel = (on: On) => {
         await say(`${label}: done`)
       } catch (error) {
         await say(`${label} failed: ${str((error as Error).message).slice(0, 100)}`)
+      }
+    }
+
+    // The setup and update flows run in the conversation, so the pane closes first: the person's attention
+    // belongs to Claude's questions, not the panel.
+    const handOff = async (text: string) => {
+      await update($, panel, s => ({ ...s, confirm: null, message: '', at: Date.now() }))
+      try {
+        await $.ui.close({ id: PANE })
+      } catch (error) {
+        return say(`Could not close the panel: ${str((error as Error).message).slice(0, 80)}`)
+      }
+      timer?.cancel()
+      epoch += 1
+      try {
+        await $.prompt.submit({ text })
+      } catch (error) {
+        $.ui.toast(`Could not send the prompt to Claude: ${str((error as Error).message).slice(0, 80)}`)
       }
     }
 
@@ -194,8 +255,7 @@ export const registerPanel = (on: On) => {
         if (c.kind === 'stop') return run(`Stop ${c.agent}`, 'stop_agent', { agent: c.agent })
         if (c.kind === 'stopAll') return run('Stop all', 'stop_agents', { agents: c.names })
         if (c.kind === 'cleanup') return run(`Clean up ${c.agent}`, 'cleanup_worktree', { agent: c.agent })
-        await say('Update prompt sent to Claude.')
-        await $.prompt.submit({ text: updatePrompt(c.latest) })
+        await handOff(updatePrompt(c.latest))
       }
       return (
         <Box flexDirection="column">
@@ -211,9 +271,15 @@ export const registerPanel = (on: On) => {
 
     const wide = e.props.placement === 'dock' && e.props.bodyColumns >= 90
     const select = (id: string) => update($, panel, s => ({ ...s, selected: id, detail: [], detailFor: id }))
-    const at = state.agents.findIndex(a => a.id === state.selected)
+    // Running agents and the most recent finished ones; the selected agent always stays in view.
+    let finished = 0
+    const visible = state.showAll
+      ? state.agents
+      : state.agents.filter(a => isRunning(a) || a.id === state.selected || ++finished <= RECENT)
+    const hidden = state.agents.length - visible.length
+    const at = visible.findIndex(a => a.id === state.selected)
     const move = (by: number) => {
-      const next = state.agents[Math.min(state.agents.length - 1, Math.max(0, at + by))]
+      const next = visible[Math.min(visible.length - 1, Math.max(0, at + by))]
       return next === undefined ? undefined : select(next.id)
     }
     const pending = selected?.approval
@@ -229,6 +295,23 @@ export const registerPanel = (on: On) => {
         await say(`${label} failed: ${str((error as Error).message).slice(0, 100)}`)
       }
     }
+    const toggle = async (backend: string) => {
+      if (state.locked.includes(backend)) return say(`${backend} is disabled by an environment variable; change it where the server starts`)
+      try {
+        const text = await $.fs.read(MODELS_FILE)
+        const now = readDisabled(text)
+        if (now === null) return say('disabledBackends in models.yaml is not a one-line list; edit it by hand')
+        const next = now.includes(backend) ? now.filter(b => b !== backend) : [...now, backend]
+        const edit = writeDisabled(text, next)
+        if (!edit.ok) return say(edit.reason)
+        await $.fs.write(`${MODELS_FILE}.bak`, text)
+        await $.fs.write(MODELS_FILE, edit.text)
+        await loadPolicy($)
+        await say(`${backend} ${next.includes(backend) ? 'disabled' : 'enabled'} (models.yaml reloads live; previous copy in models.yaml.bak)`)
+      } catch (error) {
+        await say(`Could not change models.yaml: ${str((error as Error).message).slice(0, 80)} (is there a project .subagents/models.yaml? run i)`)
+      }
+    }
     const row = (a: PanelAgent) => (
       <Button key={`agent-${a.id}`} onPress={() => select(a.id)}>
         {state.selected === a.id ? '> ' : '  '}
@@ -240,9 +323,10 @@ export const registerPanel = (on: On) => {
     const list = (
       <Box flexDirection="column">
         {state.agents.length === 0 && <Text dimColor>No agents.</Text>}
-        {state.agents.map(a => (
+        {visible.map(a => (
           <Box key={`g-${a.id}`} flexDirection="column">
             {row(a)}
+            {isRunning(a) && <Text dimColor>{'    ' + (a.activity ?? (a.state === 'needs_approval' ? 'waiting for approval' : 'working'))}</Text>}
             {!wide && state.selected === a.id && detailLines.map((line, i) => <Text key={`d${i}`} dimColor>{'    ' + line}</Text>)}
           </Box>
         ))}
@@ -256,6 +340,9 @@ export const registerPanel = (on: On) => {
 
     return (
       <Box flexDirection="column">
+        {!e.props.isFocused && (
+          <Text color="yellow">Keys go to the chat. Run /subagent-mcp again to use the panel.</Text>
+        )}
         <Box>
           {pending !== undefined && <Button key="allow" hotkey="a" plain onPress={() => decide('allow')}>allow</Button>}
           {pending !== undefined && <Text>  </Text>}
@@ -281,10 +368,7 @@ export const registerPanel = (on: On) => {
             key="init"
             hotkey="i"
             plain
-            onPress={async () => {
-              await say('Setup prompt sent to Claude.')
-              await $.prompt.submit({ text: INIT_PROMPT })
-            }}
+            onPress={() => handOff(INIT_PROMPT)}
           >
             init
           </Button>
@@ -299,6 +383,16 @@ export const registerPanel = (on: On) => {
           <Text>  </Text>
           <Button key="up" hotkey="k" plain onPress={() => move(-1)}>prev</Button>
         </Box>
+        <Box>
+          {BACKENDS.map((b, i) => (
+            <Box key={`be-${b}`}>
+              <Button key={`backend-${b}`} hotkey={String(i + 1)} plain onPress={() => toggle(b)}>
+                {`${b} ${state.disabled.includes(b) ? (state.locked.includes(b) ? 'OFF (env)' : 'OFF') : 'on'}`}
+              </Button>
+              <Text>  </Text>
+            </Box>
+          ))}
+        </Box>
         {state.message !== '' && <Text dimColor>{state.message}</Text>}
         {wide ? (
           <Box>
@@ -307,6 +401,11 @@ export const registerPanel = (on: On) => {
           </Box>
         ) : (
           list
+        )}
+        {(hidden > 0 || state.showAll) && (
+          <Button key="all" hotkey="l" plain onPress={() => update($, panel, s => ({ ...s, showAll: !s.showAll }))}>
+            {state.showAll ? 'show recent only' : `show ${hidden} older`}
+          </Button>
         )}
       </Box>
     )

@@ -81,8 +81,8 @@ question menus gate every write.
 | `a` | shows the pending approval's details; approve or deny via `resolve_approval` | no extra step (the details screen is the confirmation) |
 | `m` | text input, then `send_message` (resumes a finished agent) | no |
 | `w` | `cleanup_worktree` on the selected worktree | yes; warns if there are unmerged commits or uncommitted changes |
-| `i` | submits the init prompt (below) | none; Claude asks its own questions |
-| `u` | submits the update prompt (below); only offered when an update is available | none; the prompt gates itself |
+| `i` | closes the pane, then submits the init prompt (below) | none; Claude asks its own questions |
+| `u` | closes the pane, then submits the update prompt (below); only offered when an update is available | yes, asked before the pane closes |
 
 Confirmed: stop one, stop all and worktree cleanup need a confirmation. Denying an approval does not.
 Every action reports its result in the pane and surfaces server error codes as they come back
