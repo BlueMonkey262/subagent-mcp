@@ -107,3 +107,22 @@ test('message sends the typed text to the selected agent in the background', asy
   ])
   await ui.unmount()
 })
+
+test('init closes the pane, then hands the interview prompt to Claude', async ($, on) => {
+  server(on, [agent({ name: 'Ada', state: 'completed' })])
+  const order: string[] = []
+  on('ui.close', () => {
+    order.push('close')
+    return { value: undefined }
+  })
+  on('prompt.submit', (_, e) => {
+    order.push('submit:' + String((e as { text?: string }).text).slice(0, 12))
+    return { text: String((e as { text?: string }).text) }
+  })
+  await open($)
+
+  const ui = await $.ui.mount(PANE)
+  await ui.press({ key: 'init' })
+  expect(order).toEqual(['close', 'submit:Run the suba'])
+  await ui.unmount()
+})

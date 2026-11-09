@@ -170,6 +170,14 @@ export const registerPanel = (on: On) => {
       }
     }
 
+    // The setup and update flows run in the conversation, so the pane closes first: the person's attention
+    // belongs to Claude's questions, not the panel.
+    const handOff = async (text: string) => {
+      timer?.cancel()
+      await $.ui.close({ id: PANE })
+      await $.prompt.submit({ text })
+    }
+
     const c = state.confirm
     if (c !== null && c.kind === 'message') {
       const agent = c.agent
@@ -200,8 +208,7 @@ export const registerPanel = (on: On) => {
         if (c.kind === 'stop') return run(`Stop ${c.agent}`, 'stop_agent', { agent: c.agent })
         if (c.kind === 'stopAll') return run('Stop all', 'stop_agents', { agents: c.names })
         if (c.kind === 'cleanup') return run(`Clean up ${c.agent}`, 'cleanup_worktree', { agent: c.agent })
-        await say('Update prompt sent to Claude.')
-        await $.prompt.submit({ text: updatePrompt(c.latest) })
+        await handOff(updatePrompt(c.latest))
       }
       return (
         <Box flexDirection="column">
@@ -290,10 +297,7 @@ export const registerPanel = (on: On) => {
             key="init"
             hotkey="i"
             plain
-            onPress={async () => {
-              await say('Setup prompt sent to Claude.')
-              await $.prompt.submit({ text: INIT_PROMPT })
-            }}
+            onPress={() => handOff(INIT_PROMPT)}
           >
             init
           </Button>
