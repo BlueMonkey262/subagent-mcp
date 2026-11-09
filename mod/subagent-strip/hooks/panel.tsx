@@ -140,7 +140,13 @@ export const registerPanel = (on: On) => {
 
     timer?.cancel()
     timer = $.clock.every(POLL_MS, refresh)
-    void refresh()
+    // Running the command again while the pane is open reclaims the keys: the open above asks for focus,
+    // and the ring is put on the selected row once the list is drawn. A refusal (text in the prompt, a
+    // dialog up) is fine: the pane then shows its hint.
+    void refresh().then(async () => {
+      const state = await read($, panel)
+      if (state.selected !== null) await $.ui.focus({ requestId: PANE, key: `agent-${state.selected}` }).catch(() => undefined)
+    })
 
     return {
       text: opened.isPlaced ? 'Subagent panel opened.' : `Subagent panel is waiting: ${opened.reason}`,
@@ -256,6 +262,9 @@ export const registerPanel = (on: On) => {
 
     return (
       <Box flexDirection="column">
+        {!e.props.isFocused && (
+          <Text color="yellow">Keys go to the chat. Click here, or run /subagent-mcp again, to use the panel.</Text>
+        )}
         <Box>
           {pending !== undefined && <Button key="allow" hotkey="a" plain onPress={() => decide('allow')}>allow</Button>}
           {pending !== undefined && <Text>  </Text>}
