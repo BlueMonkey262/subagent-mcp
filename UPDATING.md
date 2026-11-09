@@ -8,7 +8,7 @@ Two rules hold throughout:
 
 - **Never rebuild `<repo>` while a session is using it.** A rebuild mid-session has dropped the host
   connection before. All building and testing happens in a separate worktree first; the swap is last.
-- **Nothing is discarded.** Stop and report if `<repo>` has uncommitted changes. Never run
+- **Nothing is discarded.** Never run
   `git reset --hard`, `git checkout -- .` or `git clean` here. Nothing updates without the person's yes.
 
 ## 1. Preflight
@@ -17,8 +17,12 @@ Two rules hold throughout:
    Note `latest` and the running version in `<repo>/package.json`. If `latest` is not newer, stop.
 2. Read the release notes: `https://github.com/BlueMonkey262/subagent-mcp/releases/tag/v<latest>`.
    Show the person the version change and the notes.
-3. `git -C <repo> status --short`. If anything other than untracked files that the release does not
-   touch shows up, stop and tell the person. Local edits such as `.subagents/models.yaml` are theirs.
+3. `git -C <repo> status --short`. Local edits are normal (for example `.subagents/models.yaml`), so they are
+   not a blocker by themselves. Find the overlap with the release:
+   `git -C <repo> diff --name-only HEAD v<latest>` against the modified tracked files. No overlap: the
+   checkout in step 4 carries the edits over untouched. An overlap (the release changes a file the person
+   edited): stop, show both diffs, and ask how to merge; never overwrite the person's version. Untracked
+   files are left alone.
 4. `list_agents`. If agents are running, say so: the restart in step 4 ends them. Offer to wait.
 
 ## 2. Build and test in a worktree
@@ -44,16 +48,20 @@ Releases that change `models.yaml` or agent-config semantics must add a dated no
 
 ## 4. Swap (the one step that touches the live install)
 
-Only after step 2 passed and the person confirmed. Claude runs this itself, last:
+Only after step 2 passed and the person confirmed. Claude runs this itself, last. On a branch (normally
+`main`), move the branch forward to the release; never leave the install on a detached HEAD:
 
 ```sh
-git -C <repo> checkout v<latest>
+git -C <repo> merge --ff-only v<latest>   # on a branch; carries the person's local edits along
 cd <repo> && npm ci && npm run build
 ```
 
+If the merge refuses (the branch has commits of its own, or edits clash), stop and ask. Only when
+`<repo>` is already on a detached HEAD at a tag, use `git -C <repo> checkout v<latest>`.
+
 Then call `restart_host` so the session picks up the new code. If the connection drops anyway, say so;
-`/mcp` reconnects. If a step fails after the checkout, return to the previous version:
-`git -C <repo> checkout -` and rebuild.
+`/mcp` reconnects. If a step fails after the merge, go back with `git -C <repo> reset --keep <previous
+commit>` (never `--hard`) and rebuild.
 
 ## 5. After restart
 
