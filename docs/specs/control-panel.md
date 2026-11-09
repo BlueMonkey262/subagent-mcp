@@ -159,7 +159,7 @@ section and may assume the running server supports it).
    mounted drawing) and Buttons, but how a pane receives keys while the prompt box has focus is
    unconfirmed. Resolve with a throwaway prototype pane before building the real one; fall back to
    Buttons/Select inside the pane if bare letters collide with typing.
-2. **Launcher-supplied MCP server.** Verify `--mcp-config` plus the development-channels flag works
-   as described under "Where it lives", and that plain `claude` then sees nothing.
+2. **Launcher-supplied MCP server.** Resolved, negative: the channel flag ignores a server passed with
+   `--mcp-config`, so the server stays at user scope (see "Where it lives").
 3. **`restart_host` after a rebuild.** Confirm it reconnects cleanly to the freshly built code in
    the same session; if not, `u` ends by telling the person to restart the session.
