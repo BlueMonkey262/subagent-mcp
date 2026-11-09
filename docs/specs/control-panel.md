@@ -18,18 +18,17 @@ auto-updating anything.
 ## Where it lives
 
 The `mod/subagent-strip` plugin, which `bin/subagent-mcp` already loads through
-`CLAUDE_CODE_PLUGIN_DIRS`. Decided: the panel exists only in sessions started with the launcher.
-A plain `claude` session must have no mod, no MCP server and no `/subagent-mcp` command.
+`CLAUDE_CODE_PLUGIN_DIRS`. The panel and the `/subagent-mcp` command exist only in sessions started
+with the launcher. The MCP server stays registered at user scope (SETUP.md step 3), so a plain
+`claude` session can still call its tools but has no panel.
 
-That is a requirement on the install, not only on the mod. Today SETUP.md step 3 registers the
-server with `claude mcp add -s user`, which makes it available to plain `claude` too. To meet the
-requirement the launcher must supply the server itself (for example `--mcp-config` pointing at
-`bin/run-server.sh`, not strict, so the person's other servers stay) and SETUP.md must stop
-registering it at user scope; UPDATING.md must migrate existing installs by removing the user-scope
-entry. Needs verifying that `--dangerously-load-development-channels server:subagent-mcp` accepts a
-server that comes from `--mcp-config`. The `statusLine` entry in `settings.json` is global; with
-no mod running it finds no live file and prints nothing, which is acceptable. The poller that feeds the status line also
-feeds the panel (one `list_agents` poll, shared), so the panel adds no extra server load.
+Decided: the earlier requirement that plain `claude` have no server either is dropped. It would need
+the launcher to supply the server, and that was tried: a server passed with `--mcp-config` connects,
+but `--dangerously-load-development-channels server:<name>` reports "no MCP server configured with
+that name", so completion events would never arrive. The `statusLine` entry in `settings.json` is
+global; with no mod running it finds no live file and prints nothing, which is acceptable. The poller
+that feeds the status line also feeds the panel (one `list_agents` poll, shared), so the panel adds no
+extra server load.
 
 Implementation surface (plugin API on this Claude Code build; verify at build time):
 

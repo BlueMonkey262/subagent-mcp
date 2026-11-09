@@ -42,18 +42,6 @@ Releases that change `models.yaml` or agent-config semantics must add a dated no
 
 - *(none yet)*
 
-### Moving to launcher-only registration
-
-Older installs registered the server for every Claude Code session:
-
-```sh
-claude mcp list            # a user-scope "subagent-mcp" entry means an old install
-```
-
-Once the launcher supplies the server itself (see SETUP.md step 3), remove the old entry with
-`claude mcp remove -s user subagent-mcp`, with the person's yes. Do this only if the release notes say
-the launcher now provides the server; otherwise the entry is still needed.
-
 ## 4. Swap (the one step that touches the live install)
 
 Only after step 2 passed and the person confirmed. Claude runs this itself, last:
