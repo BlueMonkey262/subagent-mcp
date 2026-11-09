@@ -7,6 +7,8 @@ export type PanelAgent = {
   updated: string
   tokensIn: number
   tokensOut: number
+  /** Set while the agent is waiting on an approval. */
+  approval?: { requestId: string; tool: string; command: string }
 }
 
 /** What a confirmation is waiting on; null when nothing is. */

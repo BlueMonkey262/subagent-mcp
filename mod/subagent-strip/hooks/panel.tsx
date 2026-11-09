@@ -101,6 +101,9 @@ export const registerPanel = (on: On) => {
             updated: str(a['updated_at']),
             tokensIn: num(usage['inputTokens']),
             tokensOut: num(usage['outputTokens']),
+            ...(a['request_id'] === undefined || a['request_id'] === null
+              ? {}
+              : { approval: { requestId: str(a['request_id']), tool: str(a['tool_name']), command: str(a['command'] ?? JSON.stringify(a['input'] ?? '')).slice(0, 200) } }),
           }
         })
         let latest: string | null = null
@@ -194,7 +197,19 @@ export const registerPanel = (on: On) => {
       const next = state.agents[Math.min(state.agents.length - 1, Math.max(0, at + by))]
       return next === undefined ? undefined : select(next.id)
     }
-    const detailLines = selected === undefined ? [] : state.detail
+    const pending = selected?.approval
+    const detailLines =
+      selected === undefined ? [] : pending === undefined ? state.detail : [`Waiting for approval: ${pending.tool} ${pending.command}`, ...state.detail]
+    const decide = async (decision: 'allow' | 'allow_for_session' | 'deny') => {
+      if (selected === undefined || pending === undefined) return
+      const label = decision === 'deny' ? 'Denied' : decision === 'allow' ? 'Allowed' : 'Allowed for session'
+      try {
+        await callTool($, 'resolve_approval', { request_id: pending.requestId, decision })
+        await say(`${label}: ${selected.name} ${pending.tool}`)
+      } catch (error) {
+        await say(`${label} failed: ${str((error as Error).message).slice(0, 100)}`)
+      }
+    }
     const row = (a: PanelAgent) => (
       <Button key={`agent-${a.id}`} onPress={() => select(a.id)}>
         {state.selected === a.id ? '> ' : '  '}
@@ -223,6 +238,12 @@ export const registerPanel = (on: On) => {
     return (
       <Box flexDirection="column">
         <Box>
+          {pending !== undefined && <Button key="allow" hotkey="a" plain onPress={() => decide('allow')}>allow</Button>}
+          {pending !== undefined && <Text>  </Text>}
+          {pending !== undefined && <Button key="allow-session" hotkey="r" plain onPress={() => decide('allow_for_session')}>allow for session</Button>}
+          {pending !== undefined && <Text>  </Text>}
+          {pending !== undefined && <Button key="deny" hotkey="d" plain onPress={() => decide('deny')}>deny</Button>}
+          {pending !== undefined && <Text>  </Text>}
           {selected !== undefined && isRunning(selected) && (
             <Button key="stop" hotkey="s" plain onPress={() => ask({ kind: 'stop', agent: selected.name })}>stop</Button>
           )}
