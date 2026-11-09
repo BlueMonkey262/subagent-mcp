@@ -20,3 +20,22 @@ Shows the active subagent-mcp agents in the status line under the prompt, one co
 
 The `subagent-mcp` launcher loads this mod automatically (`CLAUDE_CODE_PLUGIN_DIRS`). The status line
 command is the one setting that must live in `settings.json`; see SETUP.md.
+
+## Control panel: `/subagent-mcp`
+
+Type `/subagent-mcp` to open a panel with the agent list (`hooks/panel.tsx`). In Claude Code's
+main-screen layout, which is tmux's default, it sits above the prompt; in the fullscreen layout from
+110 columns it docks beside the transcript. Keys act on the selected agent and fire only while the pane
+has focus:
+
+| Key | Does |
+|---|---|
+| `j` / `k` | next / previous agent; the selected agent's digest opens under its row |
+| `s` / `x` | stop the selected agent / stop all running agents (each asks first) |
+| `a` / `r` / `d` | allow / allow for session / deny a pending approval |
+| `m` | message or resume the selected agent (an input row; Enter sends) |
+| `w` | remove the selected agent's managed worktree (asks first; the branch is kept) |
+| `i` | ask Claude to run the setup interview for `.subagents/` |
+| `u` | when an update is available, ask Claude to follow `UPDATING.md` (asks first) |
+
+Tests: `claude plugin test mod/subagent-strip` (mocked server). Design: `docs/specs/control-panel.md`.

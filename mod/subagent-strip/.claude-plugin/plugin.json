@@ -1,1 +1,6 @@
-{ "name": "subagent-strip", "version": "0.5.0", "description": "Polls subagent-mcp and writes live agents to a file the status line script reads" }
+{
+  "name": "subagent-strip",
+  "version": "0.6.0-dev",
+  "description": "Polls subagent-mcp and writes live agents to a file the status line script reads",
+  "types": "./types/index.d.ts"
+}
