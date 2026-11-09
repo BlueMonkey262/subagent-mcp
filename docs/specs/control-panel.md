@@ -58,7 +58,7 @@ question menus gate every write.
 
 - Left column: agents, running first, then recent. Each row: backend, model, config, name,
   elapsed, state. A badge marks a pending approval. Worktrees appear in their own section below
-  the agents (leftover `subagent/*` branches and their worktrees).
+  the agents (the managed worktrees of listed agents; `cleanup_worktree` removes only an agent's own worktree and keeps its branch).
 - Right column: detail for the selected row. For an agent: the `summary: true` digest from
   `get_agent_events` (tool counts, last tool calls, message tail), then its result once finished.
   For a worktree: path, branch, whether it has unmerged commits or uncommitted changes.

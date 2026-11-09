@@ -106,3 +106,5 @@ backend set up. To undo, remove `"Agent"` from the list. Restart Claude Code aft
 ## 8. Verify
 
 Run `npm test`, start a new session with `subagent-mcp`, and check that the `list_models` tool works.
+Type `/subagent-mcp` to open the control panel (stop, approve, message, clean up, `i` init, `u` update).
+Updates follow [UPDATING.md](UPDATING.md).
