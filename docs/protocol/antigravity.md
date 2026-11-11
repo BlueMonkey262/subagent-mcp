@@ -23,6 +23,16 @@ The project config's `antigravityAgent` must name an agent that Antigravity disc
 `.agents/agents/<name>.md` or its configured global location. This bridge does not generate
 workspace agent files or lower a system prompt into a user message.
 
+Verified on agy 1.2.x:
+
+- The agent file's frontmatter must list `tools` (for example
+  `tools: [read_file, edit_file, write_file, run_command, manage_task, search_web]`). Without it,
+  agy grants a small read-only default set (`read_file`, `search_web`, `manage_task` and a few
+  others), so the agent cannot run commands or edit files.
+- The global location `~/.gemini/antigravity-cli/agents/<name>/agent.md` is discovered from any
+  working directory. Use it for `isolation: worktree` in projects that do not commit `.agents/`,
+  because a managed worktree only contains committed files.
+
 ## Input
 
 Each turn is one newline-delimited JSON object on stdin; retain the stdin stream after a result:
@@ -67,6 +77,25 @@ rules control tool execution; an action that cannot be approved headlessly is so
 CLI. Therefore this adapter does not emit `approval.requested`, cannot use the bridge's
 `resolve_approval`, and exposes `relaysDenyMessage: false`. Native tool failures remain visible
 as failed `tool.end` events when the CLI supplies `tool_info.error`.
+
+A headless auto-denial (verified on agy 1.2.x) looks like this:
+
+1. The tool's `step_update` ends in `state: "ERROR"` (not `DONE`) with
+   `tool_info.error.message` starting `permission check failed ... user denied permission`. The
+   adapter ends that tool with status `denied`; any other `ERROR` step ends it `failed`.
+2. The `result` still has `status: "SUCCESS"`, carries
+   `denied_actions: [{"action": "command", "display_name": "RunCommand"}]`, and often an empty
+   `response`, because the model stops there.
+3. stderr explains the fix (`Add an allow-rule under permissions.allow in settings.json`).
+
+The adapter emits a non-fatal `ANTIGRAVITY_PERMISSION_DENIED` error naming the denied actions.
+When the response is empty it fails the turn and uses that explanation as `finalText`, so the
+parent never receives an empty success. Allow rules go in
+`~/.gemini/antigravity-cli/settings.json`, for example:
+
+```json
+{ "permissions": { "allow": ["command(git)", "write_file(/path/to/repo)"], "deny": ["command(sudo)"] } }
+```
 
 For interruption the adapter sends `SIGINT`, waits a short grace interval for a terminal `result`,
 then emits one interrupted terminal event and terminates the owned process if the CLI does not
