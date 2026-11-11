@@ -1,6 +1,8 @@
 ---
 name: subagent-general
 description: General-purpose subagent for work delegated through subagent-mcp (Antigravity backend).
+# Without `tools`, agy grants only a small read-only set (no shell, no edits).
+tools: [read_file, edit_file, write_file, run_command, manage_task, search_web]
 ---
 You are a focused subagent delegated a specific task by a parent session.
 You have no access to the parent's conversation history, only this prompt.

@@ -367,14 +367,18 @@ export class AntigravityAdapter implements BackendAdapter {
         input: isRecord(toolInfo.parameters) ? toolInfo.parameters : {},
       });
     }
-    if (step.state !== "DONE" || session.completedTools.has(toolCallId)) return;
+    // A tool step ends in DONE, or in ERROR when it failed or headless mode denied it.
+    if ((step.state !== "DONE" && step.state !== "ERROR") || session.completedTools.has(toolCallId)) return;
     session.completedTools.add(toolCallId);
-    const failed = isRecord(toolInfo.error);
+    const error = isRecord(toolInfo.error) ? toolInfo.error : undefined;
+    const status = error === undefined && step.state === "DONE" ? "completed"
+      : isPermissionDenial(error) ? "denied" : "failed";
+    const output = toolInfo.output ?? error;
     this.#emit(session, "tool.end", {
       toolCallId,
       toolName,
-      status: failed ? "failed" : "completed",
-      ...(toolInfo.output === undefined ? {} : { output: toolInfo.output }),
+      status,
+      ...(output === undefined ? {} : { output }),
     });
   }
 
@@ -395,10 +399,29 @@ export class AntigravityAdapter implements BackendAdapter {
         fatal: false,
       });
     }
+    const response = typeof result.response === "string" ? scanChildOutput(result.response) : undefined;
+    // Headless agy auto-denies actions no permissions.allow rule covers. The result still says
+    // SUCCESS, often with an empty response, so name the denied actions instead of returning nothing.
+    const denied = deniedActions(result);
+    let outcome: "completed" | "interrupted" | "failed" = normalized;
+    let finalText = response;
+    if (denied.length > 0) {
+      const message = deniedActionsMessage(denied);
+      this.#emit(session, "error", {
+        code: "ANTIGRAVITY_PERMISSION_DENIED",
+        message,
+        fatal: false,
+        details: { deniedActions: denied },
+      });
+      if (response === undefined || response.trim() === "") {
+        finalText = message;
+        if (outcome === "completed") outcome = "failed";
+      }
+    }
     this.#completeTurn(
       session,
-      session.currentTurn.timedOut ? "failed" : session.currentTurn.interruptRequested ? "interrupted" : normalized,
-      typeof result.response === "string" ? scanChildOutput(result.response) : undefined,
+      session.currentTurn.timedOut ? "failed" : session.currentTurn.interruptRequested ? "interrupted" : outcome,
+      finalText,
       extractUsage(result),
     );
   }
@@ -593,6 +616,25 @@ function deferred<T>(): Deferred<T> {
     rejectPromise = reject;
   });
   return { promise, resolve: resolvePromise, reject: rejectPromise, settled: false };
+}
+
+/** agy reports a headless permission denial as a TOOL_ERROR whose message says so. */
+function isPermissionDenial(error: Readonly<Record<string, unknown>> | undefined): boolean {
+  return typeof error?.message === "string" && /permission check failed|denied permission/i.test(error.message);
+}
+
+function deniedActions(result: Readonly<Record<string, unknown>>): { action: string; displayName?: string }[] {
+  if (!Array.isArray(result.denied_actions)) return [];
+  return result.denied_actions.filter(isRecord).flatMap((entry) => typeof entry.action === "string"
+    ? [{ action: entry.action, ...(typeof entry.display_name === "string" ? { displayName: entry.display_name } : {}) }]
+    : []);
+}
+
+function deniedActionsMessage(denied: readonly { action: string; displayName?: string }[]): string {
+  const names = denied.map((entry) => entry.displayName === undefined ? entry.action : `${entry.action} (${entry.displayName})`);
+  const rules = [...new Set(denied.map((entry) => `${entry.action}(...)`))].join(", ");
+  return `Antigravity headless mode auto-denied: ${names.join(", ")}. Headless runs cannot ask for approval; `
+    + `add allow rules such as ${rules} under permissions.allow in ~/.gemini/antigravity-cli/settings.json.`;
 }
 
 function extractUsage(result: Readonly<Record<string, unknown>>): Usage | undefined {

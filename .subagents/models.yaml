@@ -37,10 +37,10 @@ models:
   antigravity:
     - name: gemini-3.8-flash-low
       description: Fast, low-effort Gemini 3.8 Flash tier from `agy models`.
+    - name: gemini-3.8-flash-medium
+      description: Medium-effort Gemini 3.8 Flash tier from `agy models`.
     - name: gemini-3.8-flash-high
       description: Higher-reasoning Gemini 3.8 Flash tier from `agy models`.
-    - name: gemini-3.1-pro-high
-      description: Higher-capability Gemini 3.1 Pro tier from `agy models`.
   cursor:
     # Cursor Agent CLI model ids are the exact values from `agent --list-models`.
     # `auto` is the CLI default; effort is folded into the id (e.g. grok-4.7-high).
