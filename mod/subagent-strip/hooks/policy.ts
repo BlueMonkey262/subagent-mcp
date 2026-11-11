@@ -1,7 +1,7 @@
 // Reading and rewriting the one `disabledBackends` line of a project's models.yaml. Everything else in the
 // file, comments included, is left byte for byte as it was.
 
-export const BACKENDS = ['claude', 'codex', 'opencode', 'antigravity', 'cursor'] as const
+export const BACKENDS = ['claude', 'codex', 'opencode', 'antigravity', 'cursor', 'copilot'] as const
 
 export type Edit = { ok: true; text: string } | { ok: false; reason: string }
 

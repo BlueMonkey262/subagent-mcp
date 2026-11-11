@@ -248,10 +248,10 @@ export async function loadModelsFile(path: string): Promise<ModelsFile> {
   const roster = Object.fromEntries(
     BACKENDS.map((backend) => [
       backend,
-      // Antigravity and Cursor were added after the original roster format. Let older projects
+      // Antigravity, Cursor and Copilot were added after the original roster format. Let older projects
       // load until they deliberately add a model, while preserving strict array validation for
       // every key they do provide and for the pre-existing backends.
-      (backend === "antigravity" || backend === "cursor") && rawModels[backend] === undefined
+      (backend === "antigravity" || backend === "cursor" || backend === "copilot") && rawModels[backend] === undefined
         ? []
         : parseModelEntries(rawModels[backend], path, backend),
     ]),
@@ -442,7 +442,7 @@ function effortIgnoredError(backend: Backend, effort: string): ConfigurationErro
     ? `Cursor folds effort into the model id (for example grok-4.7-high). Pass that model and omit effort.`
     : `OpenCode has no reasoning-effort parameter, so the run would silently use the model's default.`;
   return new ConfigurationError(
-    `Backend "${backend}" does not honor effort "${effort}". ${detail} Remove effort, or use Claude, Codex, or Antigravity.`,
+    `Backend "${backend}" does not honor effort "${effort}". ${detail} Remove effort, or use Claude, Codex, Antigravity, or Copilot.`,
     { backend, effort },
   );
 }
