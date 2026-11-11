@@ -106,8 +106,10 @@ against the repository, tests, and the operator's actual request.
   cold resumes launch with `--conversation <id>`. It maps `init`, `step_update`, and `result`
   records into normal server events. It deliberately does **not** pass
   `--dangerously-skip-permissions`: configure Antigravity's native allow/ask/deny rules in its
-  settings. Headless Antigravity has no host approval-response channel, so native soft-denials
-  are reported as tool failures and cannot enter this server's `resolve_approval` loop.
+  settings. Headless Antigravity has no host approval-response channel, so an action no
+  `permissions.allow` rule covers is auto-denied: the tool ends `denied`, the turn reports the
+  denied actions (and fails if the agent produced no text), and nothing enters this server's
+  `resolve_approval` loop. The custom agent must list `tools`, or agy gives it only a read-only set.
   `reasoningEffort` accepts only `low`, `medium`, or `high` for this backend. See
   [`docs/protocol/antigravity.md`](docs/protocol/antigravity.md) for the verified protocol and
   outstanding live-acceptance probes.

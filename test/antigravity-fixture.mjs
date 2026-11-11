@@ -37,6 +37,27 @@ lines.on("line", (line) => {
     return;
   }
   if (prompt.includes("HANG")) return;
+  if (prompt.includes("DENIED")) {
+    // Live agy 1.2.x shape for a headless auto-denial: the tool step ends in ERROR and the result
+    // still says SUCCESS, with denied_actions and (when the model stops there) an empty response.
+    step += 1;
+    const index = step * 10;
+    const tool = { name: "run_command", parameters: { CommandLine: "date" } };
+    send({ event: "step_update", step_update: {
+      conversation_id: conversationId, step_index: index, step_type: "tool", state: "ACTIVE", tool_name: "run_command", tool_info: tool,
+    } });
+    send({ event: "step_update", step_update: {
+      conversation_id: conversationId, step_index: index, step_type: "tool", state: "ERROR", tool_name: "run_command",
+      tool_info: { ...tool, error: { type: "TOOL_ERROR", message: "permission check failed for unsandboxed \"date\": user denied permission to run command:\ndate" } },
+    } });
+    const explained = prompt.includes("EXPLAINED");
+    send({ event: "result", result: {
+      conversation_id: conversationId, status: "SUCCESS", response: explained ? "I could not run date: permission denied." : "",
+      usage: { input_tokens: 3, output_tokens: 1, cache_read_tokens: 0, total_tokens: 4 },
+      denied_actions: [{ action: "command", display_name: "RunCommand" }],
+    } });
+    return;
+  }
   step += 1;
   const index = step * 10;
   send({ event: "step_update", step_update: {
