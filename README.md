@@ -1,8 +1,8 @@
 # subagent-mcp
 
 A resumable, approval-aware MCP server for delegating work from a Claude Code session to
-subagents across five backends: Claude Code, Codex, OpenCode, Google Antigravity CLI, and the
-Cursor Agent CLI. All five have been exercised live against their installed CLIs.
+subagents across six backends: Claude Code, Codex, OpenCode, Google Antigravity CLI, the
+Cursor Agent CLI, and the GitHub Copilot CLI. All six have been exercised live against their installed CLIs.
 
 ## Setup
 
@@ -18,11 +18,12 @@ That installs: the server (user-scoped MCP), the `subagent-mcp` launcher, and th
 | Codex | needs `codex`; model names are whatever your Codex account offers |
 | OpenCode | model IDs are `provider/model` (`opencode models`) |
 | Cursor | needs the `agent` CLI; model IDs from `agent --list-models` |
+| GitHub Copilot | needs the `copilot` CLI, signed in; model IDs as `copilot --model` accepts them (`auto` routes within your plan) |
 | Antigravity (AGY) | needs `agy`; agent config also sets `antigravityAgent` |
 | NVIDIA NIM | free-tier models via an API key; usable from Claude, Codex and OpenCode agents |
 | Generic OpenAI-compatible API | any `/v1` endpoint, optional key, add as many as you like; same harnesses as NIM |
 
-Only the CLIs you actually use need to be installed. Cursor and Antigravity are closed harnesses with
+Only the CLIs you actually use need to be installed. Cursor, Antigravity and Copilot are closed harnesses with
 no custom-endpoint setting, so NIM/generic endpoints cannot be routed through them.
 
 ### Endpoints (NIM and generic OpenAI-compatible)
@@ -124,6 +125,18 @@ against the repository, tests, and the operator's actual request.
   Antigravity do the same: `stop_agent` and a turn timeout signal the child's process group, so
   shells and builds it spawned (`cargo`, `check_task`) are reaped with it. See
   [`docs/protocol/cursor.md`](docs/protocol/cursor.md) for the verified protocol.
+- **GitHub Copilot**: drives the Copilot CLI one process per turn, `copilot --output-format json
+  --no-auto-update --no-ask-user --model <explicit> --prompt=<prompt>` (verified against `copilot
+  1.0.109`); `send_message` resumes with `--resume <sessionId>`. Headless Copilot cannot prompt, so
+  `approve()` is not honored; instead the agent's rules map to native flags: `permission.default:
+  allow` → `--allow-all-tools`, otherwise only the `allow` rules become `--allow-tool` and anything
+  else is denied (reported as a `denied` tool result). `deny` rules always become `--deny-tool`, which
+  Copilot enforces over every allow. Rules translate from the Claude-style syntax (`Bash(git:*)` →
+  `shell(git:*)`, `Read` → `read`, `Write(p)`/`Edit(p)` → `write(p)`); native Copilot rules pass
+  through. Copilot has no system-prompt flag, so the agent config body is prepended to the first
+  prompt. `effort` maps to `--reasoning-effort` (not every model accepts it; `auto` rejects it).
+  Copilot reports premium requests, not tokens, so its turns carry no token usage. See
+  [`docs/protocol/copilot.md`](docs/protocol/copilot.md).
 
 ## Operational limits
 
@@ -170,6 +183,7 @@ against the repository, tests, and the operator's actual request.
 - **Per-agent token counts.** `list_agents` reports each agent's `cumulative_usage`: its finished
   turns plus the turn in progress. Claude, Codex and OpenCode 2.x report usage mid-turn (as
   `usage.updated` events in `get_agent_events`); Cursor and Antigravity report it when a turn ends.
+  Copilot reports no token counts.
   Usage fields:
 
   | Field | Meaning |
@@ -319,6 +333,6 @@ Spawn options:
   result lookup, and cancellation after launch.
 
 Effort support is reported by discovery. OpenCode currently has no verified effort
-mapping in this adapter; Cursor uses model IDs containing effort. Unsupported
+mapping in this adapter; Cursor uses model IDs containing effort; Copilot passes `--reasoning-effort`. Unsupported
 values remain errors. Usage and monetary cost are reported only when supplied by
 the backend; the bridge does not invent price estimates.

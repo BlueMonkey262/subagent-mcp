@@ -1,4 +1,4 @@
-export const BACKENDS = ["claude", "codex", "opencode", "antigravity", "cursor"] as const;
+export const BACKENDS = ["claude", "codex", "opencode", "antigravity", "cursor", "copilot"] as const;
 export type Backend = (typeof BACKENDS)[number];
 
 export function isBackend(value: unknown): value is Backend {

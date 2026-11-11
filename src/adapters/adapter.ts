@@ -21,7 +21,7 @@ export interface SpawnRequest {
   readonly timeoutMs?: number;
   /**
    * Reasoning effort (e.g. "low"/"medium"/"high"/"xhigh"/"max"). Claude maps it to `--effort` at
-   * launch; Codex and Antigravity apply it per turn. The registry rejects it for OpenCode and
+   * launch; Codex, Antigravity and Copilot apply it per turn. The registry rejects it for OpenCode and
    * Cursor before an adapter sees it (Cursor folds effort into the model name).
    */
   readonly reasoningEffort?: string;
@@ -45,7 +45,7 @@ export interface ResumeRequest {
   readonly timeoutMs?: number;
   /**
    * Reasoning effort (e.g. "low"/"medium"/"high"/"xhigh"/"max"). Claude maps it to `--effort` at
-   * launch; Codex and Antigravity apply it per turn. The registry rejects it for OpenCode and
+   * launch; Codex, Antigravity and Copilot apply it per turn. The registry rejects it for OpenCode and
    * Cursor before an adapter sees it (Cursor folds effort into the model name).
    */
   readonly reasoningEffort?: string;

@@ -255,7 +255,7 @@ test("a background Cursor turn pushes the settled channel event on completion, f
     env: {},
     sourcePath: "test-fixture",
   };
-  const roster: ModelRoster = { claude: [], codex: [], opencode: [], antigravity: [], cursor: [{ name: "auto" }] };
+  const roster: ModelRoster = { claude: [], codex: [], opencode: [], antigravity: [], cursor: [{ name: "auto" }], copilot: [] };
 
   async function harness(): Promise<{ adapter: CursorAdapter; supervisor: Supervisor; settled: Readonly<Record<string, unknown>>[] }> {
     const adapter = fixtureAdapter();

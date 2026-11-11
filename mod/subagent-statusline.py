@@ -9,7 +9,8 @@ from datetime import datetime, timezone
 LIVE = {"starting", "running", "needs_approval"}
 BLUE, BOLD, DIM, RESET = "\033[34m", "\033[1m", "\033[2m", "\033[0m"
 HARNESS_COLORS = {"codex": "\033[38;5;141m", "opencode": "\033[36m", "claude": "\033[38;5;208m",
-                  "cursor": "\033[97m", "antigravity": "\033[32m"}  # purple, cyan, orange, white, green
+                  "cursor": "\033[97m", "antigravity": "\033[32m",
+                  "copilot": "\033[94m"}  # purple, cyan, orange, white, green, light blue
 
 def load_names():
     """Name pool shared with the server (src/agent-names.ts); only used for servers that don't send names."""
