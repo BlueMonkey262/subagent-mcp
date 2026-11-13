@@ -784,6 +784,50 @@ test("startup restores pending tasks and pings before enabling persistence", { t
   }
 });
 
+test("shutdown waits for an in-flight settle before writing the final snapshot", { timeout: 20_000 }, async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "subagent-host-notifier-shutdown-"));
+  const paths = hostPaths(cwd);
+  const fixture = pathToFileURL(join(process.cwd(), "test", "shutdown-notifier-fixture.mjs")).href;
+  const saved = {
+    NODE_OPTIONS: process.env.NODE_OPTIONS,
+    SUBAGENT_TEST_PING_DELAY_MS: process.env.SUBAGENT_TEST_PING_DELAY_MS,
+    SUBAGENT_TEST_PING_ID: process.env.SUBAGENT_TEST_PING_ID,
+  };
+  const pingId = "task-notifier-race";
+  process.env.NODE_OPTIONS = `${saved.NODE_OPTIONS ?? ""} --import=${fixture}`.trim();
+  process.env.SUBAGENT_TEST_PING_DELAY_MS = "400";
+  process.env.SUBAGENT_TEST_PING_ID = pingId;
+  let client: HostClient | undefined;
+  try {
+    client = await connectHost(daemonOptions(cwd));
+    const hello = await client.call("hello") as { pid: number };
+    process.kill(hello.pid, "SIGUSR2");
+    // Let the signal handler start the async notifier, which stays in flight for 400ms.
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    await client.call("shutdown");
+    client.close();
+    client = undefined;
+    await waitForPidExit(hello.pid);
+
+    const snapshot = JSON.parse(await readFile(paths.snapshotPath, "utf8")) as {
+      undeliveredPings?: { agent_id?: string; task_id?: string }[];
+    };
+    assert.equal(
+      snapshot.undeliveredPings?.some((ping) => ping.agent_id === pingId || ping.task_id === pingId),
+      true,
+      "the ping enqueued during shutdown reached the final snapshot",
+    );
+  } finally {
+    for (const [key, value] of Object.entries(saved)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+    client?.close();
+    await stopDaemon(cwd);
+    await rm(cwd, { recursive: true, force: true });
+  }
+});
+
 test("shutdown writes the final snapshot before removing the socket, pid, and lock", { timeout: 20_000 }, async () => {
   const cwd = await mkdtemp(join(tmpdir(), "subagent-host-shutdown-order-"));
   const paths = hostPaths(cwd);

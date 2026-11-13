@@ -515,6 +515,15 @@ export class HostSession {
   }
 }
 
+/**
+ * Wait for in-flight completion notifiers. A settle can enqueue a ping after the final snapshot
+ * is captured, so shutdown drains here first and re-checks after each wait in case one settle
+ * started another notifier.
+ */
+export async function drainNotifierTasks(tasks: ReadonlySet<Promise<unknown>>): Promise<void> {
+  while (tasks.size > 0) await Promise.allSettled([...tasks]);
+}
+
 export async function runHost(): Promise<void> {
   const cwd = process.cwd();
   const agentsDirectory = process.env.SUBAGENT_MCP_AGENTS_DIR ?? join(cwd, ".subagents");
@@ -555,6 +564,7 @@ export async function runHost(): Promise<void> {
   const antigravity = new AntigravityAdapter();
   const cursor = new CursorAdapter();
   let endpoint: RunningHost | undefined;
+  const notifierTasks = new Set<Promise<unknown>>();
   const supervisor = new SupervisorClass({
     registry: live,
     adapters: new AdapterRegistry([claude, codex, opencode, antigravity, cursor]),
@@ -567,12 +577,14 @@ export async function runHost(): Promise<void> {
     onDetachedSettled: (result) => {
       // A probe/CLI socket is not a consumer; only an attached session counts. If none are
       // attached (or the writes failed), persist the ping for the next attach_session instead.
-      void (async () => {
+      const task = (async () => {
         const delivered = endpoint === undefined
           ? 0
           : await endpoint.notify({ event: "detached", data: result }).catch(() => 0);
         if (delivered === 0) await supervisor.enqueueUndeliveredPing(result).catch(() => undefined);
       })();
+      notifierTasks.add(task);
+      void task.finally(() => notifierTasks.delete(task));
     },
   });
   live.watch(() => {
@@ -617,6 +629,9 @@ export async function runHost(): Promise<void> {
     clearInterval(updateTimer);
     clearInterval(livenessTimer);
     live.close();
+    // Let notifiers that are still running enqueue their ping before the final snapshot, and stop
+    // scheduled work so no task can launch between the snapshot and process exit.
+    await drainNotifierTasks(notifierTasks);
     await Promise.all([
       claude.closeAll(),
       codex.closeAll(),
