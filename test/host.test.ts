@@ -861,6 +861,52 @@ test("shutdown waits for an in-flight settle before writing the final snapshot",
   }
 });
 
+test("shutdown drains pings from agents interrupted by closeAll before the final snapshot", { timeout: 20_000 }, async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "subagent-host-closeall-shutdown-"));
+  const paths = hostPaths(cwd);
+  const orderPath = join(cwd, "shutdown-closeall-order.json");
+  const fixture = pathToFileURL(join(process.cwd(), "test", "shutdown-closeall-fixture.mjs")).href;
+  const saved = {
+    NODE_OPTIONS: process.env.NODE_OPTIONS,
+    SUBAGENT_TEST_PING_DELAY_MS: process.env.SUBAGENT_TEST_PING_DELAY_MS,
+    SUBAGENT_TEST_PING_ID: process.env.SUBAGENT_TEST_PING_ID,
+    SUBAGENT_TEST_ORDER_PATH: process.env.SUBAGENT_TEST_ORDER_PATH,
+  };
+  const pingId = "task-closeall-race";
+  process.env.NODE_OPTIONS = `${saved.NODE_OPTIONS ?? ""} --import=${fixture}`.trim();
+  process.env.SUBAGENT_TEST_PING_DELAY_MS = "300";
+  process.env.SUBAGENT_TEST_PING_ID = pingId;
+  process.env.SUBAGENT_TEST_ORDER_PATH = orderPath;
+  let client: HostClient | undefined;
+  try {
+    client = await connectHost(daemonOptions(cwd));
+    const hello = await client.call("hello") as { pid: number };
+    await client.call("shutdown");
+    client.close();
+    client = undefined;
+    await waitForPidExit(hello.pid);
+
+    const snapshot = JSON.parse(await readFile(paths.snapshotPath, "utf8")) as {
+      undeliveredPings?: { agent_id?: string; task_id?: string }[];
+    };
+    assert.equal(
+      snapshot.undeliveredPings?.some((ping) => ping.agent_id === pingId || ping.task_id === pingId),
+      true,
+      "the ping settled by closeAll reached the final snapshot",
+    );
+    const order = JSON.parse(await readFile(orderPath, "utf8")) as string[];
+    assert.deepEqual(order.slice(-3), ["quiesce", "closeAll", "flush"], "closeAll runs before the notifier drain");
+  } finally {
+    for (const [key, value] of Object.entries(saved)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+    client?.close();
+    await stopDaemon(cwd);
+    await rm(cwd, { recursive: true, force: true });
+  }
+});
+
 test("shutdown writes the final snapshot before removing the socket, pid, and lock", { timeout: 20_000 }, async () => {
   const cwd = await mkdtemp(join(tmpdir(), "subagent-host-shutdown-order-"));
   const paths = hostPaths(cwd);

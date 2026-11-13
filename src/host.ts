@@ -684,9 +684,8 @@ export async function runHost(): Promise<void> {
     clearInterval(updateTimer);
     clearInterval(livenessTimer);
     live.close();
-    // Let notifiers that are still running enqueue their ping before the final snapshot, and stop
-    // scheduled work so no task can launch between the snapshot and process exit.
-    await drainNotifierTasks(notifierTasks);
+    // Stop scheduled work first, then interrupt live agents. Their settle pings fire after
+    // closeAll(), so drain notifiers after it and before the final snapshot.
     await supervisor.quiesce();
     await Promise.all([
       claude.closeAll(),
@@ -695,6 +694,7 @@ export async function runHost(): Promise<void> {
       antigravity.closeAll(),
       cursor.closeAll(),
     ]).catch(() => undefined);
+    await drainNotifierTasks(notifierTasks);
     const ownsPaths = await ownsHostPaths(paths, process.pid);
     // Persist the final snapshot before closing the endpoint or removing the socket/pid/lock. Once
     // those are gone a replacement host can start, and it must not later be overwritten by ours.
