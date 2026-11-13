@@ -11,7 +11,7 @@ import { FakeAdapter } from "../src/adapters/fake.js";
 import { LiveConfig } from "../src/config/live.js";
 import { ConfigRegistry } from "../src/config/registry.js";
 import type { AgentConfig, ModelRoster } from "../src/config/schema.js";
-import { buildInfo, connectHost, HOST_PROTOCOL, hostDisposition, hostPaths, HostClient, HostSession, serveHost } from "../src/host.js";
+import { buildInfo, connectHost, drainNotifierTasks, HOST_PROTOCOL, hostDisposition, hostPaths, HostClient, HostSession, sendSocketMessage, serveHost } from "../src/host.js";
 import { attachSessionAfterInitialize } from "../src/session.js";
 import { Supervisor } from "../src/supervisor.js";
 
@@ -351,6 +351,39 @@ async function withBuildEnv<T>(env: Record<string, string | undefined>, body: ()
 }
 
 const buildEnv = (id: string, time: number) => ({ SUBAGENT_MCP_BUILD_ID: id, SUBAGENT_MCP_BUILD_TIME: String(time) });
+
+test("a stalled socket write is bounded and destroys that peer", async () => {
+  const keepAlive = setTimeout(() => undefined, 200);
+  let destroyed = false;
+  const stalled = {
+    destroyed: false,
+    writable: true,
+    write: () => true, // never invokes the completion callback, like a peer that stopped reading
+    destroy: () => { destroyed = true; },
+  };
+  try {
+    const started = Date.now();
+    const delivered = await sendSocketMessage(stalled, { event: "detached", data: {} }, 20);
+    assert.equal(delivered, false, "a write that never completes resolves false");
+    assert.equal(destroyed, true, "the stalled peer is destroyed so later writes do not queue up");
+    assert.ok(Date.now() - started < 1_000, "the timeout bounds the wait");
+  } finally {
+    clearTimeout(keepAlive);
+  }
+});
+
+test("draining in-flight notifier tasks is bounded so shutdown always proceeds", async () => {
+  const keepAlive = setTimeout(() => undefined, 200);
+  const never = new Promise<void>(() => undefined);
+  const tasks = new Set<Promise<unknown>>([never]);
+  try {
+    const started = Date.now();
+    await drainNotifierTasks(tasks, 20);
+    assert.ok(Date.now() - started < 1_000, "a hung notifier does not hold the drain forever");
+  } finally {
+    clearTimeout(keepAlive);
+  }
+});
 
 test("hostDisposition: replace only an older, idle host no other session uses; never downgrade", () => {
   const local = { build: "new", builtAt: 2_000 };

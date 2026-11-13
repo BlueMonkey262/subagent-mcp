@@ -115,6 +115,55 @@ const CONNECT_WAIT_MS = 8_000;
 const RECORDED_HOST_WAIT_MS = 2_000;
 /** Bound on re-flushing pings that were enqueued while an attach_session was already flushing. */
 const ATTACH_FLUSH_ROUNDS = 5;
+/** Bound on one socket write to a ping consumer; a peer that stops reading is dropped. */
+export const SEND_TIMEOUT_MS = 5_000;
+/** Bound on waiting for in-flight completion notifiers before the host exits. */
+export const NOTIFIER_DRAIN_TIMEOUT_MS = 3_000;
+/** Delay before retrying pings still queued when a bounded attach flush ends. */
+export const ATTACH_REDELIVER_DELAY_MS = 1_000;
+
+/** The part of a net.Socket this module needs, so a stalled peer can be tested without a real socket. */
+export interface WritablePeer {
+  readonly destroyed: boolean;
+  readonly writable: boolean;
+  write(data: string, callback?: (error?: Error | null) => void): boolean;
+  destroy(): unknown;
+}
+
+/**
+ * Write one newline-delimited message, resolving false if the peer stalls past the timeout (then
+ * destroying it). A peer that stops reading would otherwise never complete the write callback.
+ */
+export function sendSocketMessage(
+  socket: WritablePeer,
+  message: Readonly<Record<string, unknown>>,
+  timeoutMs = SEND_TIMEOUT_MS,
+): Promise<boolean> {
+  return new Promise((resolve) => {
+    if (socket.destroyed || !socket.writable) {
+      resolve(false);
+      return;
+    }
+    let timer: NodeJS.Timeout | undefined;
+    let settled = false;
+    const finish = (delivered: boolean): void => {
+      if (settled) return;
+      settled = true;
+      if (timer !== undefined) clearTimeout(timer);
+      resolve(delivered);
+    };
+    timer = setTimeout(() => {
+      finish(false);
+      socket.destroy();
+    }, timeoutMs);
+    timer.unref();
+    try {
+      socket.write(`${JSON.stringify(message)}\n`, (error?: Error | null) => finish(error === undefined || error === null));
+    } catch {
+      finish(false);
+    }
+  });
+}
 
 /** True while the host must stay up: live agents, capacity waiters, or queued/scheduled tasks. */
 export function hasLiveWork(
@@ -183,17 +232,7 @@ export async function serveHost(options: {
   const sockets = new Set<Socket>();
   const attached = new Set<Socket>();
   let shuttingDown = false;
-  const send = (socket: Socket, message: Readonly<Record<string, unknown>>): Promise<boolean> => new Promise((resolve) => {
-    if (socket.destroyed || !socket.writable) {
-      resolve(false);
-      return;
-    }
-    try {
-      socket.write(`${JSON.stringify(message)}\n`, (error?: Error | null) => resolve(error === undefined || error === null));
-    } catch {
-      resolve(false);
-    }
-  });
+  const send = sendSocketMessage;
   const broadcast = async (message: Readonly<Record<string, unknown>>): Promise<number> => {
     const targets = [...attached].filter((socket) => !socket.destroyed && socket.writable);
     const results = await Promise.all(targets.map((socket) => send(socket, message)));
@@ -516,12 +555,28 @@ export class HostSession {
 }
 
 /**
- * Wait for in-flight completion notifiers. A settle can enqueue a ping after the final snapshot
- * is captured, so shutdown drains here first and re-checks after each wait in case one settle
- * started another notifier.
+ * Wait for in-flight completion notifiers, bounded so a stuck notifier cannot hold shutdown open.
+ * A settle can enqueue a ping after the final snapshot is captured, so shutdown drains here and
+ * re-checks after each wait in case one settle started another notifier.
  */
-export async function drainNotifierTasks(tasks: ReadonlySet<Promise<unknown>>): Promise<void> {
-  while (tasks.size > 0) await Promise.allSettled([...tasks]);
+export async function drainNotifierTasks(
+  tasks: ReadonlySet<Promise<unknown>>,
+  timeoutMs = NOTIFIER_DRAIN_TIMEOUT_MS,
+): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (tasks.size > 0) {
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) return;
+    let timer: NodeJS.Timeout | undefined;
+    await Promise.race([
+      Promise.allSettled([...tasks]),
+      new Promise<void>((resolve) => {
+        timer = setTimeout(resolve, remaining);
+        timer.unref();
+      }),
+    ]);
+    if (timer !== undefined) clearTimeout(timer);
+  }
 }
 
 export async function runHost(): Promise<void> {
