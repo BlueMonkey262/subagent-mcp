@@ -214,6 +214,8 @@ function canonicalPath(path: string): string {
 export interface RunningHost {
   /** Broadcast a ping to attached sessions; resolves with how many sockets the write completed on. */
   notify(message: Readonly<Record<string, unknown>>): Promise<number>;
+  /** Retry pings still queued (for example after a bounded attach flush) to attached sessions. */
+  redeliverQueued(): Promise<void>;
   close(): Promise<void>;
   /** Raw socket count, including probes and CLI clients that never attached. */
   readonly clients: number;
@@ -238,6 +240,30 @@ export async function serveHost(options: {
     const results = await Promise.all(targets.map((socket) => send(socket, message)));
     return results.filter((delivered) => delivered).length;
   };
+  let redeliverTimer: NodeJS.Timeout | undefined;
+  const redeliverQueued = async (): Promise<void> => {
+    if (options.supervisor.undeliveredPingCount() === 0) return;
+    for (const socket of [...attached]) {
+      if (socket.destroyed || !socket.writable) {
+        attached.delete(socket);
+        continue;
+      }
+      try {
+        await options.supervisor.flushUndeliveredPings((result) => send(socket, { event: "detached", data: result }));
+      } catch {
+        continue;
+      }
+      if (options.supervisor.undeliveredPingCount() === 0) return;
+    }
+  };
+  const scheduleRedeliver = (): void => {
+    if (redeliverTimer !== undefined) return;
+    redeliverTimer = setTimeout(() => {
+      redeliverTimer = undefined;
+      void redeliverQueued().catch(() => undefined);
+    }, ATTACH_REDELIVER_DELAY_MS);
+    redeliverTimer.unref();
+  };
   const attach = async (socket: Socket): Promise<Readonly<Record<string, unknown>>> => {
     // Register before flushing so a ping that settles during the flush broadcasts to this socket
     // instead of finding no consumer and being queued behind the copy that flush already took.
@@ -257,6 +283,9 @@ export async function serveHost(options: {
       attached.delete(socket);
       throw error;
     }
+    // The bounded rounds can end with the queue still non-empty (writes failing while the socket
+    // stays writable, or notifiers adding pings across rounds). Retry once shortly after attach.
+    if (options.supervisor.undeliveredPingCount() > 0 && attached.has(socket)) scheduleRedeliver();
     return { attached: true, delivered, attached_sessions: attached.size };
   };
   const server: Server = createServer((socket) => {
@@ -305,7 +334,12 @@ export async function serveHost(options: {
     notify(message) {
       return broadcast(message);
     },
+    redeliverQueued,
     close() {
+      if (redeliverTimer !== undefined) {
+        clearTimeout(redeliverTimer);
+        redeliverTimer = undefined;
+      }
       for (const socket of sockets) socket.destroy();
       sockets.clear();
       attached.clear();
@@ -636,7 +670,13 @@ export async function runHost(): Promise<void> {
         const delivered = endpoint === undefined
           ? 0
           : await endpoint.notify({ event: "detached", data: result }).catch(() => 0);
-        if (delivered === 0) await supervisor.enqueueUndeliveredPing(result).catch(() => undefined);
+        if (delivered === 0) {
+          await supervisor.enqueueUndeliveredPing(result).catch(() => undefined);
+          // The session is attached but the broadcast write failed; retry from the persisted queue.
+          if (endpoint !== undefined && endpoint.attached > 0) {
+            await endpoint.redeliverQueued().catch(() => undefined);
+          }
+        }
       })();
       notifierTasks.add(task);
       void task.finally(() => notifierTasks.delete(task));

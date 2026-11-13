@@ -288,6 +288,40 @@ test("a ping enqueued while attach_session flushes is delivered to that socket, 
   }
 });
 
+test("an attach that exhausts its flush rounds re-delivers leftovers to the attached socket", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "delayed-attach-redeliver-"));
+  const { supervisor } = fixture();
+  const paths = hostPaths(cwd);
+  await supervisor.enqueueUndeliveredPing({
+    agent_id: "leftover", backend: "codex", status: "completed", result: "leftover",
+  });
+  const endpoint = await serveHost({ socketPath: paths.socketPath, supervisor });
+  const client = await HostClient.connect(paths.socketPath);
+  const received: Readonly<Record<string, unknown>>[] = [];
+  client.onDetached((data) => received.push(data));
+  const original = supervisor.flushUndeliveredPings.bind(supervisor);
+  let attempts = 0;
+  // Fail every write during the bounded attach rounds, then let the scheduled retry succeed.
+  supervisor.flushUndeliveredPings = async (deliver) => {
+    attempts += 1;
+    return attempts <= 5 ? 0 : original(deliver);
+  };
+  try {
+    const attached = await client.call("attach_session") as { attached: boolean; delivered: number };
+    assert.equal(attached.attached, true);
+    assert.equal(attached.delivered, 0);
+    assert.equal(supervisor.undeliveredPingCount(), 1, "the bound left the queue non-empty");
+    await waitUntil(() => received.length === 1, 4_000);
+    assert.equal(received[0]?.["result"], "leftover");
+    assert.equal(supervisor.undeliveredPingCount(), 0, "the delayed re-delivery drained the queue");
+  } finally {
+    client.close();
+    await endpoint.close();
+    await rm(paths.socketPath, { force: true });
+    await rm(cwd, { recursive: true, force: true });
+  }
+});
+
 test("concurrent attaches deliver each queued ping exactly once", async () => {
   const cwd = await mkdtemp(join(tmpdir(), "delayed-concurrent-attach-"));
   const { supervisor } = fixture();
