@@ -301,6 +301,7 @@ export class Supervisor {
   readonly #usage: UsageLedger;
   readonly #updateCachePath: string | undefined;
   #persistencePath: string | undefined;
+  #persistenceClosed = false;
   #resultsStore: AppendOnlyJsonlStore<Record<string, unknown>> | undefined;
   #nameCursor = 0;
   #writes: Promise<void> = Promise.resolve();
@@ -1724,6 +1725,14 @@ export class Supervisor {
     await this.#writeSnapshot();
   }
 
+  /**
+   * Make later snapshot writes no-ops. Called after the host's final flush so a task that
+   * outlived quiesce cannot overwrite a replacement host's state when it finally settles.
+   */
+  closePersistence(): void {
+    this.#persistenceClosed = true;
+  }
+
   async recoverResults(): Promise<void> {
     if (!this.#persistencePath) return;
     await this.#resultsStore!.repairTail();
@@ -1754,14 +1763,27 @@ export class Supervisor {
   }
 
   restorePending(tasks: readonly PendingTask[]): void {
+    const rerun = new Set<string>();
     for (const task of tasks) {
-      if (task.state === 'starting') this.#setTaskState(task, 'interrupted');
+      if (task.state === 'starting') {
+        const record = [...this.#agents.values()].find(agent => agent.meta.queued_from === task.id);
+        if (record !== undefined) {
+          // The agent launched before the snapshot, so the task did settle even if its own state
+          // update never made it to disk.
+          this.#setTaskState(task, 'completed');
+          task.result = { agent_id: record.id };
+        } else {
+          // No agent record means spawnAgent never launched; run the task instead of losing it.
+          this.#setTaskState(task, 'queued');
+          rerun.add(task.id);
+        }
+      }
       this.#pending.set(task.id, task);
     }
-    let changed = false;
+    let changed = rerun.size > 0;
     for (const task of tasks) {
       if (task.state !== 'queued') continue;
-      if (task.start_at !== undefined) {
+      if (task.start_at !== undefined && !rerun.has(task.id)) {
         const due = Date.parse(task.start_at);
         const lateMs = Date.now() - due;
         if (Number.isFinite(due) && lateMs > this.#scheduledGraceMs) {
@@ -1944,12 +1966,14 @@ export class Supervisor {
   }
 
   #writeSnapshot(): Promise<void> {
+    if (this.#persistenceClosed) return Promise.resolve();
     const operation = this.#writes.then(() => this.#saveSnapshot());
     this.#writes = operation.catch(error => { this.#storageError = String(error); });
     return operation;
   }
 
   async #saveSnapshot(): Promise<void> {
+    if (this.#persistenceClosed) return;
     const path = this.#persistencePath;
     if (path === undefined) return;
     const body = `${JSON.stringify({

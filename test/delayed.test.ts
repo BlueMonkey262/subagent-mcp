@@ -564,6 +564,75 @@ test("a delayed task whose timer fires during shutdown stays queued and runs onc
   await restarted.supervisor.stopAgents([String(task["task_id"]), "task-late-check"]);
 });
 
+test("closePersistence stops snapshot writes after the final flush", async () => {
+  const path = join(await mkdtemp(join(tmpdir(), "delayed-closed-persistence-")), "sessions.json");
+  const { supervisor } = fixture();
+  supervisor.enablePersistence(path);
+  await supervisor.flushSnapshot();
+  const before = await readFile(path, "utf8");
+  supervisor.closePersistence();
+  await supervisor.enqueueUndeliveredPing({ agent_id: "too-late", backend: "codex", status: "completed" });
+  await supervisor.flushSnapshot();
+  assert.equal(await readFile(path, "utf8"), before, "no write may land after the final snapshot");
+});
+
+test("a starting task with no launched agent returns to queued and runs instead of being lost", async () => {
+  const path = join(await mkdtemp(join(tmpdir(), "delayed-starting-rerun-")), "sessions.json");
+  const { supervisor, adapter } = fixture();
+  adapter.queueScript(completeScript("completed", "recovered"));
+  supervisor.enablePersistence(path);
+  const taskId = "task-starting-lost";
+  const task = {
+    ...restoredTask(new Date(Date.now() - 2 * 3_600_000).toISOString(), taskId),
+    state: "starting",
+  };
+  supervisor.restorePending([task] as never);
+  await waitUntil(() => supervisor.listAgents().some((agent) =>
+    agent["queued_from"] === taskId && agent["state"] === "completed"));
+  assert.equal(adapter.spawnRequests.length, 1, "the task ran even though its start time was long past");
+  await supervisor.flushSnapshot();
+  const saved = JSON.parse(await readFile(path, "utf8")) as {
+    pending?: { id: string; state: string; result?: { agent_id?: string } }[];
+  };
+  const recovered = saved.pending?.find((pending) => pending.id === taskId);
+  assert.equal(recovered?.state, "completed", "the recovered task settled instead of staying interrupted");
+  assert.match(String(recovered?.result?.agent_id), /^fake-codex-agent-/);
+});
+
+test("a starting task whose agent record exists is completed and linked, not interrupted", async () => {
+  const path = join(await mkdtemp(join(tmpdir(), "delayed-starting-linked-")), "sessions.json");
+  const { supervisor, adapter } = fixture();
+  supervisor.enablePersistence(path);
+  const now = new Date().toISOString();
+  const taskId = "task-starting-linked";
+  supervisor.restore([{
+    id: "fake-codex-agent-linked",
+    name: "linked-agent",
+    backend: "codex",
+    model: "fake-model",
+    agentConfig: "general",
+    cwd: "/work",
+    state: "interrupted",
+    background: true,
+    createdAt: now,
+    updatedAt: now,
+    timeoutSeconds: null,
+    meta: { turn: 1, history: [], queued_from: taskId, queued_at: now },
+  }]);
+  supervisor.restorePending([{
+    ...restoredTask(now, taskId),
+    state: "starting",
+  }] as never);
+  await supervisor.flushSnapshot();
+  const saved = JSON.parse(await readFile(path, "utf8")) as {
+    pending?: { id: string; state: string; result?: { agent_id?: string } }[];
+  };
+  const task = saved.pending?.find((pending) => pending.id === taskId);
+  assert.equal(task?.state, "completed");
+  assert.equal(task?.result?.agent_id, "fake-codex-agent-linked");
+  assert.equal(adapter.spawnRequests.length, 0, "the already-launched task is not run twice");
+});
+
 test("a delayed task and a queued ping survive a host replacement", async () => {
   const cwd = await mkdtemp(join(tmpdir(), "delayed-replacement-"));
   const snapshotPath = join(cwd, "sessions.json");

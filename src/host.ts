@@ -699,6 +699,9 @@ export async function runHost(): Promise<void> {
     // Persist the final snapshot before closing the endpoint or removing the socket/pid/lock. Once
     // those are gone a replacement host can start, and it must not later be overwritten by ours.
     await supervisor.flushSnapshot().catch(() => undefined);
+    // Nothing may write after this point: a task that outlived quiesce must not race a replacement
+    // host with a stale snapshot.
+    supervisor.closePersistence();
     // net.Server.close() unlinks Unix sockets, so an orphan must exit without closing a replacement's path.
     if (ownsPaths) await endpoint?.close();
     if (ownsPaths && await ownsHostPaths(paths, process.pid)) {
