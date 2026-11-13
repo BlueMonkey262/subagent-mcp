@@ -678,6 +678,43 @@ test("a settle with only a probe connected is queued, then delivered on attach_s
   }
 });
 
+test("startup restores pending tasks and pings before enabling persistence", { timeout: 20_000 }, async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "subagent-host-startup-restore-"));
+  const paths = hostPaths(cwd);
+  const startAt = new Date(Date.now() + 3_600_000).toISOString();
+  await mkdir(paths.directory, { recursive: true });
+  await writeFile(paths.snapshotPath, `${JSON.stringify({
+    version: 1,
+    agents: [],
+    pending: [{
+      id: "task-restored",
+      created_at: new Date().toISOString(),
+      input: { agent: "general", prompt: "later", description: "later", run_in_background: true },
+      dependencies: [],
+      state: "queued",
+      start_at: startAt,
+      notify: "always",
+    }],
+    undeliveredPings: [{ agent_id: "old-agent", backend: "codex", status: "completed", result: "kept" }],
+  })}\n`);
+  let client: HostClient | undefined;
+  try {
+    client = await connectHost(daemonOptions(cwd));
+    await client.call("hello");
+    const saved = JSON.parse(await readFile(paths.snapshotPath, "utf8")) as {
+      pending?: { id: string }[];
+      undeliveredPings?: unknown[];
+    };
+    assert.equal(saved.pending?.length, 1, "startup recovery did not clobber the queued task");
+    assert.equal(saved.pending?.[0]?.id, "task-restored");
+    assert.equal(saved.undeliveredPings?.length, 1, "startup recovery did not clobber the queued ping");
+  } finally {
+    client?.close();
+    await stopDaemon(cwd);
+    await rm(cwd, { recursive: true, force: true });
+  }
+});
+
 test("shutdown writes the final snapshot before removing the socket, pid, and lock", { timeout: 20_000 }, async () => {
   const cwd = await mkdtemp(join(tmpdir(), "subagent-host-shutdown-order-"));
   const paths = hostPaths(cwd);

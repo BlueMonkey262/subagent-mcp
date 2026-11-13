@@ -510,12 +510,13 @@ export async function runHost(): Promise<void> {
     pending = snapshot.pending ?? [];
     undeliveredPings = snapshot.undeliveredPings ?? [];
   } catch(error) { if (!isErrno(error, 'ENOENT')) throw error; }
-  supervisor.enablePersistence(paths.snapshotPath);
-  await supervisor.recoverResults();
-  // Restore before pending tasks can settle: a MISSED_START ping emitted during restore must append to
-  // this queue, not be overwritten by it.
+  // Load queued state into memory before persistence is enabled: an interrupted startup must not
+  // write an empty snapshot over the pending tasks and pings still on disk.
   supervisor.restoreUndeliveredPings(undeliveredPings);
   supervisor.restorePending(pending);
+  supervisor.enablePersistence(paths.snapshotPath);
+  await supervisor.recoverResults();
+  await supervisor.flushSnapshot();
 
   const runUpdateCheck = (): void => {
     void checkForUpdate({ memoryDirectory: paths.directory }).catch(() => undefined);
