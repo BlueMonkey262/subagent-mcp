@@ -161,8 +161,8 @@ function canonicalPath(path: string): string {
 }
 
 export interface RunningHost {
-  /** Broadcast a ping to attached sessions; returns how many sockets it was written to. */
-  notify(message: Readonly<Record<string, unknown>>): number;
+  /** Broadcast a ping to attached sessions; resolves with how many sockets the write completed on. */
+  notify(message: Readonly<Record<string, unknown>>): Promise<number>;
   close(): Promise<void>;
   /** Raw socket count, including probes and CLI clients that never attached. */
   readonly clients: number;
@@ -179,18 +179,28 @@ export async function serveHost(options: {
   const sockets = new Set<Socket>();
   const attached = new Set<Socket>();
   let shuttingDown = false;
-  const send = (socket: Socket, message: Readonly<Record<string, unknown>>): void => {
-    socket.write(`${JSON.stringify(message)}\n`);
-  };
-  const broadcast = (message: Readonly<Record<string, unknown>>): number => {
-    for (const socket of attached) send(socket, message);
-    return attached.size;
+  const send = (socket: Socket, message: Readonly<Record<string, unknown>>): Promise<boolean> => new Promise((resolve) => {
+    if (socket.destroyed || !socket.writable) {
+      resolve(false);
+      return;
+    }
+    try {
+      socket.write(`${JSON.stringify(message)}\n`, (error?: Error | null) => resolve(error === undefined || error === null));
+    } catch {
+      resolve(false);
+    }
+  });
+  const broadcast = async (message: Readonly<Record<string, unknown>>): Promise<number> => {
+    const targets = [...attached].filter((socket) => !socket.destroyed && socket.writable);
+    const results = await Promise.all(targets.map((socket) => send(socket, message)));
+    return results.filter((delivered) => delivered).length;
   };
   const attach = async (socket: Socket): Promise<Readonly<Record<string, unknown>>> => {
-    attached.add(socket);
-    // Flush to the attaching socket only, and clear the persisted queue after the writes are issued.
+    // Flush to the attaching socket only. A ping is removed from the queue only after its write succeeds.
     const delivered = await options.supervisor.flushUndeliveredPings((result) => send(socket, { event: "detached", data: result }));
-    return { attached: true, delivered, attached_sessions: attached.size };
+    const consumer = !socket.destroyed && socket.writable;
+    if (consumer) attached.add(socket);
+    return { attached: consumer, delivered, attached_sessions: attached.size };
   };
   const server: Server = createServer((socket) => {
     sockets.add(socket);
@@ -472,9 +482,13 @@ export async function runHost(): Promise<void> {
     scheduledGraceMs: live.scheduledGraceMs(),
     onDetachedSettled: (result) => {
       // A probe/CLI socket is not a consumer; only an attached session counts. If none are
-      // attached, persist the ping for the next attach_session instead of dropping it.
-      const delivered = endpoint?.notify({ event: "detached", data: result }) ?? 0;
-      if (delivered === 0) void supervisor.enqueueUndeliveredPing(result).catch(() => undefined);
+      // attached (or the writes failed), persist the ping for the next attach_session instead.
+      void (async () => {
+        const delivered = endpoint === undefined
+          ? 0
+          : await endpoint.notify({ event: "detached", data: result }).catch(() => 0);
+        if (delivered === 0) await supervisor.enqueueUndeliveredPing(result).catch(() => undefined);
+      })();
     },
   });
   live.watch(() => {

@@ -638,8 +638,12 @@ test("a settle with only a probe connected is queued, then delivered on attach_s
     adapters: new AdapterRegistry([adapter]),
     cwd,
     onDetachedSettled: (result) => {
-      const delivered = endpoint?.notify({ event: "detached", data: result }) ?? 0;
-      if (delivered === 0) void supervisor.enqueueUndeliveredPing(result).catch(() => undefined);
+      void (async () => {
+        const delivered = endpoint === undefined
+          ? 0
+          : await endpoint.notify({ event: "detached", data: result }).catch(() => 0);
+        if (delivered === 0) await supervisor.enqueueUndeliveredPing(result).catch(() => undefined);
+      })();
     },
   });
   const paths = hostPaths(cwd);

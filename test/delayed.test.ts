@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
+import { once } from "node:events";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { createConnection } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -201,9 +203,55 @@ test("the offline ping queue is bounded and flushed at most once", async () => {
   supervisor.restoreUndeliveredPings(pings);
 
   const delivered: Readonly<Record<string, unknown>>[] = [];
-  assert.equal(await supervisor.flushUndeliveredPings((ping) => delivered.push(ping)), 100);
+  assert.equal(await supervisor.flushUndeliveredPings((ping) => { delivered.push(ping); }), 100);
   assert.equal(delivered[0]?.["agent_id"], "agent-50", "the oldest pings are dropped");
-  assert.equal(await supervisor.flushUndeliveredPings((ping) => delivered.push(ping)), 0, "a flush is at most once");
+  assert.equal(await supervisor.flushUndeliveredPings((ping) => { delivered.push(ping); }), 0, "a flush is at most once");
+});
+
+test("an attaching socket that closes mid-flush leaves pings queued for the next attach", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "delayed-mid-flush-"));
+  const snapshotPath = join(cwd, "sessions.json");
+  const { supervisor } = fixture();
+  supervisor.enablePersistence(snapshotPath);
+  const paths = hostPaths(cwd);
+  const endpoint = await serveHost({ socketPath: paths.socketPath, supervisor });
+  const raw = createConnection(paths.socketPath);
+  await once(raw, "connect");
+  try {
+    await supervisor.enqueueUndeliveredPing({ agent_id: "closing", backend: "codex", status: "completed", result: "retry" });
+    const original = supervisor.flushUndeliveredPings.bind(supervisor);
+    let first = true;
+    supervisor.flushUndeliveredPings = async (deliver) => {
+      if (first) {
+        first = false;
+        // Close the consumer while attach_session is still flushing to it.
+        raw.destroy();
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      }
+      return original(deliver);
+    };
+    raw.write(`${JSON.stringify({ id: 1, method: "attach_session" })}\n`);
+    await new Promise((resolve) => setTimeout(resolve, 150));
+
+    const saved = JSON.parse(await readFile(snapshotPath, "utf8")) as { undeliveredPings?: unknown[] };
+    assert.equal(saved.undeliveredPings?.length, 1, "the failed write did not remove the ping");
+
+    const client = await HostClient.connect(paths.socketPath);
+    const received: Readonly<Record<string, unknown>>[] = [];
+    client.onDetached((data) => received.push(data));
+    try {
+      await client.call("attach_session");
+      await waitUntil(() => received.length === 1);
+      assert.equal(received[0]?.["result"], "retry");
+    } finally {
+      client.close();
+    }
+  } finally {
+    raw.destroy();
+    await endpoint.close();
+    await rm(paths.socketPath, { force: true });
+    await rm(cwd, { recursive: true, force: true });
+  }
 });
 
 function restoredTask(startAt: string, id = "task-restored"): Record<string, unknown> {
@@ -357,8 +405,12 @@ test("pings with no attached session are queued, persisted, and flushed on attac
     adapters: new AdapterRegistry([adapter]),
     cwd,
     onDetachedSettled: (result) => {
-      const delivered = endpoint?.notify({ event: "detached", data: result }) ?? 0;
-      if (delivered === 0) void supervisor.enqueueUndeliveredPing(result);
+      void (async () => {
+        const delivered = endpoint === undefined
+          ? 0
+          : await endpoint.notify({ event: "detached", data: result }).catch(() => 0);
+        if (delivered === 0) await supervisor.enqueueUndeliveredPing(result);
+      })();
     },
   });
   supervisor.enablePersistence(snapshotPath);

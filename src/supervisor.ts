@@ -1765,15 +1765,28 @@ export class Supervisor {
     await this.#writeSnapshot();
   }
 
-  /** Clear the persisted queue before delivering, so a crash cannot replay a ping (at-most-once). */
-  async flushUndeliveredPings(deliver: (result: Readonly<Record<string, unknown>>) => void): Promise<number> {
+  /**
+   * Deliver queued pings, removing each entry only after its write reports success. Failed entries
+   * stay queued. A crash between a successful write and the snapshot can redeliver that ping.
+   */
+  async flushUndeliveredPings(
+    deliver: (result: Readonly<Record<string, unknown>>) => boolean | void | Promise<boolean | void>,
+  ): Promise<number> {
     if (this.#undeliveredPings.length === 0) return 0;
-    const queued = this.#undeliveredPings.splice(0, this.#undeliveredPings.length);
-    await this.#writeSnapshot().catch(() => undefined);
+    const queued = [...this.#undeliveredPings];
+    const delivered = new Set<Record<string, unknown>>();
     for (const result of queued) {
-      try { deliver(result); } catch { /* a failing notifier must not strand the rest */ }
+      try {
+        if (await deliver(result) !== false) delivered.add(result);
+      } catch {
+        // A failing notifier leaves this ping queued for the next attach.
+      }
     }
-    return queued.length;
+    if (delivered.size === 0) return 0;
+    // Remove exactly the entries that were delivered (by identity), keeping any added meanwhile.
+    this.#undeliveredPings = this.#undeliveredPings.filter(ping => !delivered.has(ping));
+    await this.#writeSnapshot().catch(() => undefined);
+    return delivered.size;
   }
 
   restoreUndeliveredPings(pings: unknown): void {

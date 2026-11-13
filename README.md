@@ -308,7 +308,8 @@ the outcome. See `src/channel.ts`.
 - **Offline queue.** If no attached Claude Code session is available when a background agent
   settles, the ping is persisted (up to 100, oldest dropped) and delivered after the next session
   completes the MCP initialize handshake and explicitly attaches. Probes and other MCP clients do
-  not drain it. Delivery is at most once.
+  not drain it. A ping is removed from the queue only after its socket write succeeds; a crash
+  between the write and the removal can redeliver it.
 - **Opt-in per session.** Channels are a research preview; a custom server is not on the
   allowlist, so start Claude Code with
   `claude --dangerously-load-development-channels server:subagent-mcp`. Without it Claude Code
@@ -352,13 +353,15 @@ Scheduled tasks and dependency queues are persisted in `.subagents/memory/sessio
 they survive a host restart. The host writes a final snapshot on shutdown, and the replacement
 host restores the queue and re-arms each timer. `list_agents` shows their `start_at` and
 `notify`; `restart_host` reports `scheduled_tasks_preserved`. Queued completion pings persist
-the same way and are delivered after the next session attaches (at most once).
+the same way and are delivered after the next session attaches. Delivered pings are removed
+after a successful socket write; a crash between the write and the removal can redeliver one.
 
 Limits: the host must be running (or restarted) to launch the job, and the machine must be awake.
 A sleeping machine starts the job when it wakes, subject to `scheduledGraceSeconds` (default
 3600). A task restored later than that grace window is marked `blocked` with a structured
 `MISSED_START` error instead of running late; reschedule it with a new `spawn_agent` call.
-Completion pings are delivered at most once.
+Delivered pings are removed after a successful socket write; a crash between the write and the
+removal can redeliver one.
 
 ### Long-running agents and workflows
 
