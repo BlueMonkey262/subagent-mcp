@@ -678,6 +678,75 @@ test("a settle with only a probe connected is queued, then delivered on attach_s
   }
 });
 
+test("a failed attach_session is retried and delivers queued pings", { timeout: 20_000 }, async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "subagent-host-attach-retry-"));
+  const supervisor = new Supervisor({ registry: registry(), adapters: new AdapterRegistry([new FakeAdapter("codex")]), cwd });
+  const paths = hostPaths(cwd);
+  const endpoint = await serveHost({ socketPath: paths.socketPath, supervisor });
+  const session = new HostSession(daemonOptions(cwd));
+  try {
+    await supervisor.enqueueUndeliveredPing({ agent_id: "retry", backend: "codex", status: "completed", result: "delivered" });
+    await session.connect();
+    const received: Readonly<Record<string, unknown>>[] = [];
+    session.onDetached((data) => received.push(data));
+    const original = supervisor.flushUndeliveredPings.bind(supervisor);
+    let attempts = 0;
+    supervisor.flushUndeliveredPings = async (deliver) => {
+      attempts += 1;
+      if (attempts === 1) throw new Error("temporary attach failure");
+      return original(deliver);
+    };
+
+    const attached = await session.attachSession() as { delivered: number };
+    assert.equal(attempts, 2, "the failed attach was retried once");
+    assert.equal(attached.delivered, 1);
+    await waitUntil(() => received.length === 1);
+    assert.equal(received[0]?.["result"], "delivered");
+  } finally {
+    session.close();
+    await endpoint.close();
+    await rm(paths.socketPath, { force: true });
+    await rm(cwd, { recursive: true, force: true });
+  }
+});
+
+test("a permanently failing attach_session logs once and does not spin", { timeout: 20_000 }, async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "subagent-host-attach-permanent-"));
+  const supervisor = new Supervisor({ registry: registry(), adapters: new AdapterRegistry([new FakeAdapter("codex")]), cwd });
+  const paths = hostPaths(cwd);
+  const endpoint = await serveHost({ socketPath: paths.socketPath, supervisor });
+  const session = new HostSession(daemonOptions(cwd));
+  const writes: string[] = [];
+  const originalWrite = process.stderr.write;
+  try {
+    await session.connect();
+    let attempts = 0;
+    supervisor.flushUndeliveredPings = async () => {
+      attempts += 1;
+      throw new Error("permanent attach failure");
+    };
+    process.stderr.write = ((chunk: string | Uint8Array) => {
+      writes.push(String(chunk));
+      return true;
+    }) as typeof process.stderr.write;
+    try {
+      await assert.rejects(session.attachSession(), /permanent attach failure/);
+    } finally {
+      process.stderr.write = originalWrite;
+    }
+    assert.equal(attempts, 5, "the retry is bounded");
+    assert.equal(writes.filter((line) => line.includes("attach_session failed")).length, 1);
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    assert.equal(attempts, 5, "no background retry loop after the final failure");
+  } finally {
+    process.stderr.write = originalWrite;
+    session.close();
+    await endpoint.close();
+    await rm(paths.socketPath, { force: true });
+    await rm(cwd, { recursive: true, force: true });
+  }
+});
+
 test("startup restores pending tasks and pings before enabling persistence", { timeout: 20_000 }, async () => {
   const cwd = await mkdtemp(join(tmpdir(), "subagent-host-startup-restore-"));
   const paths = hostPaths(cwd);

@@ -305,6 +305,8 @@ export async function connectHost(options: {
 }
 
 const RESTART_EXIT_WAIT_MS = 10_000;
+/** Bounded retry backoff for the attach_session handshake. */
+const ATTACH_RETRY_DELAYS_MS = [250, 500, 1_000, 2_000] as const;
 
 /**
  * The proxy's connection to its project host, and the one place that replaces it. Owns the client
@@ -314,6 +316,9 @@ export class HostSession {
   #client: HostClient | undefined;
   #error: Error | undefined;
   #wantsAttach = false;
+  #attached = false;
+  #attachInFlight: Promise<unknown> | undefined;
+  #attachFailureLogged = false;
   readonly #detached: ((data: Readonly<Record<string, unknown>>) => void)[] = [];
 
   constructor(readonly options: Parameters<typeof connectHost>[0]) {}
@@ -334,7 +339,11 @@ export class HostSession {
    */
   async attachSession(): Promise<unknown> {
     this.#wantsAttach = true;
-    return this.call("attach_session", undefined, 5_000);
+    const client = this.#client;
+    if (client === undefined) {
+      throw this.#error ?? new Error("subagent-mcp host is not connected. Ask the user to run `/mcp` and then reconnect subagent-mcp.");
+    }
+    return this.#startAttach(client);
   }
 
   onDetached(listener: (data: Readonly<Record<string, unknown>>) => void): void {
@@ -343,10 +352,17 @@ export class HostSession {
   }
 
   async call(method: string, params?: unknown, timeoutMs = 0): Promise<unknown> {
-    if (this.#client === undefined) {
+    const client = this.#client;
+    if (client === undefined) {
       throw this.#error ?? new Error("subagent-mcp host is not connected. Ask the user to run `/mcp` and then reconnect subagent-mcp.");
     }
-    return this.#client.call(method, params, timeoutMs);
+    const result = await client.call(method, params, timeoutMs);
+    if (method === "hello" && isRecord(result) && result["attached"] === 0) this.#attached = false;
+    // A failed attach must not strand this connection for good: retry after the next successful call.
+    if (this.#wantsAttach && !this.#attached && this.#attachInFlight === undefined) {
+      void this.#startAttach(client).catch(() => undefined);
+    }
+    return result;
   }
 
   /** Why the connected host's code differs from this proxy's, if it does. */
@@ -420,15 +436,64 @@ export class HostSession {
   #attach(client: HostClient): void {
     this.#client = client;
     this.#error = undefined;
+    this.#attached = false;
+    this.#attachInFlight = undefined;
     for (const listener of this.#detached) client.onDetached(listener);
     if (this.#wantsAttach) {
       // The replacement host restored queued pings; consume them on this connection too.
-      void client.call("attach_session", undefined, 5_000).catch(() => undefined);
+      void this.#startAttach(client).catch(() => undefined);
     }
+  }
+
+  #startAttach(client: HostClient): Promise<unknown> {
+    if (this.#attachInFlight !== undefined) return this.#attachInFlight;
+    const run = this.#attachWithRetry(client);
+    const tracked = run.then(
+      (result) => {
+        if (this.#attachInFlight === tracked) this.#attachInFlight = undefined;
+        return result;
+      },
+      (error: unknown) => {
+        if (this.#attachInFlight === tracked) this.#attachInFlight = undefined;
+        throw error;
+      },
+    );
+    this.#attachInFlight = tracked;
+    return tracked;
+  }
+
+  async #attachWithRetry(client: HostClient): Promise<unknown> {
+    let lastError: unknown;
+    for (let attempt = 0; attempt <= ATTACH_RETRY_DELAYS_MS.length; attempt += 1) {
+      if (this.#client !== client) throw new Error("subagent-mcp host connection changed before attach");
+      try {
+        const result = await client.call("attach_session", undefined, 5_000);
+        if (this.#client !== client) throw new Error("subagent-mcp host connection changed before attach");
+        this.#attached = true;
+        this.#attachFailureLogged = false;
+        return result;
+      } catch (error) {
+        lastError = error;
+        const wait = ATTACH_RETRY_DELAYS_MS[attempt];
+        if (wait === undefined) break;
+        await delay(wait);
+      }
+    }
+    this.#attached = false;
+    if (!this.#attachFailureLogged) {
+      this.#attachFailureLogged = true;
+      process.stderr.write(
+        `subagent-mcp: attach_session failed after ${ATTACH_RETRY_DELAYS_MS.length + 1} attempts: ` +
+          `${lastError instanceof Error ? lastError.message : String(lastError)}\n`,
+      );
+    }
+    throw lastError;
   }
 
   #fail(error: unknown): void {
     this.#client = undefined;
+    this.#attached = false;
+    this.#attachInFlight = undefined;
     const message = error instanceof Error ? error.message : String(error);
     this.#error = new Error(message.includes("/mcp") ? message : `${message} Ask the user to run \`/mcp\` and then reconnect subagent-mcp.`);
   }
