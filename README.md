@@ -353,15 +353,17 @@ Scheduled tasks and dependency queues are persisted in `.subagents/memory/sessio
 they survive a host restart. The host writes a final snapshot on shutdown, and the replacement
 host restores the queue and re-arms each timer. `list_agents` shows their `start_at` and
 `notify`; `restart_host` reports `scheduled_tasks_preserved`. Queued completion pings persist
-the same way and are delivered after the next session attaches. Delivered pings are removed
-after a successful socket write; a crash between the write and the removal can redeliver one.
+the same way and are delivered after the next session attaches. Concurrent attaches are
+serialized, so each queued ping is delivered to exactly one session. Shutdown waits for
+in-flight completion pings and stops scheduled tasks before writing the final snapshot, so a
+task that comes due during shutdown stays queued for the replacement host. Delivered pings are
+removed after a successful socket write; a crash between the write and the removal can
+redeliver one.
 
 Limits: the host must be running (or restarted) to launch the job, and the machine must be awake.
 A sleeping machine starts the job when it wakes, subject to `scheduledGraceSeconds` (default
 3600). A task restored later than that grace window is marked `blocked` with a structured
 `MISSED_START` error instead of running late; reschedule it with a new `spawn_agent` call.
-Delivered pings are removed after a successful socket write; a crash between the write and the
-removal can redeliver one.
 
 ### Long-running agents and workflows
 

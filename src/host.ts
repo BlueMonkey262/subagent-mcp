@@ -632,6 +632,7 @@ export async function runHost(): Promise<void> {
     // Let notifiers that are still running enqueue their ping before the final snapshot, and stop
     // scheduled work so no task can launch between the snapshot and process exit.
     await drainNotifierTasks(notifierTasks);
+    await supervisor.quiesce();
     await Promise.all([
       claude.closeAll(),
       codex.closeAll(),

@@ -307,6 +307,8 @@ export class Supervisor {
   #storageError: string | undefined;
   #pending = new Map<string, PendingTask>();
   #taskTimers = new Map<string, NodeJS.Timeout>();
+  #taskRuns = new Set<Promise<void>>();
+  #stopping = false;
   #undeliveredPings: Record<string, unknown>[] = [];
   #pingFlush: Promise<void> = Promise.resolve();
   #changes = new Set<() => void>();
@@ -352,6 +354,29 @@ export class Supervisor {
   /** True while queued work (including a time-delayed task) still needs this host alive. */
   hasPendingWork(): boolean {
     return [...this.#pending.values()].some(task => task.state === 'queued' || task.state === 'starting');
+  }
+
+  /**
+   * Stop launching queued work before the host exits: clear scheduled timers and refuse new
+   * starts, then wait (bounded) for tasks already launching. Queued tasks stay queued so the
+   * next host starts them exactly once instead of this one racing the final snapshot.
+   */
+  async quiesce(timeoutMs = 5_000): Promise<void> {
+    this.#stopping = true;
+    for (const id of [...this.#taskTimers.keys()]) this.#clearTaskTimer(id);
+    if (this.#taskRuns.size === 0) return;
+    let timer: NodeJS.Timeout | undefined;
+    try {
+      await Promise.race([
+        Promise.allSettled([...this.#taskRuns]),
+        new Promise<void>((resolve) => {
+          timer = setTimeout(resolve, timeoutMs);
+          timer.unref();
+        }),
+      ]);
+    } finally {
+      if (timer !== undefined) clearTimeout(timer);
+    }
   }
 
   /** Replace the per-backend and per-model pools after a live config reload. */
@@ -719,6 +744,7 @@ export class Supervisor {
 
   async #runTask(task: PendingTask) {
     const run = async () => {
+      if (this.#stopping) { this.#changes.delete(check); this.#clearTaskTimer(task.id); return; }
       if (task.state !== 'queued') { this.#changes.delete(check); this.#clearTaskTimer(task.id); return; }
       if (task.start_at !== undefined) {
         const due = Date.parse(task.start_at);
@@ -734,6 +760,8 @@ export class Supervisor {
       if (results.some(r => !r)) return;
       this.#changes.delete(check);
       this.#clearTaskTimer(task.id);
+      // A shutdown may have begun while the timer/readiness check was running.
+      if (this.#stopping) return;
       if (results.some(r => r!.status !== 'completed' || r!.validation_errors)) { this.#setTaskState(task, 'blocked'); await this.#writeSnapshot(); this.#changed(); return; }
       this.#setTaskState(task, 'starting');
       await this.#writeSnapshot();
@@ -748,7 +776,11 @@ export class Supervisor {
       } catch(error) { this.#setTaskState(task, 'blocked'); task.result = { error: String(error) }; }
       await this.#writeSnapshot(); this.#changed();
     };
-    const check = () => { void run().catch(error => { this.#setTaskState(task, 'blocked'); task.result = { error: String(error) }; this.#changed(); }); };
+    const check = () => {
+      const running = run().catch(error => { this.#setTaskState(task, 'blocked'); task.result = { error: String(error) }; this.#changed(); });
+      this.#taskRuns.add(running);
+      void running.finally(() => this.#taskRuns.delete(running));
+    };
     this.#changes.add(check); check();
   }
 

@@ -535,6 +535,35 @@ test("pings with no attached session are queued, persisted, and flushed on attac
   }
 });
 
+test("a delayed task whose timer fires during shutdown stays queued and runs once on restart", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout", "Date"] });
+  const path = join(await mkdtemp(join(tmpdir(), "delayed-shutdown-")), "sessions.json");
+  const first = fixture();
+  first.supervisor.enablePersistence(path);
+  const task = await first.supervisor.spawnAgent({ ...spawn, delay_seconds: 5 });
+
+  // Shutdown begins (quiesce runs) and then the scheduled timer fires; it must not launch.
+  const quiescing = first.supervisor.quiesce();
+  t.mock.timers.tick(5_000);
+  await quiescing;
+  // A readiness check that starts after shutdown began must also refuse to launch.
+  first.supervisor.restorePending([
+    restoredTask(new Date(Date.now() - 60_000).toISOString(), "task-late-check"),
+  ] as never);
+  await flush();
+  assert.equal(first.adapter.spawnRequests.length, 0, "shutdown refused to start either task");
+  await first.supervisor.flushSnapshot();
+
+  const saved = JSON.parse(await readFile(path, "utf8")) as { pending: { id: string; state: string }[] };
+  assert.deepEqual(saved.pending.map((pending) => pending.state), ["queued", "queued"], "the final snapshot keeps both tasks queued");
+
+  const restarted = fixture();
+  restarted.supervisor.restorePending(saved.pending as never);
+  await flush();
+  assert.equal(restarted.adapter.spawnRequests.length, 2, "the restarted host ran each task exactly once");
+  await restarted.supervisor.stopAgents([String(task["task_id"]), "task-late-check"]);
+});
+
 test("a delayed task and a queued ping survive a host replacement", async () => {
   const cwd = await mkdtemp(join(tmpdir(), "delayed-replacement-"));
   const snapshotPath = join(cwd, "sessions.json");
