@@ -113,6 +113,8 @@ export function hostDisposition(hello: HostHello, local: BuildInfo): HostDisposi
 const IDLE_EXIT_MS = 60_000;
 const CONNECT_WAIT_MS = 8_000;
 const RECORDED_HOST_WAIT_MS = 2_000;
+/** Bound on re-flushing pings that were enqueued while an attach_session was already flushing. */
+const ATTACH_FLUSH_ROUNDS = 5;
 
 /** True while the host must stay up: live agents, capacity waiters, or queued/scheduled tasks. */
 export function hasLiveWork(
@@ -198,11 +200,25 @@ export async function serveHost(options: {
     return results.filter((delivered) => delivered).length;
   };
   const attach = async (socket: Socket): Promise<Readonly<Record<string, unknown>>> => {
-    // Flush to the attaching socket only. A ping is removed from the queue only after its write succeeds.
-    const delivered = await options.supervisor.flushUndeliveredPings((result) => send(socket, { event: "detached", data: result }));
-    const consumer = !socket.destroyed && socket.writable;
-    if (consumer) attached.add(socket);
-    return { attached: consumer, delivered, attached_sessions: attached.size };
+    // Register before flushing so a ping that settles during the flush broadcasts to this socket
+    // instead of finding no consumer and being queued behind the copy that flush already took.
+    attached.add(socket);
+    let delivered = 0;
+    try {
+      for (let attempt = 0; attempt < ATTACH_FLUSH_ROUNDS; attempt += 1) {
+        delivered += await options.supervisor.flushUndeliveredPings((result) => send(socket, { event: "detached", data: result }));
+        if (socket.destroyed || !socket.writable) {
+          attached.delete(socket);
+          return { attached: false, delivered, attached_sessions: attached.size };
+        }
+        // A settle may have enqueued a ping after this flush copied the queue; drain that too.
+        if (options.supervisor.undeliveredPingCount() === 0) break;
+      }
+    } catch (error) {
+      attached.delete(socket);
+      throw error;
+    }
+    return { attached: true, delivered, attached_sessions: attached.size };
   };
   const server: Server = createServer((socket) => {
     sockets.add(socket);

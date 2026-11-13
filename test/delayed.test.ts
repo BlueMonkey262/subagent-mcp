@@ -254,6 +254,40 @@ test("an attaching socket that closes mid-flush leaves pings queued for the next
   }
 });
 
+test("a ping enqueued while attach_session flushes is delivered to that socket, not stranded", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "delayed-attach-race-"));
+  const { supervisor } = fixture();
+  const paths = hostPaths(cwd);
+  const endpoint = await serveHost({ socketPath: paths.socketPath, supervisor });
+  const client = await HostClient.connect(paths.socketPath);
+  const received: Readonly<Record<string, unknown>>[] = [];
+  client.onDetached((data) => received.push(data));
+  try {
+    const original = supervisor.flushUndeliveredPings.bind(supervisor);
+    let injected = false;
+    supervisor.flushUndeliveredPings = async (deliver) => {
+      const delivered = await original(deliver);
+      if (!injected) {
+        injected = true;
+        // Simulate a settle after the flush copied the queue but before attach registered the socket.
+        await supervisor.enqueueUndeliveredPing({
+          agent_id: "racing", backend: "codex", status: "completed", result: "late",
+        });
+      }
+      return delivered;
+    };
+
+    await client.call("attach_session");
+    await waitUntil(() => received.some((ping) => ping["result"] === "late"));
+    assert.equal(received.filter((ping) => ping["result"] === "late").length, 1, "delivered exactly once");
+  } finally {
+    client.close();
+    await endpoint.close();
+    await rm(paths.socketPath, { force: true });
+    await rm(cwd, { recursive: true, force: true });
+  }
+});
+
 test("concurrent attaches deliver each queued ping exactly once", async () => {
   const cwd = await mkdtemp(join(tmpdir(), "delayed-concurrent-attach-"));
   const { supervisor } = fixture();

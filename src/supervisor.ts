@@ -1766,6 +1766,11 @@ export class Supervisor {
     await this.#writeSnapshot();
   }
 
+  /** How many completion pings are still waiting for an attached consumer. */
+  undeliveredPingCount(): number {
+    return this.#undeliveredPings.length;
+  }
+
   /**
    * Deliver queued pings, removing each entry only after its write reports success. Failed entries
    * stay queued. A crash between a successful write and the snapshot can redeliver that ping.
