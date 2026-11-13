@@ -371,6 +371,8 @@ export class Supervisor {
     readonly limit: number;
     readonly active: number;
     readonly waiting: number;
+    /** Queued tasks with a future `start_at`; they persist across a host replacement. */
+    readonly scheduled: number;
     readonly per_backend: Readonly<Record<string, Readonly<Record<string, unknown>>>>;
     readonly per_model: Readonly<Record<string, Readonly<Record<string, unknown>>>>;
   } {
@@ -389,6 +391,8 @@ export class Supervisor {
       limit: this.#capacity.limit,
       active: this.#capacity.activeCount,
       waiting: this.#capacity.waitingCount,
+      scheduled: [...this.#pending.values()].filter(task =>
+        task.start_at !== undefined && (task.state === 'queued' || task.state === 'starting')).length,
       per_backend: perBackend,
       per_model: perModel,
     };
@@ -1680,6 +1684,11 @@ export class Supervisor {
     this.#persistencePath = path;
     this.#resultsStore = new AppendOnlyJsonlStore(path + '.results.jsonl');
     void this.#writeSnapshot().catch(error => { this.#storageError = String(error); });
+  }
+
+  /** Wait for all queued writes, then persist the current snapshot (used before the host exits). */
+  async flushSnapshot(): Promise<void> {
+    await this.#writeSnapshot();
   }
 
   async recoverResults(): Promise<void> {

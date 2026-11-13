@@ -10,6 +10,7 @@ import { BACKENDS, isBackend } from "./core/types.js";
 import { NORMALIZED_EVENT_TYPES } from "./events/schema.js";
 import { HostSession, runHost } from "./host.js";
 import { ORCHESTRATOR_AUTHORITY_NOTICE } from "./prompt-policy.js";
+import { attachSessionAfterInitialize } from "./session.js";
 
 async function main(): Promise<void> {
   if (process.env.SUBAGENT_MCP_HOST === "1") {
@@ -292,7 +293,8 @@ async function main(): Promise<void> {
       description:
         "Restart this project's subagent-mcp host so it runs the subagent-mcp code currently on disk (after a " +
         "rebuild). Agent records, results and usage are kept, and queued or scheduled (`start_at`/`delay_seconds`) " +
-        "tasks persist so a restart is safe for them. Always refused while any agent is running, waiting " +
+        "tasks persist so a restart is safe for them; the replacement host re-arms their timers and the result " +
+        "reports `scheduled_tasks_preserved`. Undelivered pings are kept too. Always refused while any agent is running, waiting " +
         "for a slot, or waiting for approval. Also refused when the host already runs the code on disk, or when " +
         "other Claude Code sessions are connected to it (restarting would disconnect them); ask the user before " +
         "passing `force: true` to override those two. Reconnecting with `/mcp` already reloads an idle host that no " +
@@ -306,6 +308,8 @@ async function main(): Promise<void> {
   );
 
   const transport = new StdioServerTransport();
+  // Probes and non-Claude clients never attach; the queue is drained after initialize for Claude Code.
+  attachSessionAfterInitialize(server.server, host);
   await server.connect(transport);
 
   // The host process owns the agents. Exiting this proxy must not kill them.

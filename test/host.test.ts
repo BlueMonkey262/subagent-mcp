@@ -12,6 +12,7 @@ import { LiveConfig } from "../src/config/live.js";
 import { ConfigRegistry } from "../src/config/registry.js";
 import type { AgentConfig, ModelRoster } from "../src/config/schema.js";
 import { buildInfo, connectHost, HOST_PROTOCOL, hostDisposition, hostPaths, HostClient, HostSession, serveHost } from "../src/host.js";
+import { attachSessionAfterInitialize } from "../src/session.js";
 import { Supervisor } from "../src/supervisor.js";
 
 // Daemon integration tests must never contact the release API.
@@ -61,6 +62,14 @@ async function waitForPidExit(pid: number, timeoutMs = 5_000): Promise<void> {
     await new Promise((resolve) => setTimeout(resolve, 25));
   }
   assert.fail(`pid ${pid} did not exit`);
+}
+
+async function waitUntil(predicate: () => boolean, timeoutMs = 2_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!predicate()) {
+    if (Date.now() > deadline) throw new Error("Timed out waiting for condition");
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
 }
 
 function registry(): ConfigRegistry {
@@ -452,6 +461,65 @@ test("a failed restart leaves a clear error instead of a closed connection", { t
   }
 });
 
+test("restart re-attaches the proxy and re-arms a scheduled task", { timeout: 30_000 }, async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "subagent-host-scheduled-restart-"));
+  const agents = join(cwd, ".subagents");
+  const models = join(agents, "models.yaml");
+  await mkdir(agents, { recursive: true });
+  await writeFile(models, `models:
+  claude: []
+  codex: [fake-model]
+  opencode: []
+  antigravity: []
+  cursor: []
+`);
+  await writeFile(join(agents, "general.md"), `---
+name: general
+backend: codex
+model: fake-model
+description: General agent
+---
+Work.
+`);
+  const session = new HostSession({ cwd, agentsDirectory: agents, modelsFile: models, scriptPath: serverPath });
+  try {
+    await session.connect();
+    await session.attachSession();
+    assert.equal((await session.call("hello") as { attached: number }).attached, 1);
+    const spawned = await session.call("spawn_agent", {
+      agent: "general", prompt: "later", description: "delayed", delay_seconds: 600,
+    }) as { status: string };
+    assert.equal(spawned.status, "queued");
+    const before = await session.call("hello") as { pid: number; scheduled: number };
+    assert.equal(before.scheduled, 1);
+
+    const restarted = await session.restart(true) as {
+      pid: number;
+      scheduled_tasks_preserved: number;
+      note?: string;
+    };
+    assert.notEqual(restarted.pid, before.pid);
+    assert.equal(restarted.scheduled_tasks_preserved, 1);
+    assert.match(restarted.note ?? "", /1 scheduled task/);
+
+    let attached = 0;
+    let scheduled = 0;
+    const deadline = Date.now() + 5_000;
+    while (Date.now() < deadline) {
+      const hello = await session.call("hello") as { attached: number; scheduled: number };
+      attached = hello.attached;
+      scheduled = hello.scheduled;
+      if (attached === 1) break;
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+    assert.equal(attached, 1, "the proxy re-attached after the restart");
+    assert.equal(scheduled, 1, "the replacement host restored the scheduled task");
+  } finally {
+    session.close();
+    await stopDaemon(cwd);
+  }
+});
+
 test("restart is refused while an agent waits for approval, and the host stays up", async () => {
   const cwd = await mkdtemp(join(tmpdir(), "subagent-host-busy-"));
   const adapter = new FakeAdapter("codex");
@@ -486,5 +554,122 @@ test("restart is refused while an agent waits for approval, and the host stays u
     session.close();
     await endpoint.close();
     await rm(paths.socketPath, { force: true });
+  }
+});
+
+test("the proxy attaches only after initialize and only for Claude Code", () => {
+  let calls = 0;
+  const host = { attachSession: async () => { calls += 1; return {}; } };
+  const fake = (name: string | undefined) => ({
+    oninitialized: undefined as (() => void) | undefined,
+    getClientVersion: () => (name === undefined ? undefined : { name, version: "1" }),
+  });
+
+  const claude = fake("claude-code");
+  attachSessionAfterInitialize(claude as never, host);
+  assert.equal(calls, 0, "initialize has not completed yet");
+  claude.oninitialized?.();
+  assert.equal(calls, 1, "Claude Code attaches after initialize");
+
+  for (const name of ["codex", "opencode", undefined]) {
+    const other = fake(name);
+    attachSessionAfterInitialize(other as never, host);
+    other.oninitialized?.();
+  }
+  assert.equal(calls, 1, "other clients never attach");
+});
+
+test("a probe does not consume queued pings; attach_session delivers to that socket only", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "subagent-host-attach-"));
+  const supervisor = new Supervisor({ registry: registry(), adapters: new AdapterRegistry([new FakeAdapter("codex")]), cwd });
+  const paths = hostPaths(cwd);
+  const endpoint = await serveHost({ socketPath: paths.socketPath, supervisor });
+  const probe = await HostClient.connect(paths.socketPath);
+  const first = await HostClient.connect(paths.socketPath);
+  const second = await HostClient.connect(paths.socketPath);
+  const probePings: Readonly<Record<string, unknown>>[] = [];
+  const firstPings: Readonly<Record<string, unknown>>[] = [];
+  const secondPings: Readonly<Record<string, unknown>>[] = [];
+  probe.onDetached((data) => probePings.push(data));
+  first.onDetached((data) => firstPings.push(data));
+  second.onDetached((data) => secondPings.push(data));
+  try {
+    await supervisor.enqueueUndeliveredPing({ agent_id: "a1", backend: "codex", status: "completed", result: "queued" });
+    await probe.call("hello");
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    assert.equal(probePings.length, 0, "a probe/hello connection never drains the queue");
+    assert.equal(firstPings.length, 0);
+    assert.equal(secondPings.length, 0);
+
+    await first.call("attach_session");
+    await waitUntil(() => firstPings.length === 1);
+    assert.equal(firstPings[0]?.["result"], "queued");
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    assert.equal(probePings.length, 0, "the probe still receives nothing");
+    assert.equal(secondPings.length, 0, "another connected socket receives nothing");
+
+    const attached = await second.call("attach_session") as { delivered: number };
+    assert.equal(attached.delivered, 0, "the queue was already drained by the first attach");
+    assert.equal(secondPings.length, 0);
+  } finally {
+    probe.close();
+    first.close();
+    second.close();
+    await endpoint.close();
+    await rm(paths.socketPath, { force: true });
+    await rm(cwd, { recursive: true, force: true });
+  }
+});
+
+test("a settle with only a probe connected is queued, then delivered on attach_session", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "subagent-host-probe-settle-"));
+  const adapter = new FakeAdapter("codex");
+  adapter.queueScript([{
+    create: (context) => ({
+      type: "turn.completed",
+      agentId: context.agentId,
+      backend: context.backend,
+      data: { turnId: context.turnId, status: "completed" as const, finalText: "probe result" },
+    }),
+  }]);
+  let endpoint: Awaited<ReturnType<typeof serveHost>> | undefined;
+  const supervisor = new Supervisor({
+    registry: registry(),
+    adapters: new AdapterRegistry([adapter]),
+    cwd,
+    onDetachedSettled: (result) => {
+      const delivered = endpoint?.notify({ event: "detached", data: result }) ?? 0;
+      if (delivered === 0) void supervisor.enqueueUndeliveredPing(result).catch(() => undefined);
+    },
+  });
+  const paths = hostPaths(cwd);
+  endpoint = await serveHost({ socketPath: paths.socketPath, supervisor });
+  const probe = await HostClient.connect(paths.socketPath);
+  const probePings: Readonly<Record<string, unknown>>[] = [];
+  probe.onDetached((data) => probePings.push(data));
+  let consumer: HostClient | undefined;
+  try {
+    await probe.call("hello");
+    const spawned = await supervisor.spawnAgent({
+      agent: "general", prompt: "work", description: "probe", run_in_background: true,
+    });
+    await waitUntil(() => supervisor.listAgents().some((agent) =>
+      agent["agent_id"] === spawned["agent_id"] && agent["state"] === "completed"));
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    assert.equal(probePings.length, 0, "a raw probe socket is not a consumer");
+
+    consumer = await HostClient.connect(paths.socketPath);
+    const consumerPings: Readonly<Record<string, unknown>>[] = [];
+    consumer.onDetached((data) => consumerPings.push(data));
+    await consumer.call("attach_session");
+    await waitUntil(() => consumerPings.length === 1);
+    assert.equal(consumerPings[0]?.["result"], "probe result");
+    assert.equal(probePings.length, 0);
+  } finally {
+    probe.close();
+    consumer?.close();
+    await endpoint.close();
+    await rm(paths.socketPath, { force: true });
+    await rm(cwd, { recursive: true, force: true });
   }
 });

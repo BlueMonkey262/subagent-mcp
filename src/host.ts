@@ -82,8 +82,12 @@ export interface HostHello {
   readonly builtAt?: number;
   /** Connected clients, including the one asking. */
   readonly clients?: number;
+  /** Connected clients that completed the explicit attach_session handshake. */
+  readonly attached?: number;
   readonly active?: number;
   readonly waiting?: number;
+  /** Queued tasks with a future start_at; they are preserved across a replacement host. */
+  readonly scheduled?: number;
 }
 
 export type HostDisposition = "keep" | "newer" | "stale" | "replace" | "refuse";
@@ -97,6 +101,7 @@ export type HostDisposition = "keep" | "newer" | "stale" | "replace" | "refuse";
  * - `refuse`/`replace` on a protocol mismatch, by whether agents are running.
  */
 export function hostDisposition(hello: HostHello, local: BuildInfo): HostDisposition {
+  // Scheduled/queued tasks are persisted and re-armed by the replacement, so they do not count as busy.
   const busy = (hello.active ?? 0) > 0 || (hello.waiting ?? 0) > 0;
   if (hello.protocol !== HOST_PROTOCOL) return busy ? "refuse" : "replace";
   if (hello.build === local.build) return "keep";
@@ -156,9 +161,13 @@ function canonicalPath(path: string): string {
 }
 
 export interface RunningHost {
-  notify(message: Readonly<Record<string, unknown>>): void;
+  /** Broadcast a ping to attached sessions; returns how many sockets it was written to. */
+  notify(message: Readonly<Record<string, unknown>>): number;
   close(): Promise<void>;
+  /** Raw socket count, including probes and CLI clients that never attached. */
   readonly clients: number;
+  /** Sockets that completed the explicit `attach_session` handshake. */
+  readonly attached: number;
 }
 
 export async function serveHost(options: {
@@ -168,20 +177,24 @@ export async function serveHost(options: {
   readonly onShutdown?: () => void;
 }): Promise<RunningHost> {
   const sockets = new Set<Socket>();
+  const attached = new Set<Socket>();
   let shuttingDown = false;
-  const broadcast = (message: Readonly<Record<string, unknown>>): void => {
-    const line = `${JSON.stringify(message)}\n`;
-    for (const socket of sockets) socket.write(line);
+  const send = (socket: Socket, message: Readonly<Record<string, unknown>>): void => {
+    socket.write(`${JSON.stringify(message)}\n`);
+  };
+  const broadcast = (message: Readonly<Record<string, unknown>>): number => {
+    for (const socket of attached) send(socket, message);
+    return attached.size;
+  };
+  const attach = async (socket: Socket): Promise<Readonly<Record<string, unknown>>> => {
+    attached.add(socket);
+    // Flush to the attaching socket only, and clear the persisted queue after the writes are issued.
+    const delivered = await options.supervisor.flushUndeliveredPings((result) => send(socket, { event: "detached", data: result }));
+    return { attached: true, delivered, attached_sessions: attached.size };
   };
   const server: Server = createServer((socket) => {
-    const wasEmpty = sockets.size === 0;
     sockets.add(socket);
     options.onClients?.(sockets.size);
-    if (wasEmpty) {
-      // Pings that arrived with no client attached were persisted; hand them to the first one.
-      void options.supervisor.flushUndeliveredPings((result) => broadcast({ event: "detached", data: result }))
-        .catch(() => undefined);
-    }
     const buffer = { text: "" };
     socket.setEncoding("utf8");
     socket.on("data", (chunk: string) => {
@@ -196,11 +209,12 @@ export async function serveHost(options: {
           if (shuttingDown) return;
           shuttingDown = true;
           options.onShutdown?.();
-        }, { clients: () => sockets.size });
+        }, { clients: () => sockets.size, attached: () => attached.size, attach: () => attach(socket) });
       }
     });
     const drop = (): void => {
       sockets.delete(socket);
+      attached.delete(socket);
       options.onClients?.(sockets.size);
     };
     socket.on("close", drop);
@@ -217,12 +231,16 @@ export async function serveHost(options: {
     get clients() {
       return sockets.size;
     },
+    get attached() {
+      return attached.size;
+    },
     notify(message) {
-      broadcast(message);
+      return broadcast(message);
     },
     close() {
       for (const socket of sockets) socket.destroy();
       sockets.clear();
+      attached.clear();
       return new Promise((resolve) => server.close(() => resolve()));
     },
   };
@@ -282,6 +300,7 @@ const RESTART_EXIT_WAIT_MS = 10_000;
 export class HostSession {
   #client: HostClient | undefined;
   #error: Error | undefined;
+  #wantsAttach = false;
   readonly #detached: ((data: Readonly<Record<string, unknown>>) => void)[] = [];
 
   constructor(readonly options: Parameters<typeof connectHost>[0]) {}
@@ -294,6 +313,15 @@ export class HostSession {
       process.stderr.write(`subagent-mcp: ${error instanceof Error ? error.message : String(error)}\n`);
       this.#fail(error);
     }
+  }
+
+  /**
+   * Register this proxy as a ping consumer. Called only after the MCP initialize handshake, and
+   * only for Claude Code; a later reconnect/restart re-attaches automatically.
+   */
+  async attachSession(): Promise<unknown> {
+    this.#wantsAttach = true;
+    return this.call("attach_session", undefined, 5_000);
   }
 
   onDetached(listener: (data: Readonly<Record<string, unknown>>) => void): void {
@@ -357,12 +385,17 @@ export class HostSession {
       throw this.#error;
     }
     const next = this.#client!.host;
+    const scheduled = hello?.scheduled ?? 0;
     return {
       restarted: true,
       ...(hello?.pid === undefined ? {} : { previous_pid: hello.pid }),
       pid: next?.pid,
       build: next?.build,
       build_changed: hello?.build !== next?.build,
+      scheduled_tasks_preserved: scheduled,
+      ...(scheduled === 0 ? {} : {
+        note: `${scheduled} scheduled task(s) were preserved; the replacement host re-armed their timers.`,
+      }),
       ...(this.warning() === undefined ? {} : { host_warning: this.warning() }),
     };
   }
@@ -375,6 +408,10 @@ export class HostSession {
     this.#client = client;
     this.#error = undefined;
     for (const listener of this.#detached) client.onDetached(listener);
+    if (this.#wantsAttach) {
+      // The replacement host restored queued pings; consume them on this connection too.
+      void client.call("attach_session", undefined, 5_000).catch(() => undefined);
+    }
   }
 
   #fail(error: unknown): void {
@@ -434,8 +471,10 @@ export async function runHost(): Promise<void> {
     staleAgentMs: live.staleAgentMs(),
     scheduledGraceMs: live.scheduledGraceMs(),
     onDetachedSettled: (result) => {
-      if (endpoint !== undefined && endpoint.clients > 0) endpoint.notify({ event: "detached", data: result });
-      else void supervisor.enqueueUndeliveredPing(result).catch(() => undefined);
+      // A probe/CLI socket is not a consumer; only an attached session counts. If none are
+      // attached, persist the ping for the next attach_session instead of dropping it.
+      const delivered = endpoint?.notify({ event: "detached", data: result }) ?? 0;
+      if (delivered === 0) void supervisor.enqueueUndeliveredPing(result).catch(() => undefined);
     },
   });
   live.watch(() => {
@@ -496,6 +535,9 @@ export async function runHost(): Promise<void> {
         await rm(paths.pidPath, { force: true }).catch(() => undefined);
       }
     }
+    // Persist queued/scheduled tasks and undelivered pings before exiting so a replacement host
+    // can restore and re-arm them.
+    await supervisor.flushSnapshot().catch(() => undefined);
     process.exit(0);
   };
   const scheduleIdle = (clients: number): void => {
@@ -525,8 +567,6 @@ export class HostClient {
   readonly #socket: Socket;
   readonly #pending = new Map<number, { resolve: (value: unknown) => void; reject: (error: Error) => void }>();
   readonly #detached: Array<(data: Readonly<Record<string, unknown>>) => void> = [];
-  /** Pings that arrived before the proxy registered its listener (e.g. a flush on attach). */
-  readonly #bufferedDetached: Record<string, unknown>[] = [];
   #buffer = "";
   #nextId = 1;
   #closed = false;
@@ -564,9 +604,6 @@ export class HostClient {
 
   onDetached(listener: (data: Readonly<Record<string, unknown>>) => void): void {
     this.#detached.push(listener);
-    if (this.#bufferedDetached.length > 0) {
-      for (const data of this.#bufferedDetached.splice(0, this.#bufferedDetached.length)) listener(data);
-    }
   }
 
   call(method: string, params?: unknown, timeoutMs = 0): Promise<unknown> {
@@ -608,12 +645,7 @@ export class HostClient {
       }
       if (!isRecord(message)) continue;
       if (message["event"] === "detached" && isRecord(message["data"])) {
-        if (this.#detached.length === 0) {
-          this.#bufferedDetached.push(message["data"]);
-          if (this.#bufferedDetached.length > 100) this.#bufferedDetached.shift();
-        } else {
-          for (const listener of this.#detached) listener(message["data"]);
-        }
+        for (const listener of this.#detached) listener(message["data"]);
         continue;
       }
       if (typeof message["id"] !== "number") continue;
@@ -677,8 +709,12 @@ async function handleLine(
 const HOST_BUILD = buildInfo();
 
 interface DispatchContext {
-  /** Clients currently connected to this host. */
+  /** Raw clients currently connected to this host, including probes. */
   readonly clients: () => number;
+  /** Clients that completed the explicit attach_session handshake. */
+  readonly attached: () => number;
+  /** Mark the calling socket as a ping consumer and flush the persisted queue to it. */
+  readonly attach: () => Promise<Readonly<Record<string, unknown>>>;
 }
 
 async function dispatch(supervisor: Supervisor, method: string, params: unknown, context: DispatchContext): Promise<unknown> {
@@ -693,8 +729,11 @@ async function dispatch(supervisor: Supervisor, method: string, params: unknown,
         build: HOST_BUILD.build,
         builtAt: HOST_BUILD.builtAt,
         clients: context.clients(),
+        attached: context.attached(),
         ...supervisor.concurrency(),
       };
+    case "attach_session":
+      return context.attach();
     case "spawn_agent":
       return supervisor.spawnAgent(input as unknown as SpawnAgentInput);
     case "send_message":

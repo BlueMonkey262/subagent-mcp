@@ -346,7 +346,7 @@ test("the host keeps running while a delayed task is queued", async () => {
   assert.equal(hasLiveWork(supervisor), false, "cancelling it lets the host idle out");
 });
 
-test("pings with no client are queued, persisted, and flushed on the next connect", async () => {
+test("pings with no attached session are queued, persisted, and flushed on attach", async () => {
   const cwd = await mkdtemp(join(tmpdir(), "delayed-offline-ping-"));
   const snapshotPath = join(cwd, "sessions.json");
   const paths = hostPaths(cwd);
@@ -357,8 +357,8 @@ test("pings with no client are queued, persisted, and flushed on the next connec
     adapters: new AdapterRegistry([adapter]),
     cwd,
     onDetachedSettled: (result) => {
-      if (endpoint !== undefined && endpoint.clients > 0) endpoint.notify({ event: "detached", data: result });
-      else void supervisor.enqueueUndeliveredPing(result);
+      const delivered = endpoint?.notify({ event: "detached", data: result }) ?? 0;
+      if (delivered === 0) void supervisor.enqueueUndeliveredPing(result);
     },
   });
   supervisor.enablePersistence(snapshotPath);
@@ -377,11 +377,14 @@ test("pings with no client are queued, persisted, and flushed on the next connec
       if ((saved.undeliveredPings ?? []).length === 1) break;
       await new Promise((resolve) => setTimeout(resolve, 10));
     }
-    assert.equal(saved.undeliveredPings?.length, 1, "the ping was persisted while no client was attached");
+    assert.equal(saved.undeliveredPings?.length, 1, "the ping was persisted while no session was attached");
 
     client = await HostClient.connect(paths.socketPath);
     const received: Readonly<Record<string, unknown>>[] = [];
     client.onDetached((data) => received.push(data));
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    assert.equal(received.length, 0, "connecting alone is not attaching");
+    await client.call("attach_session");
     await waitUntil(() => received.length === 1);
     assert.equal(received[0]?.["status"], "completed");
     assert.equal(received[0]?.["result"], "offline result");
@@ -398,6 +401,58 @@ test("pings with no client are queued, persisted, and flushed on the next connec
   } finally {
     client?.close();
     await endpoint.close();
+    await rm(paths.socketPath, { force: true });
+    await rm(cwd, { recursive: true, force: true });
+  }
+});
+
+test("a delayed task and a queued ping survive a host replacement", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "delayed-replacement-"));
+  const snapshotPath = join(cwd, "sessions.json");
+  const first = fixture();
+  first.supervisor.enablePersistence(snapshotPath);
+  const task = await first.supervisor.spawnAgent({ ...spawn, delay_seconds: 3_600 });
+  const taskId = String(task["task_id"]);
+  await first.supervisor.enqueueUndeliveredPing({
+    agent_id: "old-agent", backend: "codex", status: "completed", result: "survived",
+  });
+  await first.supervisor.flushSnapshot();
+
+  const saved = JSON.parse(await readFile(snapshotPath, "utf8")) as {
+    pending: unknown[];
+    undeliveredPings?: unknown[];
+  };
+  assert.equal(saved.pending.length, 1, "the scheduled task was persisted before exit");
+  assert.equal(saved.undeliveredPings?.length, 1, "the queued ping was persisted before exit");
+
+  // A replacement host restores both, re-arms the timer, and only drains pings on attach_session.
+  const second = fixture();
+  second.supervisor.enablePersistence(snapshotPath);
+  second.supervisor.restoreUndeliveredPings(saved.undeliveredPings);
+  second.supervisor.restorePending(saved.pending as never);
+  assert.equal(second.supervisor.hasPendingWork(), true);
+  assert.equal(second.supervisor.concurrency().scheduled, 1);
+  assert.equal(second.adapter.spawnRequests.length, 0, "a future task does not launch during restore");
+
+  const paths = hostPaths(cwd);
+  const endpoint = await serveHost({ socketPath: paths.socketPath, supervisor: second.supervisor });
+  const client = await HostClient.connect(paths.socketPath);
+  const received: Readonly<Record<string, unknown>>[] = [];
+  client.onDetached((data) => received.push(data));
+  try {
+    await client.call("hello");
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    assert.equal(received.length, 0, "connecting alone does not drain the restored queue");
+    await client.call("attach_session");
+    await waitUntil(() => received.length === 1);
+    assert.equal(received[0]?.["result"], "survived");
+    const listed = second.supervisor.listAgents().find((agent) => agent["agent_id"] === taskId);
+    assert.equal(listed?.["state"], "queued");
+    assert.equal(listed?.["start_at"], task["start_at"]);
+  } finally {
+    client.close();
+    await endpoint.close();
+    await second.supervisor.stopAgents([taskId]);
     await rm(paths.socketPath, { force: true });
     await rm(cwd, { recursive: true, force: true });
   }

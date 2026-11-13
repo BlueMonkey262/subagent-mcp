@@ -253,7 +253,8 @@ against the repository, tests, and the operator's actual request.
 - **Picking up code changes.** After rebuilding subagent-mcp (`npm run build`), run `/mcp` and
   reconnect. The host reports a fingerprint of the compiled code it loaded and when it was built;
   the reconnecting proxy replaces the host only when it runs *older* code, is idle, and no other
-  Claude Code session is attached. Agent records, results and usage carry over. A host running
+  Claude Code session is attached. Agent records, results and usage carry over, and queued or
+  scheduled tasks plus undelivered pings are preserved and re-armed. A host running
   newer code than the proxy is never downgraded; tool responses then carry a `host_warning` to
   reconnect. When agents are running or another session is attached, the old host is kept and the
   `host_warning` says so; `restart_host` then reloads it once agents finish. `restart_host` is
@@ -304,9 +305,10 @@ the outcome. See `src/channel.ts`.
   `on_failure` suppresses only completed. `needs_approval` always pings because the agent is
   blocked. Results stay retrievable through `list_agents`, `get_agent_result`, and
   `get_agent_events` regardless.
-- **Offline queue.** If no client is attached when a background agent settles, the ping is
-  persisted (up to 100, oldest dropped) and delivered when a session next attaches. Delivery is
-  at most once.
+- **Offline queue.** If no attached Claude Code session is available when a background agent
+  settles, the ping is persisted (up to 100, oldest dropped) and delivered after the next session
+  completes the MCP initialize handshake and explicitly attaches. Probes and other MCP clients do
+  not drain it. Delivery is at most once.
 - **Opt-in per session.** Channels are a research preview; a custom server is not on the
   allowlist, so start Claude Code with
   `claude --dangerously-load-development-channels server:subagent-mcp`. Without it Claude Code
@@ -347,7 +349,10 @@ Choose `notify` per job: `always` (default) pings when the agent completes, fail
 interrupted; `on_failure` only pings for failures and interruptions; `never` suppresses all
 completion pings. A `needs_approval` ping is always sent, because the agent is blocked.
 Scheduled tasks and dependency queues are persisted in `.subagents/memory/sessions.json`, so
-they survive a host restart. `list_agents` shows their `start_at` and `notify`.
+they survive a host restart. The host writes a final snapshot on shutdown, and the replacement
+host restores the queue and re-arms each timer. `list_agents` shows their `start_at` and
+`notify`; `restart_host` reports `scheduled_tasks_preserved`. Queued completion pings persist
+the same way and are delivered after the next session attaches (at most once).
 
 Limits: the host must be running (or restarted) to launch the job, and the machine must be awake.
 A sleeping machine starts the job when it wakes, subject to `scheduledGraceSeconds` (default
