@@ -254,6 +254,49 @@ test("an attaching socket that closes mid-flush leaves pings queued for the next
   }
 });
 
+test("concurrent attaches deliver each queued ping exactly once", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "delayed-concurrent-attach-"));
+  const { supervisor } = fixture();
+  const queued = Array.from({ length: 20 }, (_, index) => ({
+    agent_id: `queued-${index}`, backend: "codex", status: "completed", result: `result-${index}`,
+  }));
+  for (const ping of queued) await supervisor.enqueueUndeliveredPing(ping);
+  const paths = hostPaths(cwd);
+  const endpoint = await serveHost({ socketPath: paths.socketPath, supervisor });
+  const first = await HostClient.connect(paths.socketPath);
+  const second = await HostClient.connect(paths.socketPath);
+  const firstPings: Readonly<Record<string, unknown>>[] = [];
+  const secondPings: Readonly<Record<string, unknown>>[] = [];
+  first.onDetached((data) => firstPings.push(data));
+  second.onDetached((data) => secondPings.push(data));
+  try {
+    // Hold both flushes open so they would copy the same queue if they were not serialized.
+    const original = supervisor.flushUndeliveredPings.bind(supervisor);
+    supervisor.flushUndeliveredPings = async (deliver) => {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      return original(async (ping) => {
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        return deliver(ping);
+      });
+    };
+    await Promise.all([first.call("attach_session"), second.call("attach_session")]);
+    await waitUntil(() => firstPings.length + secondPings.length >= queued.length);
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    const received = [...firstPings, ...secondPings];
+    assert.equal(received.length, queued.length, "each queued ping is written once in total");
+    assert.deepEqual(
+      received.map((ping) => ping["agent_id"]).sort(),
+      queued.map((ping) => ping["agent_id"]).sort(),
+    );
+  } finally {
+    first.close();
+    second.close();
+    await endpoint.close();
+    await rm(paths.socketPath, { force: true });
+    await rm(cwd, { recursive: true, force: true });
+  }
+});
+
 function restoredTask(startAt: string, id = "task-restored"): Record<string, unknown> {
   return {
     id,

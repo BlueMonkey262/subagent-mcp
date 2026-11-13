@@ -308,6 +308,7 @@ export class Supervisor {
   #pending = new Map<string, PendingTask>();
   #taskTimers = new Map<string, NodeJS.Timeout>();
   #undeliveredPings: Record<string, unknown>[] = [];
+  #pingFlush: Promise<void> = Promise.resolve();
   #changes = new Set<() => void>();
 
   constructor(options: SupervisorOptions) {
@@ -1768,8 +1769,17 @@ export class Supervisor {
   /**
    * Deliver queued pings, removing each entry only after its write reports success. Failed entries
    * stay queued. A crash between a successful write and the snapshot can redeliver that ping.
+   * Flushes are serialized so concurrent attaches cannot both deliver the same entry.
    */
-  async flushUndeliveredPings(
+  flushUndeliveredPings(
+    deliver: (result: Readonly<Record<string, unknown>>) => boolean | void | Promise<boolean | void>,
+  ): Promise<number> {
+    const run = this.#pingFlush.then(() => this.#flushUndeliveredPings(deliver));
+    this.#pingFlush = run.then(() => undefined, () => undefined);
+    return run;
+  }
+
+  async #flushUndeliveredPings(
     deliver: (result: Readonly<Record<string, unknown>>) => boolean | void | Promise<boolean | void>,
   ): Promise<number> {
     if (this.#undeliveredPings.length === 0) return 0;
