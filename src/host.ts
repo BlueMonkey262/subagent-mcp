@@ -280,11 +280,11 @@ export class HostSession {
     this.#client?.onDetached(listener);
   }
 
-  async call(method: string, params?: unknown): Promise<unknown> {
+  async call(method: string, params?: unknown, timeoutMs = 0): Promise<unknown> {
     if (this.#client === undefined) {
       throw this.#error ?? new Error("subagent-mcp host is not connected. Ask the user to run `/mcp` and then reconnect subagent-mcp.");
     }
-    return this.#client.call(method, params);
+    return this.#client.call(method, params, timeoutMs);
   }
 
   /** Why the connected host's code differs from this proxy's, if it does. */
@@ -410,9 +410,16 @@ export async function runHost(): Promise<void> {
     usage,
     updateCachePath: join(paths.directory, "update.json"),
     maxConcurrent: live.maxConcurrent(),
+    staleAgentMs: live.staleAgentMs(),
     onDetachedSettled: (result) => endpoint?.notify({ event: "detached", data: result }),
   });
-  live.watch(() => supervisor.setMaxConcurrent(live.maxConcurrent()));
+  live.watch(() => {
+    supervisor.setMaxConcurrent(live.maxConcurrent());
+    supervisor.setStaleAgentMs(live.staleAgentMs());
+    supervisor.setSendMessageWaitMs(live.sendMessageWaitMs());
+    supervisor.setCapacityConfig(live.perBackendConcurrency(), live.perModelConcurrency());
+    supervisor.checkLiveness();
+  });
   supervisor.restore(await readSnapshot(paths.snapshotPath));
   let pending = [];
   try { pending = JSON.parse(await readFile(paths.snapshotPath, 'utf8')).pending ?? []; }
@@ -427,6 +434,8 @@ export async function runHost(): Promise<void> {
   runUpdateCheck();
   const updateTimer = setInterval(runUpdateCheck, 24 * 60 * 60 * 1_000);
   updateTimer.unref();
+  const livenessTimer = setInterval(() => supervisor.checkLiveness(), 5_000);
+  livenessTimer.unref();
 
   let shuttingDown = false;
   let idleTimer: NodeJS.Timeout | undefined;
@@ -435,6 +444,7 @@ export async function runHost(): Promise<void> {
     shuttingDown = true;
     if (idleTimer !== undefined) clearTimeout(idleTimer);
     clearInterval(updateTimer);
+    clearInterval(livenessTimer);
     live.close();
     await Promise.all([
       claude.closeAll(),
@@ -460,6 +470,7 @@ export async function runHost(): Promise<void> {
     idleTimer = undefined;
     if (clients > 0 || shuttingDown) return;
     idleTimer = setTimeout(() => {
+      supervisor.checkLiveness();
       const { active, waiting } = supervisor.concurrency();
       const liveAgent = supervisor.listAgents().some((agent) => {
         const state = agent["state"];
@@ -634,6 +645,8 @@ interface DispatchContext {
 
 async function dispatch(supervisor: Supervisor, method: string, params: unknown, context: DispatchContext): Promise<unknown> {
   const input = isRecord(params) ? params : {};
+  // A stale backend process must not keep the host "busy" for restart/idle decisions.
+  supervisor.checkLiveness();
   switch (method) {
     case "hello":
       return {

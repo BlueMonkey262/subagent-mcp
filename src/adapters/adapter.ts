@@ -63,6 +63,15 @@ export interface EventOptions {
 }
 
 /**
+ * Whether the adapter still owns a reporting channel for an agent. `stale` is authoritative:
+ * the backend process/session is gone, so no future event can arrive without a resume.
+ */
+export type AdapterLiveness =
+  | { readonly state: "live"; readonly detail?: string }
+  | { readonly state: "stale"; readonly reason: string }
+  | { readonly state: "unknown"; readonly reason?: string };
+
+/**
  * Persistent backend boundary. A turn receipt is not completion; terminal state and
  * permission requests arrive through events().
  */
@@ -80,6 +89,8 @@ export interface BackendAdapter {
   interrupt(agentId: string): Promise<void>;
   events(agentId: string, options?: EventOptions): AsyncIterable<AgentEvent>;
   approve(agentId: string, resolution: ApprovalResolution): Promise<void>;
+  /** Optional synchronous health probe used by `list_agents` and the stale-agent watchdog. */
+  liveness?(agentId: string): AdapterLiveness;
   /**
    * Optional live view of what the backend itself reports: models it can run and plan/quota usage.
    * Only backends with a queryable API implement it (OpenCode today); `list_models` surfaces it.

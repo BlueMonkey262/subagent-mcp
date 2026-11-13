@@ -10,7 +10,7 @@ import type { Usage } from "../../core/types.js";
 import { EventBuffer } from "../../events/buffer.js";
 import type { AgentEvent, NewAgentEvent, NormalizedEventData, NormalizedEventType } from "../../events/schema.js";
 import { scanChildOutput } from "../../safety/output.js";
-import type { AdapterTurn, BackendAdapter, EventOptions, ResumeRequest, SpawnRequest } from "../adapter.js";
+import type { AdapterLiveness, AdapterTurn, BackendAdapter, EventOptions, ResumeRequest, SpawnRequest } from "../adapter.js";
 
 const DEFAULT_INIT_TIMEOUT_MS = 15_000;
 const DEFAULT_INTERRUPT_GRACE_MS = 2_000;
@@ -195,6 +195,18 @@ export class AntigravityAdapter implements BackendAdapter {
       `Antigravity headless mode does not expose approval ${resolution.requestId} to the host`,
       { agentId, requestId: resolution.requestId },
     );
+  }
+
+  liveness(agentId: string): AdapterLiveness {
+    const session = this.#sessions.get(agentId);
+    if (session === undefined) return { state: "unknown", reason: "no live Antigravity session" };
+    if (session.exited || session.terminated || session.child.exitCode !== null || session.child.signalCode !== null) {
+      return { state: "stale", reason: "Antigravity process exited or was terminated" };
+    }
+    if (session.child.stdin.destroyed || !session.child.stdin.writable) {
+      return { state: "stale", reason: "Antigravity stdin is no longer writable" };
+    }
+    return { state: "live" };
   }
 
   async close(agentId: string): Promise<void> {

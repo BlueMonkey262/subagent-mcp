@@ -15,7 +15,7 @@ import {
   type RegistryLoadOptions,
   type ResolveAgentOptions,
 } from "./registry.js";
-import type { Allowance, ModelEntry, ResolvedAgentConfig } from "./schema.js";
+import type { Allowance, ModelConcurrencyRule, ModelEntry, ResolvedAgentConfig } from "./schema.js";
 import { applyPolicyEnv, OPEN_POLICY, type ModelPolicy } from "../core/model-policy.js";
 
 export function missingConfigMessage(input: {
@@ -127,6 +127,22 @@ export class LiveConfig implements AgentConfigSource {
     const seconds = readPositiveIntEnv(process.env, CODEX_RESUME_IDLE_ENV);
     if (seconds !== undefined) return seconds * 1000;
     return this.#registry?.codexResumeIdleMs() ?? new ConfigRegistry([], emptyRoster()).codexResumeIdleMs();
+  }
+
+  staleAgentMs(): number {
+    return this.#registry?.staleAgentMs() ?? new ConfigRegistry([], emptyRoster()).staleAgentMs();
+  }
+
+  sendMessageWaitMs(): number {
+    return this.#registry?.sendMessageWaitMs() ?? new ConfigRegistry([], emptyRoster()).sendMessageWaitMs();
+  }
+
+  perBackendConcurrency(): Readonly<Partial<Record<Backend, number>>> {
+    return this.#registry?.perBackendConcurrency() ?? {};
+  }
+
+  perModelConcurrency(): readonly ModelConcurrencyRule[] {
+    return this.#registry?.perModelConcurrency() ?? [];
   }
 
   allowances(): Readonly<Partial<Record<Backend, Allowance>>> {

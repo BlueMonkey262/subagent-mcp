@@ -67,8 +67,7 @@ function compilePattern(raw: string): CompiledPattern {
 }
 
 /** Iterative wildcard matching, backtracking only to the most recent `*`. */
-function matchesGlob(value: string, glob: string): boolean {
-  const input = value.toLowerCase();
+function matchesGlob(value: string, glob: string): boolean {  const input = value.toLowerCase();
   let inputIndex = 0;
   let globIndex = 0;
   let starIndex = -1;
@@ -91,6 +90,13 @@ function matchesGlob(value: string, glob: string): boolean {
   }
   while (globIndex < glob.length && glob[globIndex] === "*") globIndex += 1;
   return globIndex === glob.length;
+}
+
+/** Whether a `backend:model-glob` pattern matches one backend/model pair. Shared with concurrency rules. */
+export function matchesModelPattern(pattern: string, backend: Backend, model: string): boolean {
+  const compiled = compilePattern(pattern);
+  return (compiled.backend === undefined || compiled.backend === backend)
+    && matchesGlob(model, compiled.glob);
 }
 
 /** Why `policy` refuses `model` on `backend`, or undefined when it may run. */

@@ -68,6 +68,19 @@ in `<repo>/.agents/agents/subagent-general.md`; copy `.agents/` into your projec
 `.subagents/` (or put an agent file of that name in `~/.gemini/agents/`). `agy` finds project agents
 from the directory it runs in, though `agy agents` only lists the global ones.
 
+To make the definition explicit and repo-owned, set `antigravityAgentFile` in the agent config:
+
+```yaml
+antigravityAgent: subagent-general
+antigravityAgentFile: .agents/agents/subagent-general.md
+```
+
+At spawn the bridge resolves and validates that file, records its SHA-256, tools and source path,
+and writes an exact copy under `.subagents/memory/antigravity-agents/`. A global fallback is
+allowed but reported as `portable: false`. `subagent-mcp antigravity doctor` audits every
+Antigravity config, and `subagent-mcp antigravity vendor <agent-config>` copies a resolved global
+definition into the project's `.agents/agents/` directory.
+
 ## 6. Optional: custom endpoints
 
 For NVIDIA NIM, install litellm (`pip install 'litellm[proxy]'`), then run

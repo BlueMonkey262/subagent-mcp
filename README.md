@@ -18,7 +18,7 @@ That installs: the server (user-scoped MCP), the `subagent-mcp` launcher, and th
 | Codex | needs `codex`; model names are whatever your Codex account offers |
 | OpenCode | model IDs are `provider/model` (`opencode models`) |
 | Cursor | needs the `agent` CLI; model IDs from `agent --list-models` |
-| Antigravity (AGY) | needs `agy`; agent config also sets `antigravityAgent` |
+| Antigravity (AGY) | needs `agy`; agent config sets `antigravityAgent` (and optionally `antigravityAgentFile`) |
 | NVIDIA NIM | free-tier models via an API key; usable from Claude, Codex and OpenCode agents |
 | Generic OpenAI-compatible API | any `/v1` endpoint, optional key, add as many as you like; same harnesses as NIM |
 
@@ -46,6 +46,30 @@ coverage only.
 Agents live in `.subagents/<name>.md` (frontmatter + system prompt) and the model roster in
 `.subagents/models.yaml`, in the project you run Claude Code from. If a project has none, the server
 uses the examples bundled in this repo's `.subagents/`.
+
+Useful `models.yaml` limits (all optional):
+
+```yaml
+maxConcurrent: 12
+staleAgentSeconds: 300          # heartbeat threshold when a backend cannot be probed
+sendMessageWaitSeconds: 30      # bounded send_message wait
+perBackendConcurrency:
+  opencode: 2
+perModelConcurrency:
+  "opencode:strata-coder/strata/gyro-s": 1
+  "antigravity:gemini-3.8-flash-*": 1
+```
+
+For an Antigravity agent, pin its real definition into the project:
+
+```yaml
+antigravityAgent: gemini-review
+antigravityAgentFile: .agents/agents/gemini-review.md
+```
+
+`subagent-mcp antigravity doctor` audits every resolved definition; `subagent-mcp antigravity
+vendor <agent-config>` copies a global definition into the project. Antigravity tools and
+permissions are always enforced by `agy`, not by the bridge (`bridge_enforced: false`).
 
 ## Tools
 
@@ -108,9 +132,16 @@ against the repository, tests, and the operator's actual request.
   `--dangerously-skip-permissions`: configure Antigravity's native allow/ask/deny rules in its
   settings. Headless Antigravity has no host approval-response channel, so native soft-denials
   are reported as tool failures and cannot enter this server's `resolve_approval` loop.
-  `reasoningEffort` accepts only `low`, `medium`, or `high` for this backend. See
-  [`docs/protocol/antigravity.md`](docs/protocol/antigravity.md) for the verified protocol and
-  outstanding live-acceptance probes.
+  `reasoningEffort` accepts only `low`, `medium`, or `high` for this backend.
+  The real system prompt and tool list live in the `agy` custom agent, not in `.subagents/`.
+  Before launch the bridge resolves the definition project-first
+  (`.agents/agents/<name>.md`), then the global `~/.gemini/agents/<name>.md`, or an explicit
+  `antigravityAgentFile` in the config. It validates the frontmatter name, records the SHA-256,
+  source path, tools and portability in the agent result/listing, and writes an exact copy to
+  `.subagents/memory/antigravity-agents/<sha256>.md`. A definition that changes between turns
+  refuses resume with `ANTIGRAVITY_AGENT_CHANGED` unless `allow_agent_definition_change: true`
+  is passed. See [`docs/protocol/antigravity.md`](docs/protocol/antigravity.md) for the verified
+  protocol and outstanding live-acceptance probes.
 - **Cursor**: drives the Cursor Agent CLI in print mode, `agent -p --output-format stream-json
   --trust --sandbox enabled --workspace <cwd> --model <explicit> <prompt>` (verified against
   `agent 2026.10.16-e3cb207`). This backend is **one process per turn**: the only durable state is
@@ -127,16 +158,38 @@ against the repository, tests, and the operator's actual request.
 
 ## Operational limits
 
-- **Turn cap.** Whatever `timeout` the agent config or the tool call sets is returned as
+- **Turn cap and bounded resume wait.** Whatever `timeout` the agent config or the tool call sets is returned as
   `timeout_seconds` on spawn, resume, and `list_agents`. The sample agents set `timeout: 1200`
   (20 minutes). `send_message` accepts `timeout` to raise or lower the cap for that turn.
+  It also accepts `wait_seconds` (default 30, or `sendMessageWaitSeconds` in `models.yaml`, `0`
+  returns immediately). When the wait expires the call returns `status: "running"` with
+  `wait_expired: true` and leaves the turn running; it never cancels work. Use
+  `wait_for_agents` or `get_agent_events` to follow it.
   A timeout also kills the child's process group.
 - **Codex resume cost.** Resuming a Codex agent replays the whole thread with no prompt cache.
   The result includes a `warning`. After `codexResumeIdleSeconds` (default 30 minutes) the resume
   is refused unless `allow_expensive_resume` is true.
 - **Concurrency.** At most `maxConcurrent` agents run at once (default 12, or
   `SUBAGENT_MCP_MAX_CONCURRENT`). Further `spawn_agent` calls wait for a free slot.
-  `list_models` and `list_agents` report `concurrency.active` and `concurrency.waiting`.
+  `perBackendConcurrency` and `perModelConcurrency` add narrower pools, so a one-slot local model
+  cannot be oversubscribed by the global cap and does not block spawns on other models.
+  `list_models` and `list_agents` report `concurrency.active`, `concurrency.waiting`, and the
+  `per_backend`/`per_model` pools. Model patterns use the same case-insensitive globs as
+  `blockModels`; every matching rule applies.
+- **Failure reporting.** Every failed turn carries `error.code`, `error.message`,
+  `error.category`, `error.retryable`, and `error.recommended_action`. Categories distinguish
+  `quota`, `auth`, `rate_limit`, `timeout`, `process`, `protocol`, `transport`, `task`, `config`,
+  `capacity`, `host`, `internal`, `cancelled`, and `unknown`. A failed turn with no backend error
+  is synthesized as `TURN_FAILED` (`task`), and a lost backend process becomes
+  `AGENT_UNRESPONSIVE` (`process`). A failed turn can never be labelled `*_SUCCESS`.
+  `CLAUDE_*` codes remain backend-specific for diagnostics; use `category` for automation.
+- **Liveness.** Active agents report `liveness: live | stale | unknown | settled`,
+  `liveness_reason`, `last_heartbeat_at`, and `heartbeat_age_seconds`. A backend process that has
+  exited is marked `stale` immediately and, after a second probe, failed with
+  `AGENT_UNRESPONSIVE`; its capacity slot is released and `wait_for_agents` wakes. An adapter
+  that cannot probe is marked stale only after `staleAgentSeconds` (default 300) without a
+  heartbeat, and is not killed automatically, because a long tool call may legitimately be silent.
+  The host also bounds `list_agents` so an unresponsive host returns an error instead of hanging.
 - **Blocking backends and models.** Three `models.yaml` settings refuse agents before they start:
 
   | Setting | Refuses | Environment variable |

@@ -32,6 +32,8 @@ export interface AgentConfig {
   readonly reasoningEffort?: string;
   /** Antigravity-only custom-agent name, passed to `agy --agent`. */
   readonly antigravityAgent?: string;
+  /** Optional repo-relative definition file; resolved and audited before launch. */
+  readonly antigravityAgentFile?: string;
   readonly description: string;
   readonly systemPrompt: string;
   readonly maxTurns?: number;
@@ -71,9 +73,21 @@ export interface Allowance {
 export interface ServerLimits {
   readonly maxConcurrent: number;
   readonly codexResumeIdleMs: number;
+  /** A running agent without a heartbeat or live backend probe for this long is reported stale. */
+  readonly staleAgentMs: number;
+  /** Default bounded wait for send_message before it returns a running receipt. */
+  readonly sendMessageWaitMs: number;
+  readonly perBackendConcurrency: Readonly<Partial<Record<Backend, number>>>;
+  /** `backend:model-glob` patterns; every matching rule applies as its own pool. */
+  readonly perModelConcurrency: readonly ModelConcurrencyRule[];
   readonly allowances: Readonly<Partial<Record<Backend, Allowance>>>;
   /** Which backends and models are refused (see core/model-policy.ts). */
   readonly modelPolicy: ModelPolicy;
+}
+
+export interface ModelConcurrencyRule {
+  readonly pattern: string;
+  readonly limit: number;
 }
 
 export interface ResolvedAgentConfig extends Omit<AgentConfig, "model"> {
