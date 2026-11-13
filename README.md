@@ -53,6 +53,7 @@ Useful `models.yaml` limits (all optional):
 maxConcurrent: 12
 staleAgentSeconds: 300          # heartbeat threshold when a backend cannot be probed
 sendMessageWaitSeconds: 30      # bounded send_message wait
+scheduledGraceSeconds: 3600     # how late a restored scheduled task may start
 perBackendConcurrency:
   opencode: 2
 perModelConcurrency:
@@ -298,6 +299,14 @@ the outcome. See `src/channel.ts`.
 
 - **Claude Code only.** The capability key is sent to every client (it has to be declared before
   the client is known), but events are emitted only when `clientInfo.name` is `claude-code`.
+- **Ping policy.** `spawn_agent` and `send_message` accept `notify: "always" | "on_failure" |
+  "never"` (default `always`). `never` suppresses completed, failed, and interrupted pings;
+  `on_failure` suppresses only completed. `needs_approval` always pings because the agent is
+  blocked. Results stay retrievable through `list_agents`, `get_agent_result`, and
+  `get_agent_events` regardless.
+- **Offline queue.** If no client is attached when a background agent settles, the ping is
+  persisted (up to 100, oldest dropped) and delivered when a session next attaches. Delivery is
+  at most once.
 - **Opt-in per session.** Channels are a research preview; a custom server is not on the
   allowlist, so start Claude Code with
   `claude --dangerously-load-development-channels server:subagent-mcp`. Without it Claude Code
@@ -308,6 +317,43 @@ the outcome. See `src/channel.ts`.
   straight decision-string mapping (no persistence across a resumed process). It does now
   generalize by program+subcommand (`sessionRuleForRequest()` in `src/approval/policy.ts`), not
   just an exact repeat of the same command.
+
+### Delayed agents
+
+`spawn_agent` can schedule work for later instead of starting it now. Pass exactly one of:
+
+- `start_at`: an ISO datetime in the future (at most 7 days ahead).
+- `delay_seconds`: a positive number of seconds (at most 604800).
+
+The call returns immediately with a queued receipt:
+
+```json
+{"task_id":"task-…","agent_id":"task-…","status":"queued","start_at":"2026-11-13T06:00:00.000Z"}
+```
+
+For example, to run a migration review overnight:
+
+```json
+{
+  "agent": "reviewer",
+  "prompt": "Review the migration in migrations/0042 and report risks.",
+  "description": "overnight migration review",
+  "start_at": "2026-11-13T02:00:00Z",
+  "notify": "on_failure"
+}
+```
+
+Choose `notify` per job: `always` (default) pings when the agent completes, fails, or is
+interrupted; `on_failure` only pings for failures and interruptions; `never` suppresses all
+completion pings. A `needs_approval` ping is always sent, because the agent is blocked.
+Scheduled tasks and dependency queues are persisted in `.subagents/memory/sessions.json`, so
+they survive a host restart. `list_agents` shows their `start_at` and `notify`.
+
+Limits: the host must be running (or restarted) to launch the job, and the machine must be awake.
+A sleeping machine starts the job when it wakes, subject to `scheduledGraceSeconds` (default
+3600). A task restored later than that grace window is marked `blocked` with a structured
+`MISSED_START` error instead of running late; reschedule it with a new `spawn_agent` call.
+Completion pings are delivered at most once.
 
 ### Long-running agents and workflows
 
@@ -366,6 +412,9 @@ Spawn options:
   are passed as delimited input data. Cycles cannot be created because only
   existing prerequisites may be referenced. Queues survive restart; tasks caught
   during launch become interrupted to avoid duplicate execution.
+- `start_at` / `delay_seconds` schedule a spawn for later (see "Delayed agents"). They can be
+  combined with `depends_on`: the task waits for both the clock and its prerequisites.
+  `stop_agents` cancels a scheduled task before it starts.
 - `group_id` labels related agents/tasks. `stop_agents` accepts `agents` or
   `group_id`, cancels queued tasks, and interrupts running members. It returns
   individual outcomes and is safe to repeat. Task IDs can be used for waiting,

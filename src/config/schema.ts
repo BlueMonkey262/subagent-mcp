@@ -77,6 +77,8 @@ export interface ServerLimits {
   readonly staleAgentMs: number;
   /** Default bounded wait for send_message before it returns a running receipt. */
   readonly sendMessageWaitMs: number;
+  /** How late a persisted scheduled task may start before it is blocked as MISSED_START. */
+  readonly scheduledGraceMs: number;
   readonly perBackendConcurrency: Readonly<Partial<Record<Backend, number>>>;
   /** `backend:model-glob` patterns; every matching rule applies as its own pool. */
   readonly perModelConcurrency: readonly ModelConcurrencyRule[];

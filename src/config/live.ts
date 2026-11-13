@@ -137,6 +137,10 @@ export class LiveConfig implements AgentConfigSource {
     return this.#registry?.sendMessageWaitMs() ?? new ConfigRegistry([], emptyRoster()).sendMessageWaitMs();
   }
 
+  scheduledGraceMs(): number {
+    return this.#registry?.scheduledGraceMs() ?? new ConfigRegistry([], emptyRoster()).scheduledGraceMs();
+  }
+
   perBackendConcurrency(): Readonly<Partial<Record<Backend, number>>> {
     return this.#registry?.perBackendConcurrency() ?? {};
   }

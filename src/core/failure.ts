@@ -87,6 +87,7 @@ const SUBTYPE_CLASSIFICATIONS: Readonly<Record<string, Classification>> = {
 /** Codes produced outside a backend adapter, including supervisor and host state. */
 const CODE_CLASSIFICATIONS: ReadonlyArray<readonly [RegExp, Classification]> = [
   [/^AGENT_UNRESPONSIVE$/, PROCESS],
+  [/^MISSED_START$/, TIMEOUT],
   [/^HOST_RESTARTED$/, HOST],
   [/^HOST_UNREACHABLE$|^HOST_UPGRADE_|^HOST_.*TIMEOUT$/, HOST],
   [/^TURN_TIMEOUT$|TIMEOUT$/, TIMEOUT],

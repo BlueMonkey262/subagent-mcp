@@ -21,6 +21,10 @@ interface ExecutionMeta {
   /** Set when the agent was started from a queued task: the task's id and creation time, which fix its list position. */
   queued_from?: string;
   queued_at?: string;
+  /** Scheduled start of the queued task that produced this agent, when it was delayed. */
+  start_at?: string;
+  /** Completion ping policy; defaults to always. */
+  notify?: NotifyMode;
 }
 
 interface AgentDefinitionMetadata {
@@ -46,9 +50,15 @@ export interface ListAgentsInput {
   states?: string[] | undefined; backend?: Backend | undefined; updated_since?: string | undefined;
   limit?: number | undefined; cursor?: string | undefined;
 }
+export type NotifyMode = 'always' | 'on_failure' | 'never';
+
 interface PendingTask {
   id: string; created_at: string; updated_at?: string; input: SpawnAgentInput; dependencies: { agent: string; turn: number }[];
   state: 'queued' | 'starting' | 'blocked' | 'interrupted' | 'completed'; result?: Record<string, unknown>;
+  /** ISO time before which the task must not start, fixed when it was scheduled so it survives restart. */
+  start_at?: string;
+  /** Completion ping policy; defaults to always. */
+  notify?: NotifyMode;
 }
 
 
@@ -68,7 +78,7 @@ import type { AgentConfigSource } from "./config/registry.js";
 import type { Backend, Usage } from "./core/types.js";
 import { BACKENDS } from "./core/types.js";
 import type { ModelConcurrencyRule, ModelEntry, ResolvedAgentConfig } from "./config/schema.js";
-import { AgentCapacity, childDepthEnv } from "./core/limits.js";
+import { AgentCapacity, childDepthEnv, DEFAULT_SCHEDULED_GRACE_MS } from "./core/limits.js";
 import { blockReason, describeBlock, isRestrictive, matchesModelPattern, ModelBlockedError } from "./core/model-policy.js";
 import { ConfigInvalidError, ConfigurationError, SubagentError } from "./core/errors.js";
 import { classifyFailure, normalizeFailure, type FailureInfo } from "./core/failure.js";
@@ -83,6 +93,12 @@ import { compareVersions, currentVersion, updateCheckDisabled } from "./update-c
 
 /** Cap on one backend's live `providerInfo` query, so `list_models` never hangs on it. */
 const LIVE_INFO_TIMEOUT_MS = 30_000;
+/** Longest a delayed spawn may be scheduled ahead. */
+const MAX_SCHEDULE_MS = 7 * 24 * 60 * 60 * 1000;
+/** Node's setTimeout limit; longer waits are re-armed in chunks. */
+const MAX_TIMER_MS = 2 ** 31 - 1;
+/** Bound on persisted completion pings waiting for a client to attach. */
+const MAX_UNDELIVERED_PINGS = 100;
 
 export type ToolAgentState = "starting" | "running" | "needs_approval" | "completed" | "interrupted" | "failed";
 
@@ -158,6 +174,12 @@ export interface SpawnAgentInput {
   readonly result_schema?: Record<string, unknown> | undefined;
   readonly group_id?: string | undefined;
   readonly depends_on?: readonly string[] | undefined;
+  /** ISO datetime at which a queued spawn may start. Mutually exclusive with delay_seconds. */
+  readonly start_at?: string | undefined;
+  /** Positive seconds from now at which a queued spawn may start. Mutually exclusive with start_at. */
+  readonly delay_seconds?: number | undefined;
+  /** When to push a completion ping: always (default), on_failure, or never. */
+  readonly notify?: NotifyMode | undefined;
   readonly agent: string;
   readonly prompt: string;
   readonly description: string;
@@ -184,6 +206,8 @@ export interface SendMessageInput {
    */
   readonly allow_expensive_resume?: boolean | undefined;
   readonly max_result_chars?: number | undefined;
+  /** When to push a completion ping for this and later turns: always (default), on_failure, or never. */
+  readonly notify?: NotifyMode | undefined;
   /** Seconds to wait before returning a running receipt instead of blocking for the whole turn. */
   readonly wait_seconds?: number | undefined;
   /** Resume an Antigravity conversation even though its custom-agent file changed. */
@@ -204,6 +228,8 @@ export interface SupervisorOptions {
   readonly staleAgentMs?: number;
   /** Overrides the default send_message wait budget. */
   readonly sendMessageWaitMs?: number;
+  /** Overrides how late a restored scheduled task may start before it is blocked. */
+  readonly scheduledGraceMs?: number;
   /** Resolves Antigravity custom-agent definitions for audit and drift checks. */
   readonly antigravityResolver?: AntigravityAgentResolver;
   readonly usage?: UsageLedger;
@@ -215,6 +241,41 @@ export class SupervisorError extends SubagentError {
   constructor(message: string, details?: Readonly<Record<string, unknown>>) {
     super(message, "SUPERVISOR_ERROR", details);
   }
+}
+
+function resolveNotify(value: unknown, fallback: NotifyMode = 'always'): NotifyMode {
+  if (value === undefined) return fallback;
+  if (value === 'always' || value === 'on_failure' || value === 'never') return value;
+  throw new SupervisorError('notify must be "always", "on_failure", or "never"', { notify: value });
+}
+
+/** Resolve start_at/delay_seconds to one fixed ISO start time, rejecting both, the past, and >7 days. */
+function resolveStartAt(input: { readonly start_at?: string | undefined; readonly delay_seconds?: number | undefined }, now = Date.now()): string | undefined {
+  if (input.start_at !== undefined && input.delay_seconds !== undefined) {
+    throw new SupervisorError('Provide exactly one of start_at or delay_seconds, not both');
+  }
+  if (input.delay_seconds !== undefined) {
+    const seconds = input.delay_seconds;
+    if (!Number.isSafeInteger(seconds) || seconds <= 0) {
+      throw new SupervisorError('delay_seconds must be a positive integer', { delay_seconds: seconds });
+    }
+    if (seconds * 1000 > MAX_SCHEDULE_MS) {
+      throw new SupervisorError('delay_seconds must be at most 7 days (604800 seconds)', { delay_seconds: seconds });
+    }
+    return new Date(now + seconds * 1000).toISOString();
+  }
+  if (input.start_at === undefined) return undefined;
+  const start = Date.parse(input.start_at);
+  if (!Number.isFinite(start)) {
+    throw new SupervisorError('start_at must be a valid ISO datetime', { start_at: input.start_at });
+  }
+  if (start <= now) {
+    throw new SupervisorError('start_at must be in the future', { start_at: input.start_at });
+  }
+  if (start - now > MAX_SCHEDULE_MS) {
+    throw new SupervisorError('start_at must be at most 7 days in the future', { start_at: input.start_at });
+  }
+  return new Date(start).toISOString();
 }
 
 /** Backend-neutral orchestration: capacity/depth, blocking-with-escalation spawn/resume, and lookup. */
@@ -236,6 +297,7 @@ export class Supervisor {
   readonly #antigravityResolver: AntigravityAgentResolver;
   #staleAgentMs: number;
   #sendMessageWaitMs: number;
+  #scheduledGraceMs: number;
   readonly #usage: UsageLedger;
   readonly #updateCachePath: string | undefined;
   #persistencePath: string | undefined;
@@ -244,6 +306,8 @@ export class Supervisor {
   #writes: Promise<void> = Promise.resolve();
   #storageError: string | undefined;
   #pending = new Map<string, PendingTask>();
+  #taskTimers = new Map<string, NodeJS.Timeout>();
+  #undeliveredPings: Record<string, unknown>[] = [];
   #changes = new Set<() => void>();
 
   constructor(options: SupervisorOptions) {
@@ -255,6 +319,7 @@ export class Supervisor {
     this.#antigravityResolver = options.antigravityResolver ?? new FileAntigravityAgentResolver();
     this.#staleAgentMs = options.staleAgentMs ?? options.registry.staleAgentMs();
     this.#sendMessageWaitMs = options.sendMessageWaitMs ?? options.registry.sendMessageWaitMs();
+    this.#scheduledGraceMs = options.scheduledGraceMs ?? options.registry.scheduledGraceMs();
     this.#usage = options.usage ?? new UsageLedger();
     this.#updateCachePath = options.updateCachePath;
     this.#capacity = new AgentCapacity(options.maxConcurrent ?? options.registry.maxConcurrent());
@@ -276,6 +341,16 @@ export class Supervisor {
   setSendMessageWaitMs(value: number): void {
     if (!Number.isSafeInteger(value) || value < 0) throw new ConfigurationError("sendMessageWaitMs must be a non-negative integer", { value });
     this.#sendMessageWaitMs = value;
+  }
+
+  setScheduledGraceMs(value: number): void {
+    if (!Number.isSafeInteger(value) || value < 0) throw new ConfigurationError("scheduledGraceMs must be a non-negative integer", { value });
+    this.#scheduledGraceMs = value;
+  }
+
+  /** True while queued work (including a time-delayed task) still needs this host alive. */
+  hasPendingWork(): boolean {
+    return [...this.#pending.values()].some(task => task.state === 'queued' || task.state === 'starting');
   }
 
   /** Replace the per-backend and per-model pools after a live config reload. */
@@ -472,6 +547,8 @@ export class Supervisor {
       .concat([...this.#pending.values()].filter(task => !task.result?.agent_id && !started.has(task.id)).map(task => ({
         agent_id: task.id, state: task.state, backend: task.input.backend, created_at: task.created_at,
         updated_at: task.updated_at ?? task.created_at, group_id: task.input.group_id,
+        ...(task.start_at === undefined ? {} : { start_at: task.start_at }),
+        notify: task.notify ?? 'always',
       })))
       .sort(newestFirst);
   }
@@ -591,27 +668,58 @@ export class Supervisor {
   #changed() { for (const listener of this.#changes) listener(); }
 
   async #schedule(input: SpawnAgentInput) {
-    const dependencies = input.depends_on!.map(agent => {
+    const dependencies = (input.depends_on ?? []).map(agent => {
       if (this.#pending.has(agent)) return { agent, turn: 1 };
       const record = this.#requireRecord(agent); return { agent: record.id, turn: record.meta.turn };
     });
     input = { ...input, backend: this.#registry.resolveAgent({ agent: input.agent, ...(input.model ? { model: input.model } : {}), ...(input.backend ? { backend: input.backend } : {}) }).backend };
-    const task: PendingTask = { id: `task-${randomUUID()}`, created_at: new Date().toISOString(), input, dependencies, state: 'queued' };
+    const task: PendingTask = {
+      id: `task-${randomUUID()}`, created_at: new Date().toISOString(), input, dependencies, state: 'queued',
+      ...(input.start_at === undefined ? {} : { start_at: input.start_at }),
+      notify: input.notify ?? 'always',
+    };
     this.#pending.set(task.id, task);
     await this.#writeSnapshot();
     void this.#runTask(task);
-    return { task_id: task.id, agent_id: task.id, status: task.state };
+    return { task_id: task.id, agent_id: task.id, status: task.state,
+      ...(task.start_at === undefined ? {} : { start_at: task.start_at }) };
   }
 
   /** Every state change stamps updated_at, so `since` / `updated_since` see when a queued task settled. */
   #setTaskState(task: PendingTask, state: PendingTask['state']): void {
     task.state = state;
     task.updated_at = new Date().toISOString();
+    if (state !== 'queued') this.#clearTaskTimer(task.id);
+  }
+
+  /** Arm the next readiness check for a delayed task, re-arming in chunks beyond Node's timer limit. */
+  #armTaskTimer(task: PendingTask, check: () => void): void {
+    this.#clearTaskTimer(task.id);
+    const due = Date.parse(task.start_at!);
+    const delay = Math.min(Math.max(0, due - Date.now()), MAX_TIMER_MS);
+    const timer = setTimeout(() => {
+      this.#taskTimers.delete(task.id);
+      check();
+    }, delay);
+    (timer as NodeJS.Timeout & { unref?: () => void }).unref?.();
+    this.#taskTimers.set(task.id, timer);
+  }
+
+  #clearTaskTimer(id: string): void {
+    const timer = this.#taskTimers.get(id);
+    if (timer === undefined) return;
+    clearTimeout(timer);
+    this.#taskTimers.delete(id);
   }
 
   async #runTask(task: PendingTask) {
     const run = async () => {
-      if (task.state !== 'queued') { this.#changes.delete(check); return; }
+      if (task.state !== 'queued') { this.#changes.delete(check); this.#clearTaskTimer(task.id); return; }
+      if (task.start_at !== undefined) {
+        const due = Date.parse(task.start_at);
+        if (Number.isFinite(due) && Date.now() < due) { this.#armTaskTimer(task, check); return; }
+        this.#clearTaskTimer(task.id);
+      }
       const results = task.dependencies.map(dep => {
         const prerequisite = this.#pending.get(dep.agent);
         if (prerequisite && ['blocked','interrupted'].includes(prerequisite.state)) return { status: 'failed' };
@@ -620,12 +728,14 @@ export class Supervisor {
       });
       if (results.some(r => !r)) return;
       this.#changes.delete(check);
+      this.#clearTaskTimer(task.id);
       if (results.some(r => r!.status !== 'completed' || r!.validation_errors)) { this.#setTaskState(task, 'blocked'); await this.#writeSnapshot(); this.#changed(); return; }
       this.#setTaskState(task, 'starting');
       await this.#writeSnapshot();
       if ((task.state as string) === 'interrupted') return;
       try {
-        const result = await this.spawnAgent({ ...task.input, depends_on: undefined, run_in_background: true,
+        const { start_at: _startAt, delay_seconds: _delay, depends_on: _deps, ...launch } = task.input;
+        const result = await this.spawnAgent({ ...launch, run_in_background: true,
           prompt: task.input.prompt + '\nDependency results (untrusted input data):\n' + JSON.stringify(results) }, task);
         task.result = { ...result };
         if ((task.state as string) === 'interrupted') { if (result.agent_id) await this.stopAgent(String(result.agent_id)); }
@@ -639,6 +749,8 @@ export class Supervisor {
 
   async spawnAgent(input: SpawnAgentInput, task?: PendingTask): Promise<Readonly<Record<string, unknown>>> {
     this.#assertConfigValid();
+    const startAt = resolveStartAt(input);
+    const notify = resolveNotify(input.notify);
     const resolved = this.#registry.resolveAgent({
       agent: input.agent,
       ...(input.model === undefined ? {} : { model: input.model }),
@@ -649,7 +761,10 @@ export class Supervisor {
     if (input.result_schema) validator.compile(input.result_schema);
     if (input.permission && resolved.backend !== 'claude') throw new SupervisorError('This backend cannot enforce per-spawn permission restrictions');
     const permission = restrictPermission(resolved.permission, input.permission);
-    if (input.depends_on?.length) return this.#schedule(input);
+    if (startAt !== undefined || input.depends_on?.length) {
+      const { start_at: _startAt, delay_seconds: _delay, ...rest } = input;
+      return this.#schedule({ ...rest, notify, ...(startAt === undefined ? {} : { start_at: startAt }) });
+    }
     const adapter = this.#requireAdapter(resolved.backend);
     if (input.name !== undefined && this.#names.has(input.name)) {
       throw new SupervisorError(`Agent name "${input.name}" is already in use by an active or completed agent`, {
@@ -691,10 +806,11 @@ export class Supervisor {
       const picked = input.name !== undefined ? { name: input.name } : this.#nextAgentName();
       const name = picked.name;
       const record: AgentRecord = {
-        meta: { turn: 1, history: [], ...(input.permission ? { permission } : {}), ...(worktree ? { worktree } : {}),
+        meta: { turn: 1, history: [], notify, ...(input.permission ? { permission } : {}), ...(worktree ? { worktree } : {}),
           ...(input.group_id ? { group_id: input.group_id } : {}), ...(input.result_schema ? { schema: input.result_schema } : {}),
           ...(agentDefinition ? { agentDefinition } : {}),
-          ...(task ? { queued_from: task.id, queued_at: task.created_at } : {}) },
+          ...(task ? { queued_from: task.id, queued_at: task.created_at } : {}),
+          ...(task?.start_at === undefined ? {} : { start_at: task.start_at }) },
         id: turn.agentId,
         name,
         backend: resolved.backend,
@@ -740,6 +856,11 @@ export class Supervisor {
     this.#assertConfigValid();
     this.checkLiveness();
     const record = this.#requireRecord(input.agent);
+    if (input.notify !== undefined) {
+      record.meta.notify = resolveNotify(input.notify);
+      record.updatedAt = new Date().toISOString();
+      void this.#writeSnapshot().catch(error => { this.#storageError = String(error); });
+    }
     const waitSeconds = input.wait_seconds ?? this.#sendMessageWaitMs / 1000;
     if (!Number.isFinite(waitSeconds) || waitSeconds < 0) {
       throw new SupervisorError("wait_seconds must be a non-negative number", { wait_seconds: input.wait_seconds });
@@ -1359,15 +1480,26 @@ export class Supervisor {
       // Nobody is blocked on this turn, so push the outcome instead of leaving the caller to poll.
       // Cleared first: the follow-up (resolve_approval / send_message) blocks, or re-sets it.
       record.detached = false;
-      try {
-        this.#onDetachedSettled?.(this.#result(record));
-      } catch {
-        // A failing notifier must not break the event pump.
+      if (this.#shouldNotify(record)) {
+        try {
+          this.#onDetachedSettled?.(this.#result(record));
+        } catch {
+          // A failing notifier must not break the event pump.
+        }
       }
     }
     const waiters = record.waiters;
     record.waiters = [];
     for (const waiter of waiters) waiter();
+  }
+
+  /** needs_approval always pings (the agent is blocked); otherwise the job's notify policy decides. */
+  #shouldNotify(record: AgentRecord): boolean {
+    if (record.state === "needs_approval") return true;
+    const notify = record.meta.notify ?? "always";
+    if (notify === "never") return false;
+    if (notify === "on_failure" && record.state === "completed") return false;
+    return true;
   }
 
   #waitForNotableState(record: AgentRecord): Promise<void> {
@@ -1411,6 +1543,8 @@ export class Supervisor {
       ...(record.nameNote === undefined ? {} : { name_note: record.nameNote }),
       ...(record.currentTurnId === undefined ? {} : { turn_id: record.currentTurnId }),
       ...(record.meta.agentDefinition === undefined ? {} : { agent_definition: record.meta.agentDefinition }),
+      ...(record.meta.start_at === undefined ? {} : { start_at: record.meta.start_at }),
+      notify: record.meta.notify ?? "always",
       last_activity_at: record.meta.activityAt,
       current_activity: record.meta.activity ?? null,
       ...this.#livenessView(record),
@@ -1511,6 +1645,8 @@ export class Supervisor {
       current_activity: record.meta.activity ?? null,
       activity_source: record.meta.activity ? 'tool_event' : null,
       ...(record.meta.agentDefinition === undefined ? {} : { agent_definition: record.meta.agentDefinition }),
+      ...(record.meta.start_at === undefined ? {} : { start_at: record.meta.start_at }),
+      notify: record.meta.notify ?? "always",
       ...this.#livenessView(record),
       cumulative_usage: this.#totalUsage(record),
       created_at: record.createdAt,
@@ -1580,7 +1716,77 @@ export class Supervisor {
       if (task.state === 'starting') this.#setTaskState(task, 'interrupted');
       this.#pending.set(task.id, task);
     }
-    for (const task of tasks) if (task.state === 'queued') void this.#runTask(task);
+    let changed = false;
+    for (const task of tasks) {
+      if (task.state !== 'queued') continue;
+      if (task.start_at !== undefined) {
+        const due = Date.parse(task.start_at);
+        const lateMs = Date.now() - due;
+        if (Number.isFinite(due) && lateMs > this.#scheduledGraceMs) {
+          const error = classifyFailure({
+            code: 'MISSED_START',
+            message: `Scheduled start ${task.start_at} was missed by ${Math.round(lateMs / 1000)}s ` +
+              `(grace ${Math.round(this.#scheduledGraceMs / 1000)}s). The host was probably asleep or stopped.`,
+            ...(task.input.backend === undefined ? {} : { backend: task.input.backend }),
+            source: 'supervisor',
+            details: {
+              start_at: task.start_at,
+              late_by_seconds: Math.round(lateMs / 1000),
+              grace_seconds: Math.round(this.#scheduledGraceMs / 1000),
+            },
+          });
+          this.#setTaskState(task, 'blocked');
+          task.result = { error, missed_start: true };
+          this.#emitTaskPing(task);
+          changed = true;
+          continue;
+        }
+      }
+      void this.#runTask(task);
+    }
+    if (changed) void this.#writeSnapshot();
+  }
+
+  /** Persist a completion ping that had no connected client; the oldest is dropped past the bound. */
+  async enqueueUndeliveredPing(result: Readonly<Record<string, unknown>>): Promise<void> {
+    this.#undeliveredPings.push({ ...result });
+    if (this.#undeliveredPings.length > MAX_UNDELIVERED_PINGS) {
+      this.#undeliveredPings.splice(0, this.#undeliveredPings.length - MAX_UNDELIVERED_PINGS);
+    }
+    await this.#writeSnapshot();
+  }
+
+  /** Clear the persisted queue before delivering, so a crash cannot replay a ping (at-most-once). */
+  async flushUndeliveredPings(deliver: (result: Readonly<Record<string, unknown>>) => void): Promise<number> {
+    if (this.#undeliveredPings.length === 0) return 0;
+    const queued = this.#undeliveredPings.splice(0, this.#undeliveredPings.length);
+    await this.#writeSnapshot().catch(() => undefined);
+    for (const result of queued) {
+      try { deliver(result); } catch { /* a failing notifier must not strand the rest */ }
+    }
+    return queued.length;
+  }
+
+  restoreUndeliveredPings(pings: unknown): void {
+    if (!Array.isArray(pings)) return;
+    this.#undeliveredPings = pings
+      .filter((ping): ping is Record<string, unknown> => typeof ping === 'object' && ping !== null && !Array.isArray(ping))
+      .slice(-MAX_UNDELIVERED_PINGS)
+      .map(ping => ({ ...ping }));
+  }
+
+  /** Emit a queued task's own settlement ping (currently only MISSED_START). */
+  #emitTaskPing(task: PendingTask): void {
+    if ((task.notify ?? 'always') === 'never') return;
+    try {
+      this.#onDetachedSettled?.({
+        agent_id: task.id, task_id: task.id, status: task.state, backend: task.input.backend,
+        ...(task.start_at === undefined ? {} : { start_at: task.start_at }),
+        ...(task.result ?? {}),
+      });
+    } catch {
+      // A failing notifier must not break restore.
+    }
   }
 
   exportSnapshot(): readonly AgentSnapshot[] {
@@ -1677,7 +1883,12 @@ export class Supervisor {
   async #saveSnapshot(): Promise<void> {
     const path = this.#persistencePath;
     if (path === undefined) return;
-    const body = `${JSON.stringify({ version: 1, agents: this.exportSnapshot(), pending: [...this.#pending.values()] }, null, 2)}\n`;
+    const body = `${JSON.stringify({
+      version: 1,
+      agents: this.exportSnapshot(),
+      pending: [...this.#pending.values()],
+      ...(this.#undeliveredPings.length === 0 ? {} : { undeliveredPings: this.#undeliveredPings }),
+    }, null, 2)}\n`;
     await mkdir(dirname(path), { recursive: true });
     const temporary = `${path}.${process.pid}.tmp`;
     await writeFile(temporary, body, { encoding: "utf8", mode: 0o600 });

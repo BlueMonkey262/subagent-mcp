@@ -8,6 +8,8 @@ export const DEFAULT_SEND_MESSAGE_WAIT_MS = 30_000;
 export const DEFAULT_STALE_AGENT_MS = 5 * 60 * 1000;
 /** Codex resume replays the thread with no prompt cache. Refuse after this idle unless forced. */
 export const DEFAULT_CODEX_RESUME_IDLE_MS = 30 * 60 * 1000;
+/** A scheduled task restored later than this after its start is blocked as MISSED_START. */
+export const DEFAULT_SCHEDULED_GRACE_MS = 60 * 60 * 1000;
 export const MAX_AGENT_DEPTH = 3;
 export const AGENT_DEPTH_ENV = "SUBAGENT_MCP_DEPTH";
 export const MAX_CONCURRENT_ENV = "SUBAGENT_MCP_MAX_CONCURRENT";

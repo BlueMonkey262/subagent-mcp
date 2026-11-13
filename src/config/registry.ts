@@ -7,6 +7,7 @@ import { ConfigurationError } from "../core/errors.js";
 import {
   AGENT_DEPTH_ENV,
   DEFAULT_CODEX_RESUME_IDLE_MS,
+  DEFAULT_SCHEDULED_GRACE_MS,
   DEFAULT_SEND_MESSAGE_WAIT_MS,
   DEFAULT_STALE_AGENT_MS,
   MAX_CONCURRENT_AGENTS,
@@ -49,6 +50,7 @@ export interface AgentConfigSource {
   codexResumeIdleMs(): number;
   staleAgentMs(): number;
   sendMessageWaitMs(): number;
+  scheduledGraceMs(): number;
   perBackendConcurrency(): Readonly<Partial<Record<Backend, number>>>;
   perModelConcurrency(): readonly ModelConcurrencyRule[];
   allowances(): Readonly<Partial<Record<Backend, Allowance>>>;
@@ -109,6 +111,10 @@ export class ConfigRegistry implements AgentConfigSource {
 
   sendMessageWaitMs(): number {
     return this.limits.sendMessageWaitMs;
+  }
+
+  scheduledGraceMs(): number {
+    return this.limits.scheduledGraceMs;
   }
 
   perBackendConcurrency(): Readonly<Partial<Record<Backend, number>>> {
@@ -185,6 +191,7 @@ export function defaultServerLimits(): ServerLimits {
     codexResumeIdleMs: DEFAULT_CODEX_RESUME_IDLE_MS,
     staleAgentMs: DEFAULT_STALE_AGENT_MS,
     sendMessageWaitMs: DEFAULT_SEND_MESSAGE_WAIT_MS,
+    scheduledGraceMs: DEFAULT_SCHEDULED_GRACE_MS,
     perBackendConcurrency: {},
     perModelConcurrency: [],
     allowances: {},
@@ -423,11 +430,13 @@ function parseServerLimits(root: UnknownRecord, path: string): ServerLimits {
   const idleSeconds = optionalPositiveInteger(root, "codexResumeIdleSeconds", path);
   const staleSeconds = optionalPositiveInteger(root, "staleAgentSeconds", path);
   const sendWaitSeconds = optionalPositiveInteger(root, "sendMessageWaitSeconds", path);
+  const scheduledGraceSeconds = optionalPositiveInteger(root, "scheduledGraceSeconds", path);
   return {
     maxConcurrent,
     codexResumeIdleMs: idleSeconds === undefined ? DEFAULT_CODEX_RESUME_IDLE_MS : idleSeconds * 1000,
     staleAgentMs: staleSeconds === undefined ? DEFAULT_STALE_AGENT_MS : staleSeconds * 1000,
     sendMessageWaitMs: sendWaitSeconds === undefined ? DEFAULT_SEND_MESSAGE_WAIT_MS : sendWaitSeconds * 1000,
+    scheduledGraceMs: scheduledGraceSeconds === undefined ? DEFAULT_SCHEDULED_GRACE_MS : scheduledGraceSeconds * 1000,
     perBackendConcurrency: parsePerBackendConcurrency(root["perBackendConcurrency"], path),
     perModelConcurrency: parsePerModelConcurrency(root["perModelConcurrency"], path),
     allowances: parseAllowances(root["allowances"], path),

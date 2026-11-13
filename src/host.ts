@@ -109,6 +109,18 @@ const IDLE_EXIT_MS = 60_000;
 const CONNECT_WAIT_MS = 8_000;
 const RECORDED_HOST_WAIT_MS = 2_000;
 
+/** True while the host must stay up: live agents, capacity waiters, or queued/scheduled tasks. */
+export function hasLiveWork(
+  supervisor: Pick<Supervisor, "concurrency" | "listAgents" | "hasPendingWork">,
+): boolean {
+  const { active, waiting } = supervisor.concurrency();
+  if (active > 0 || waiting > 0 || supervisor.hasPendingWork()) return true;
+  return supervisor.listAgents().some((agent) => {
+    const state = agent["state"];
+    return state === "running" || state === "starting" || state === "needs_approval";
+  });
+}
+
 export interface HostPaths {
   readonly socketPath: string;
   readonly directory: string;
@@ -157,9 +169,19 @@ export async function serveHost(options: {
 }): Promise<RunningHost> {
   const sockets = new Set<Socket>();
   let shuttingDown = false;
+  const broadcast = (message: Readonly<Record<string, unknown>>): void => {
+    const line = `${JSON.stringify(message)}\n`;
+    for (const socket of sockets) socket.write(line);
+  };
   const server: Server = createServer((socket) => {
+    const wasEmpty = sockets.size === 0;
     sockets.add(socket);
     options.onClients?.(sockets.size);
+    if (wasEmpty) {
+      // Pings that arrived with no client attached were persisted; hand them to the first one.
+      void options.supervisor.flushUndeliveredPings((result) => broadcast({ event: "detached", data: result }))
+        .catch(() => undefined);
+    }
     const buffer = { text: "" };
     socket.setEncoding("utf8");
     socket.on("data", (chunk: string) => {
@@ -196,8 +218,7 @@ export async function serveHost(options: {
       return sockets.size;
     },
     notify(message) {
-      const line = `${JSON.stringify(message)}\n`;
-      for (const socket of sockets) socket.write(line);
+      broadcast(message);
     },
     close() {
       for (const socket of sockets) socket.destroy();
@@ -411,21 +432,33 @@ export async function runHost(): Promise<void> {
     updateCachePath: join(paths.directory, "update.json"),
     maxConcurrent: live.maxConcurrent(),
     staleAgentMs: live.staleAgentMs(),
-    onDetachedSettled: (result) => endpoint?.notify({ event: "detached", data: result }),
+    scheduledGraceMs: live.scheduledGraceMs(),
+    onDetachedSettled: (result) => {
+      if (endpoint !== undefined && endpoint.clients > 0) endpoint.notify({ event: "detached", data: result });
+      else void supervisor.enqueueUndeliveredPing(result).catch(() => undefined);
+    },
   });
   live.watch(() => {
     supervisor.setMaxConcurrent(live.maxConcurrent());
     supervisor.setStaleAgentMs(live.staleAgentMs());
     supervisor.setSendMessageWaitMs(live.sendMessageWaitMs());
+    supervisor.setScheduledGraceMs(live.scheduledGraceMs());
     supervisor.setCapacityConfig(live.perBackendConcurrency(), live.perModelConcurrency());
     supervisor.checkLiveness();
   });
   supervisor.restore(await readSnapshot(paths.snapshotPath));
-  let pending = [];
-  try { pending = JSON.parse(await readFile(paths.snapshotPath, 'utf8')).pending ?? []; }
-  catch(error) { if (!isErrno(error, 'ENOENT')) throw error; }
+  let pending: any[] = [];
+  let undeliveredPings: unknown = [];
+  try {
+    const snapshot: any = JSON.parse(await readFile(paths.snapshotPath, 'utf8'));
+    pending = snapshot.pending ?? [];
+    undeliveredPings = snapshot.undeliveredPings ?? [];
+  } catch(error) { if (!isErrno(error, 'ENOENT')) throw error; }
   supervisor.enablePersistence(paths.snapshotPath);
   await supervisor.recoverResults();
+  // Restore before pending tasks can settle: a MISSED_START ping emitted during restore must append to
+  // this queue, not be overwritten by it.
+  supervisor.restoreUndeliveredPings(undeliveredPings);
   supervisor.restorePending(pending);
 
   const runUpdateCheck = (): void => {
@@ -471,12 +504,7 @@ export async function runHost(): Promise<void> {
     if (clients > 0 || shuttingDown) return;
     idleTimer = setTimeout(() => {
       supervisor.checkLiveness();
-      const { active, waiting } = supervisor.concurrency();
-      const liveAgent = supervisor.listAgents().some((agent) => {
-        const state = agent["state"];
-        return state === "running" || state === "starting" || state === "needs_approval";
-      });
-      if (active > 0 || waiting > 0 || liveAgent) return;
+      if (hasLiveWork(supervisor)) return;
       void shutdown();
     }, IDLE_EXIT_MS);
   };
@@ -497,6 +525,8 @@ export class HostClient {
   readonly #socket: Socket;
   readonly #pending = new Map<number, { resolve: (value: unknown) => void; reject: (error: Error) => void }>();
   readonly #detached: Array<(data: Readonly<Record<string, unknown>>) => void> = [];
+  /** Pings that arrived before the proxy registered its listener (e.g. a flush on attach). */
+  readonly #bufferedDetached: Record<string, unknown>[] = [];
   #buffer = "";
   #nextId = 1;
   #closed = false;
@@ -534,6 +564,9 @@ export class HostClient {
 
   onDetached(listener: (data: Readonly<Record<string, unknown>>) => void): void {
     this.#detached.push(listener);
+    if (this.#bufferedDetached.length > 0) {
+      for (const data of this.#bufferedDetached.splice(0, this.#bufferedDetached.length)) listener(data);
+    }
   }
 
   call(method: string, params?: unknown, timeoutMs = 0): Promise<unknown> {
@@ -575,7 +608,12 @@ export class HostClient {
       }
       if (!isRecord(message)) continue;
       if (message["event"] === "detached" && isRecord(message["data"])) {
-        for (const listener of this.#detached) listener(message["data"]);
+        if (this.#detached.length === 0) {
+          this.#bufferedDetached.push(message["data"]);
+          if (this.#bufferedDetached.length > 100) this.#bufferedDetached.shift();
+        } else {
+          for (const listener of this.#detached) listener(message["data"]);
+        }
         continue;
       }
       if (typeof message["id"] !== "number") continue;
