@@ -175,6 +175,8 @@ export async function serveHost(options: {
   readonly supervisor: Supervisor;
   readonly onClients?: (count: number) => void;
   readonly onShutdown?: () => void;
+  /** Set once the host begins shutting down; no further mutating RPCs are accepted. */
+  readonly shuttingDown?: () => boolean;
 }): Promise<RunningHost> {
   const sockets = new Set<Socket>();
   const attached = new Set<Socket>();
@@ -219,7 +221,8 @@ export async function serveHost(options: {
           if (shuttingDown) return;
           shuttingDown = true;
           options.onShutdown?.();
-        }, { clients: () => sockets.size, attached: () => attached.size, attach: () => attach(socket) });
+        }, { clients: () => sockets.size, attached: () => attached.size, attach: () => attach(socket),
+          shuttingDown: () => shuttingDown || options.shuttingDown?.() === true });
       }
     });
     const drop = (): void => {
@@ -540,6 +543,9 @@ export async function runHost(): Promise<void> {
       cursor.closeAll(),
     ]).catch(() => undefined);
     const ownsPaths = await ownsHostPaths(paths, process.pid);
+    // Persist the final snapshot before closing the endpoint or removing the socket/pid/lock. Once
+    // those are gone a replacement host can start, and it must not later be overwritten by ours.
+    await supervisor.flushSnapshot().catch(() => undefined);
     // net.Server.close() unlinks Unix sockets, so an orphan must exit without closing a replacement's path.
     if (ownsPaths) await endpoint?.close();
     if (ownsPaths && await ownsHostPaths(paths, process.pid)) {
@@ -549,9 +555,6 @@ export async function runHost(): Promise<void> {
         await rm(paths.pidPath, { force: true }).catch(() => undefined);
       }
     }
-    // Persist queued/scheduled tasks and undelivered pings before exiting so a replacement host
-    // can restore and re-arm them.
-    await supervisor.flushSnapshot().catch(() => undefined);
     process.exit(0);
   };
   const scheduleIdle = (clients: number): void => {
@@ -570,6 +573,7 @@ export async function runHost(): Promise<void> {
     supervisor,
     onClients: scheduleIdle,
     onShutdown: () => void shutdown(),
+    shuttingDown: () => shuttingDown,
   });
   await writeFile(paths.pidPath, `${JSON.stringify({ pid: process.pid, protocol: HOST_PROTOCOL, socketPath: paths.socketPath })}\n`);
   await refreshLockForOwner(paths.lockPath, process.pid);
@@ -707,6 +711,10 @@ async function handleLine(
   }
   const id = request["id"];
   const method = request["method"];
+  if (method !== "hello" && method !== "shutdown" && context.shuttingDown()) {
+    socket.write(`${JSON.stringify({ id, error: { message: "subagent-mcp host is shutting down", code: "HOST_SHUTTING_DOWN" } })}\n`);
+    return;
+  }
   try {
     const result = await dispatch(supervisor, method, request["params"], context);
     socket.write(`${JSON.stringify({ id, result })}\n`);
@@ -729,6 +737,8 @@ interface DispatchContext {
   readonly attached: () => number;
   /** Mark the calling socket as a ping consumer and flush the persisted queue to it. */
   readonly attach: () => Promise<Readonly<Record<string, unknown>>>;
+  /** True once the host is shutting down and must not accept more state changes. */
+  readonly shuttingDown: () => boolean;
 }
 
 async function dispatch(supervisor: Supervisor, method: string, params: unknown, context: DispatchContext): Promise<unknown> {

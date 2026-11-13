@@ -4,7 +4,7 @@ import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 import { AdapterRegistry } from "../src/adapters/adapter.js";
 import { FakeAdapter } from "../src/adapters/fake.js";
@@ -674,6 +674,44 @@ test("a settle with only a probe connected is queued, then delivered on attach_s
     consumer?.close();
     await endpoint.close();
     await rm(paths.socketPath, { force: true });
+    await rm(cwd, { recursive: true, force: true });
+  }
+});
+
+test("shutdown writes the final snapshot before removing the socket, pid, and lock", { timeout: 20_000 }, async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "subagent-host-shutdown-order-"));
+  const paths = hostPaths(cwd);
+  const orderPath = join(cwd, "shutdown-order.json");
+  const fixture = pathToFileURL(join(process.cwd(), "test", "shutdown-order-fixture.mjs")).href;
+  const saved = {
+    NODE_OPTIONS: process.env.NODE_OPTIONS,
+    SUBAGENT_TEST_SOCKET: process.env.SUBAGENT_TEST_SOCKET,
+    SUBAGENT_TEST_PID: process.env.SUBAGENT_TEST_PID,
+    SUBAGENT_TEST_LOCK: process.env.SUBAGENT_TEST_LOCK,
+    SUBAGENT_TEST_ORDER_PATH: process.env.SUBAGENT_TEST_ORDER_PATH,
+  };
+  process.env.NODE_OPTIONS = `${saved.NODE_OPTIONS ?? ""} --import=${fixture}`.trim();
+  process.env.SUBAGENT_TEST_SOCKET = paths.socketPath;
+  process.env.SUBAGENT_TEST_PID = paths.pidPath;
+  process.env.SUBAGENT_TEST_LOCK = paths.lockPath;
+  process.env.SUBAGENT_TEST_ORDER_PATH = orderPath;
+  let client: HostClient | undefined;
+  try {
+    client = await connectHost(daemonOptions(cwd));
+    const hello = await client.call("hello") as { pid: number };
+    await client.call("shutdown");
+    client.close();
+    client = undefined;
+    await waitForPidExit(hello.pid);
+    const order = JSON.parse(await readFile(orderPath, "utf8")) as { socket: boolean; pid: boolean; lock: boolean };
+    assert.deepEqual(order, { socket: true, pid: true, lock: true }, "the final snapshot ran before any endpoint removal");
+  } finally {
+    for (const [key, value] of Object.entries(saved)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+    client?.close();
+    await stopDaemon(cwd);
     await rm(cwd, { recursive: true, force: true });
   }
 });
