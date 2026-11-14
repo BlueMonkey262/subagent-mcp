@@ -44,7 +44,7 @@ async function main(): Promise<void> {
       title: "Spawn subagent",
       description:
         "Delegate implementation, research, or exploration work to a fresh subagent (Claude Code, Codex, " +
-        "OpenCode, Antigravity, Cursor, or GitHub Copilot). Mirrors the native Agent tool: the child starts with no parent context, blocks by default " +
+        "OpenCode, Antigravity, Cursor, GitHub Copilot, or Mistral Vibe). Mirrors the native Agent tool: the child starts with no parent context, blocks by default " +
         "until it finishes or needs your approval, and returns a resumable agent_id. The result always includes " +
         "a human-memorable `name` (auto-assigned unless supplied) and `timeout_seconds`: the turn cap in seconds, " +
         "or null when neither this call nor the agent config sets one. Refer to agents by name in later tool calls. " +
@@ -64,8 +64,9 @@ async function main(): Promise<void> {
         model: z.string().optional().describe("Required unless the agent config pins a model"),
         effort: z.string().optional().describe(
           "Reasoning effort for this agent: \"low\"/\"medium\"/\"high\"/\"xhigh\"/\"max\". Applied to Claude " +
-          "(--effort), Codex, Antigravity (low/medium/high), and Copilot (--reasoning-effort). OpenCode and Cursor reject this argument: " +
-          "OpenCode has no effort parameter, and Cursor folds effort into the model id (for example grok-4.7-high). " +
+          "(--effort), Codex, Antigravity (low/medium/high), and Copilot (--reasoning-effort). OpenCode, Cursor and Vibe reject this argument: " +
+          "OpenCode has no effort parameter, Cursor folds effort into the model id (for example grok-4.7-high), " +
+          "and Vibe sets thinking per model alias in its own config. " +
           "Overridable unless the agent config pins it.",
         ),
         backend: z.enum(BACKENDS).optional().describe("Overrides the agent config's backend"),
@@ -103,7 +104,7 @@ async function main(): Promise<void> {
         prompt: z.string(),
         effort: z.string().optional().describe(
           "Reasoning effort for this turn (Codex, Antigravity and Copilot per-turn; Claude only when the session must cold-start). " +
-          "OpenCode and Cursor reject it. Defaults to the value used at spawn.",
+          "OpenCode, Cursor and Vibe reject it. Defaults to the value used at spawn.",
         ),
         timeout: z.number().int().positive().optional().describe(
           "Turn cap in seconds for this resume. Overrides the agent config. Echoed back as timeout_seconds.",

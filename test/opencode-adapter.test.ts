@@ -217,6 +217,25 @@ test("v2: failed and interrupted outcomes map to the matching turn status", asyn
   }
 });
 
+test("v2: a provider error in the turn log is reported once, classified, ahead of the failed turn", async () => {
+  const fake = new FakeV2();
+  const baseUrl = await fake.listen();
+  const adapter = new OpenCodeAdapter({ baseUrl, protocol: "v2", password: PASSWORD, ...fast });
+  try {
+    const turn = await adapter.spawn(request());
+    const events = adapter.events(turn.agentId)[Symbol.asyncIterator]();
+    fake.push({ id: "msg_err", type: "error", time: { created: Date.now() }, error: { type: "provider.api", message: "Rate limit exceeded", statusCode: 429 } });
+    const error = await nextEvent(events, "error");
+    assert.deepEqual(error.data, { code: "OPENCODE_RATE_LIMITED", message: "Rate limit exceeded", fatal: false, details: { model: (error.data as unknown as { details: { model: string } }).details.model, statusCode: 429, type: "provider.api", class: "rate_limit" } });
+    fake.push({ id: "msg_idle_err", type: "idle", time: { created: Date.now() }, outcome: "failed" });
+    const done = await nextEvent(events, "turn.completed");
+    assert.equal((done.data as { status: string }).status, "failed");
+  } finally {
+    await adapter.closeAll();
+    fake.close();
+  }
+});
+
 test("v2: pending permissions come from the session route and replies use /permission/{id}/reply", async () => {
   const fake = new FakeV2();
   const baseUrl = await fake.listen();
@@ -373,7 +392,7 @@ test("v2: providerInfo summarizes models, the default, and Go usage without leak
     const info = await adapter.providerInfo();
     assert.equal(info["default_model"], "opencode-go/hy4");
     assert.deepEqual(info.models, [{
-      id: "opencode-go/hy4", name: "Hy4", status: "active", context: 1048576, max_output: 65536,
+      id: "opencode-go/hy4", provider: "opencode-go", name: "Hy4", status: "active", context: 1048576, max_output: 65536,
       cost_per_mtok: { input: 0.834, output: 2.501, cache_read: 0.042 }, variants: ["none", "high"],
     }]);
     assert.deepEqual(info["usage_limits"], {
@@ -438,7 +457,7 @@ test("v2: a hung usage endpoint times out on its own and the model list still co
   const adapter = new OpenCodeAdapter({ baseUrl, protocol: "v2", password: PASSWORD, ...fast, liveSectionTimeoutMs: 50 });
   try {
     const info = await adapter.providerInfo();
-    assert.deepEqual(info.models, [{ id: "opencode-go/hy4" }]);
+    assert.deepEqual(info.models, [{ id: "opencode-go/hy4", provider: "opencode-go" }]);
     assert.ok((info["errors"] as Record<string, string>)["usage_limits"], "the hung section is reported, not awaited");
   } finally {
     await adapter.closeAll();

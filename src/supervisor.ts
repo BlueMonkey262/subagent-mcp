@@ -49,6 +49,7 @@ import type { AgentConfigSource } from "./config/registry.js";
 import type { Backend, Usage } from "./core/types.js";
 import type { ModelEntry } from "./config/schema.js";
 import { AgentCapacity, childDepthEnv } from "./core/limits.js";
+import { classifyProviderError, providerOf, type ProviderErrorClass } from "./core/providers.js";
 import { blockReason, describeBlock, isRestrictive, ModelBlockedError } from "./core/model-policy.js";
 import { ConfigInvalidError, ConfigurationError, SubagentError } from "./core/errors.js";
 import { EventBuffer } from "./events/buffer.js";
@@ -56,7 +57,7 @@ import type { EventReadOptions } from "./events/buffer.js";
 import type { AgentEvent } from "./events/schema.js";
 import { scanChildOutput } from "./safety/output.js";
 import { describeToolInput } from "./tool-describe.js";
-import { remainingAllowances, UsageLedger } from "./usage.js";
+import { remainingAllowances, UsageLedger, usageByProvider } from "./usage.js";
 import { MAX_CONTENT_CHARS, truncateText } from "./truncate.js";
 import { compareVersions, currentVersion, updateCheckDisabled } from "./update-check.js";
 
@@ -194,6 +195,15 @@ export interface SupervisorOptions {
   readonly updateCachePath?: string;
 }
 
+interface ProviderGate {
+  capacity?: AgentCapacity;
+  cooldownUntil: number;
+  rate_limited: number;
+  auth_failures: number;
+  quota_failures: number;
+  last_error?: { readonly class: ProviderErrorClass; readonly message: string; readonly at: string; readonly agent: string };
+}
+
 export class SupervisorError extends SubagentError {
   constructor(message: string, details?: Readonly<Record<string, unknown>>) {
     super(message, "SUPERVISOR_ERROR", details);
@@ -210,6 +220,8 @@ export class Supervisor {
   readonly #adapters: AdapterRegistry;
   readonly #cwd: string;
   readonly #capacity: AgentCapacity;
+  /** Per-provider slots, cooldown and failure counts (models.yaml `providerLimits`). */
+  readonly #providers = new Map<string, ProviderGate>();
   readonly #approvals: ApprovalCoordinator;
   readonly #agents = new Map<string, AgentRecord>();
   readonly #names = new Map<string, string>();
@@ -367,11 +379,13 @@ export class Supervisor {
       models: this.#roster(backend),
       ...(isRestrictive(this.#registry.modelPolicy()) ? { model_policy: this.#policyView() } : {}),
       usage: backend === undefined ? usage : usage[backend],
+      ...(backend === undefined ? { usage_by_provider: usageByProvider(usage) } : {}),
       ...(filteredAllowance === undefined || (backend !== undefined && filteredAllowance === undefined)
         ? {}
         : { allowances: filteredAllowance }),
       ...(filteredRemaining === undefined ? {} : { remaining: filteredRemaining }),
       concurrency: this.concurrency(),
+      ...(() => { const providers = this.providersView(); return Object.keys(providers).length === 0 ? {} : { providers }; })(),
       ...(warning === undefined ? {} : { config_warning: warning }),
     };
   }
@@ -623,7 +637,7 @@ export class Supervisor {
 
     const childEnv = childDepthEnv(process.env);
     const timeoutSeconds = input.timeout ?? resolved.timeout ?? null;
-    const release = await this.#acquireCapacity();
+    const release = await this.#acquireCapacity(resolved.backend, resolved.model);
     if (task?.state === 'interrupted') { release(); return { status: 'interrupted' }; }
     // The policy can change while a spawn waits for a slot (models.yaml is hot-reloaded).
     try { this.#assertModelAllowed(resolved.backend, resolved.model); } catch (error) { release(); throw error; }
@@ -650,6 +664,8 @@ export class Supervisor {
         permission,
         ...(input.max_turns !== undefined ? { maxTurns: input.max_turns } : resolved.maxTurns !== undefined ? { maxTurns: resolved.maxTurns } : {}),
         ...(timeoutSeconds === null ? {} : { timeoutMs: timeoutSeconds * 1000 }),
+        ...(resolved.vibeMaxTokens === undefined ? {} : { vibeMaxTokens: resolved.vibeMaxTokens }),
+        ...(resolved.vibeMaxPriceUsd === undefined ? {} : { vibeMaxPriceUsd: resolved.vibeMaxPriceUsd }),
         ...(resolved.reasoningEffort === undefined ? {} : { reasoningEffort: resolved.reasoningEffort }),
       });
       launched = true;
@@ -738,7 +754,7 @@ export class Supervisor {
     else record.warning = warning;
     // The agent went terminal and released its slot; resuming it is active work
     // again, so re-count it. The call waits when the pool is full.
-    record.release = await this.#acquireCapacity();
+    record.release = await this.#acquireCapacity(record.backend, record.model);
     try { this.#assertModelAllowed(record.backend, record.model); } catch (error) { record.release(); throw error; }
     record.state = "running";
     record.timedOut = false;
@@ -793,6 +809,8 @@ export class Supervisor {
       env: { ...resolved.env, SUBAGENT_MCP_DEPTH: childEnv.SUBAGENT_MCP_DEPTH ?? "1" },
       permission: intersectPermission(resolved.permission, record.meta.permission),
       ...(resolved.maxTurns === undefined ? {} : { maxTurns: resolved.maxTurns }),
+      ...(resolved.vibeMaxTokens === undefined ? {} : { vibeMaxTokens: resolved.vibeMaxTokens }),
+      ...(resolved.vibeMaxPriceUsd === undefined ? {} : { vibeMaxPriceUsd: resolved.vibeMaxPriceUsd }),
       ...(timeoutSeconds === null ? {} : { timeoutMs: timeoutSeconds * 1000 }),
       ...(resolved.reasoningEffort === undefined ? {} : { reasoningEffort: resolved.reasoningEffort }),
     });
@@ -1040,6 +1058,7 @@ export class Supervisor {
           }
           if (event.type === "error") {
             record.lastError = { code: event.data.code, message: scanChildOutput(event.data.message) };
+            this.#noteProviderError(record, event.data.code, record.lastError.message, event.data.details);
             if (/TIMEOUT/.test(event.data.code)) record.timedOut = true;
             if (event.data.fatal) {
               record.state = "failed";
@@ -1421,9 +1440,87 @@ export class Supervisor {
     }
   }
 
-  #acquireCapacity(): Promise<() => void> {
-    const placeholder = `pending-${randomUUID()}`;
-    return this.#capacity.acquireWhenFree(placeholder);
+  /**
+   * A global slot, plus a provider slot when models.yaml limits that provider. A provider in
+   * cooldown after a rate limit is waited out first, and the provider slot is taken before the
+   * global one, so a throttled provider never holds global slots that other backends could use.
+   */
+  async #acquireCapacity(backend: Backend, model: string): Promise<() => void> {
+    const releaseProvider = await this.#acquireProvider(backend, model);
+    let releaseGlobal: () => void;
+    try {
+      releaseGlobal = await this.#capacity.acquireWhenFree(`pending-${randomUUID()}`);
+    } catch (error) {
+      releaseProvider();
+      throw error;
+    }
+    return () => { releaseGlobal(); releaseProvider(); };
+  }
+
+  async #acquireProvider(backend: Backend, model: string): Promise<() => void> {
+    const provider = providerOf(backend, model);
+    if (provider === undefined) return () => undefined;
+    const gate = this.#gate(provider);
+    for (let wait = gate.cooldownUntil - Date.now(); wait > 0; wait = gate.cooldownUntil - Date.now()) {
+      await new Promise((resolve) => setTimeout(resolve, wait));
+    }
+    const limit = this.#registry.providerLimits()[provider]?.maxConcurrent;
+    if (limit === undefined) return () => undefined;
+    if (gate.capacity === undefined) gate.capacity = new AgentCapacity(limit);
+    else if (gate.capacity.limit !== limit) gate.capacity.setLimit(limit);
+    return gate.capacity.acquireWhenFree(`pending-${randomUUID()}`);
+  }
+
+  #gate(provider: string): ProviderGate {
+    let gate = this.#providers.get(provider);
+    if (gate === undefined) {
+      gate = { cooldownUntil: 0, rate_limited: 0, auth_failures: 0, quota_failures: 0 };
+      this.#providers.set(provider, gate);
+    }
+    return gate;
+  }
+
+  /** Count a classified provider failure; a rate limit starts the provider's configured cooldown. */
+  #noteProviderError(record: AgentRecord, code: string, message: string, details: Readonly<Record<string, unknown>> | undefined): void {
+    const provider = providerOf(record.backend, record.model);
+    if (provider === undefined) return;
+    const declared = details?.["class"];
+    const kind: ProviderErrorClass | undefined = declared === "rate_limit" || declared === "auth" || declared === "quota"
+      ? declared
+      : code.startsWith("OPENCODE_") ? classifyProviderError(message, typeof details?.["statusCode"] === "number" ? details["statusCode"] : undefined) : undefined;
+    if (kind === undefined) return;
+    const gate = this.#gate(provider);
+    const at = new Date().toISOString();
+    gate.last_error = { class: kind, message: message.slice(0, 300), at, agent: record.name };
+    if (kind === "auth") { gate.auth_failures += 1; return; }
+    if (kind === "quota") { gate.quota_failures += 1; return; }
+    gate.rate_limited += 1;
+    const seconds = this.#registry.providerLimits()[provider]?.cooldownSeconds;
+    if (seconds === undefined) return;
+    // Jitter (±20%) so agents waiting on the same provider do not all resume in one burst.
+    const until = Date.now() + seconds * 1000 * (0.8 + Math.random() * 0.4);
+    gate.cooldownUntil = Math.max(gate.cooldownUntil, until);
+  }
+
+  /** Provider gates for list_models: limits, live slots, cooldown and failure counts. */
+  providersView(): Readonly<Record<string, unknown>> {
+    const limits = this.#registry.providerLimits();
+    const names = new Set([...Object.keys(limits), ...this.#providers.keys()]);
+    const view: Record<string, unknown> = {};
+    for (const provider of [...names].sort()) {
+      const gate = this.#providers.get(provider);
+      const limit = limits[provider];
+      view[provider] = {
+        ...(limit?.maxConcurrent === undefined ? {} : { limit: limit.maxConcurrent, active: gate?.capacity?.activeCount ?? 0, waiting: gate?.capacity?.waitingCount ?? 0 }),
+        ...(limit?.cooldownSeconds === undefined ? {} : { cooldown_seconds: limit.cooldownSeconds }),
+        ...(gate !== undefined && gate.cooldownUntil > Date.now() ? { cooling_down_until: new Date(gate.cooldownUntil).toISOString() } : {}),
+        rate_limited: gate?.rate_limited ?? 0,
+        auth_failures: gate?.auth_failures ?? 0,
+        quota_failures: gate?.quota_failures ?? 0,
+        ...(gate?.last_error === undefined ? {} : { last_error: gate.last_error }),
+      };
+    }
+    return view;
   }
 }
 

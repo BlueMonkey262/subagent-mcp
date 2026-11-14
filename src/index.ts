@@ -4,6 +4,7 @@ export * from "./adapters/claude/index.js";
 export * from "./adapters/codex/index.js";
 export * from "./adapters/cursor/index.js";
 export * from "./adapters/copilot/index.js";
+export * from "./adapters/vibe/index.js";
 export * from "./adapters/opencode/index.js";
 export * from "./adapters/fake.js";
 export * from "./approval/coordinator.js";

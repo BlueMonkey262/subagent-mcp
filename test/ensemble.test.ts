@@ -24,7 +24,7 @@ function fixture(options: { maxConcurrent?: number; directory?: string; supervis
   const codex = new FakeAdapter("codex");
   const opencode = new FakeAdapter("opencode");
   const registry = new ConfigRegistry([config("codex-general", "codex"), config("opencode-general", "opencode")], {
-    claude: [], codex: [{ name: "sol" }, { name: "luna" }], opencode: [{ name: "provider/a" }], antigravity: [], cursor: [], copilot: [],
+    claude: [], codex: [{ name: "sol" }, { name: "luna" }], opencode: [{ name: "provider/a" }], antigravity: [], cursor: [], copilot: [], vibe: [],
   });
   const detached: Record<string, unknown>[] = [];
   const events: Record<string, unknown>[] = [];

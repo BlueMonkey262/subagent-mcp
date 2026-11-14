@@ -12,6 +12,13 @@
 # disabledBackends: [antigravity]
 # blockModels: ["*grok*", "codex:gpt-5.6-sol"]
 # blockClaudeModels: true   # Claude subagents go through Claude Code's own Agent tool instead
+# Per-provider guard for OpenCode `provider/model` ids (README: "Provider limits"): at most
+# maxConcurrent agents on that provider at once, and after a turn fails on a recognized rate limit,
+# new turns for it wait cooldownSeconds (±20% jitter). OpenCode retries single requests itself.
+# providerLimits:
+#   mistral:
+#     maxConcurrent: 2
+#     cooldownSeconds: 60
 
 models:
   claude:
@@ -26,6 +33,7 @@ models:
       description: Codex CLI default model
     - name: gpt-5.6-luna
       description: Fast and affordable agentic coding model
+    # Mistral API (pay-as-you-go) runs through OpenCode, not Codex; see the opencode section.
     # Endpoint models (NVIDIA NIM, any OpenAI-compatible URL) are added automatically from
     # `subagent-mcp endpoint add ...` as "<endpoint>/<alias>" in the claude, codex and opencode rosters.
     # Policy checks both that alias and the endpoint's upstream model id.
@@ -34,6 +42,10 @@ models:
       description: >-
         OpenCode model IDs are "provider/model" (matching config/providers). Run
         `opencode models` to see what's configured locally, then add entries here.
+    # Mistral API models (pay-as-you-go) after connecting Mistral in OpenCode; `opencode models`
+    # lists the `mistral/...` ids your key can run. Limit them with `providerLimits.mistral`. E.g.:
+    # - name: mistral/mistral-medium-latest
+    # - name: mistral/codestral-latest
   antigravity:
     - name: gemini-3.8-flash-low
       description: Fast, low-effort Gemini 3.8 Flash tier from `agy models`.
@@ -51,3 +63,10 @@ models:
     # Copilot plan and model settings; `auto` routes to a model your plan allows.
     - name: auto
       description: Copilot routes each request to a model your plan allows (rejects effort).
+  vibe:
+    # Mistral Vibe model aliases (`vibe` then /model lists them; `list_models` shows them after one
+    # Vibe run). Vibe uses its own login (`vibe --setup`); thinking is set per alias, not by effort.
+    - name: mistral-medium-3.5
+      description: Mistral Medium 3.5 through Vibe (plan or API key); Vibe's default coding model.
+    - name: zai-glm-5-3-flash
+      description: GLM-5.3 Flash hosted by Mistral through Vibe; fast, priced at zero in Vibe's table.

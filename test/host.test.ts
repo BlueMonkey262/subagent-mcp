@@ -81,7 +81,7 @@ function registry(): ConfigRegistry {
     opencode: [],
     antigravity: [],
     cursor: [],
-    copilot: [],
+    copilot: [], vibe: [],
   };
   return new ConfigRegistry([agent], roster);
 }

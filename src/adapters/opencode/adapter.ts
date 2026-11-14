@@ -8,6 +8,7 @@ import type { Usage } from "../../core/types.js";
 import { EventBuffer } from "../../events/buffer.js";
 import type { AgentEvent, NewAgentEvent, NormalizedEventData, NormalizedEventType } from "../../events/schema.js";
 import { signalProcessGroup } from "../../process-group.js";
+import { classifyProviderError } from "../../core/providers.js";
 import { scanChildOutput } from "../../safety/output.js";
 import type { AdapterTurn, BackendAdapter, EventOptions, ProviderInfo, ProviderModel, ResumeRequest, SpawnRequest } from "../adapter.js";
 
@@ -109,6 +110,8 @@ interface OpenCodeSession {
   timeout?: NodeJS.Timeout;
   timedOut: boolean;
   readonly waiters: (() => void)[];
+  /** Turn id whose provider error was already reported, so a repeated poll does not repeat it. */
+  providerErrorTurn?: string;
 }
 
 /** Polling-only OpenCode `serve` adapter. One shared server process, many directory-scoped sessions. */
@@ -546,7 +549,8 @@ export class OpenCodeAdapter implements BackendAdapter {
         .map((part) => part.text as string)
         .join("");
       const usage = extractUsage(info);
-      const status = session.timedOut ? "failed" : info.finish === "error" ? "failed" : "completed";
+      const status = session.timedOut ? "failed" : info.finish === "error" || info.error !== undefined ? "failed" : "completed";
+      if (status === "failed") this.#reportProviderError(sessionId, session, info.error);
       this.#completeTurn(sessionId, session, status, finalText === "" ? undefined : scanChildOutput(finalText), usage);
     }
   }
@@ -606,9 +610,15 @@ export class OpenCodeAdapter implements BackendAdapter {
       if (!isRecord(message)) continue;
       if (message.type === "idle") {
         idle ??= message;
+        if (message.error !== undefined) this.#reportProviderError(sessionId, session, message.error);
+        continue;
+      }
+      if (message.type === "error") {
+        this.#reportProviderError(sessionId, session, message.error ?? message);
         continue;
       }
       if (message.type !== "assistant") continue;
+      if (message.error !== undefined) this.#reportProviderError(sessionId, session, message.error);
       const messageId = typeof message.id === "string" ? message.id : "";
       const content = Array.isArray(message.content) ? message.content : [];
       let text = "";
@@ -670,6 +680,30 @@ export class OpenCodeAdapter implements BackendAdapter {
       const usage: Usage | undefined = sawUsage ? { inputTokens, outputTokens, cachedInputTokens, uncachedInputTokens, costUsd } : undefined;
       this.#completeTurn(sessionId, session, status, lastText === "" ? undefined : scanChildOutput(lastText), usage);
     }
+  }
+
+  /**
+   * A provider failure (rate limit, bad key, unavailable model) as a non-fatal `error` event ahead
+   * of the failed turn, so the supervisor can tell why it failed and back off from a throttled
+   * provider. OpenCode itself retries retryable requests; the turn is never replayed here.
+   */
+  #reportProviderError(sessionId: string, session: OpenCodeSession, value: unknown): void {
+    if (session.providerErrorTurn === session.turnId) return;
+    const error = providerErrorOf(value);
+    if (error === undefined) return;
+    session.providerErrorTurn = session.turnId;
+    const kind = classifyProviderError(error.message, error.statusCode);
+    this.#emit(sessionId, "error", {
+      code: kind === "rate_limit" ? "OPENCODE_RATE_LIMITED" : kind === "auth" ? "OPENCODE_AUTH_FAILED" : kind === "quota" ? "OPENCODE_QUOTA_EXCEEDED" : "OPENCODE_PROVIDER_ERROR",
+      message: scanChildOutput(error.message),
+      fatal: false,
+      details: {
+        ...(session.model === undefined ? {} : { model: session.model }),
+        ...(error.statusCode === undefined ? {} : { statusCode: error.statusCode }),
+        ...(error.type === undefined ? {} : { type: error.type }),
+        ...(kind === undefined ? {} : { class: kind }),
+      },
+    });
   }
 
   #completeTurn(sessionId: string, session: OpenCodeSession, status: NormalizedEventData["turn.completed"]["status"], finalText?: string, usage?: Usage): void {
@@ -735,6 +769,26 @@ function parseModel(model: string): { readonly providerID: string; readonly mode
  * One v2 `/api/model` entry, reduced to what routing needs. Drops `headers`/`settings`, which carry
  * account identifiers and provider endpoints. `cost` is OpenCode's USD per million tokens.
  */
+/**
+ * A provider error in either shape OpenCode uses: v1's `{ name: "APIError", data: { message,
+ * statusCode } }` on the assistant message, or v2's `{ type: "provider.…", message }` log entry.
+ */
+export function providerErrorOf(value: unknown): { message: string; statusCode?: number; type?: string } | undefined {
+  if (typeof value === "string") return value === "" ? undefined : { message: value };
+  if (!isRecord(value)) return undefined;
+  const data = isRecord(value.data) ? value.data : {};
+  const nested = isRecord(value.error) ? value.error : {};
+  const message = [data.message, value.message, nested.message, data.responseBody, value.name].find((candidate) => typeof candidate === "string" && candidate !== "");
+  if (typeof message !== "string") return undefined;
+  const statusCode = [data.statusCode, value.statusCode, nested.statusCode, value.status].find((candidate) => typeof candidate === "number");
+  const type = [value.type, value.name, nested.type].find((candidate) => typeof candidate === "string" && candidate !== "");
+  return {
+    message,
+    ...(typeof statusCode === "number" ? { statusCode } : {}),
+    ...(typeof type === "string" ? { type } : {}),
+  };
+}
+
 function summarizeModel(value: unknown): ProviderModel[] {
   if (!isRecord(value) || typeof value.providerID !== "string") return [];
   const modelID = typeof value.modelID === "string" ? value.modelID : typeof value.id === "string" ? value.id : undefined;
@@ -748,6 +802,8 @@ function summarizeModel(value: unknown): ProviderModel[] {
     : [];
   return [{
     id: `${value.providerID}/${modelID}`,
+    provider: value.providerID,
+    ...(value.providerID === "mistral" ? { billing_channel: "api" } : {}),
     ...(typeof value.name === "string" ? { name: value.name } : {}),
     ...(typeof value.status === "string" ? { status: value.status } : {}),
     ...(value.enabled === false ? { enabled: false } : {}),

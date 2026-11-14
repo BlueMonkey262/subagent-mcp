@@ -23,6 +23,12 @@ const NIM = {
   ],
 };
 
+// An endpoint's key is either a literal (`apiKey`, kept in the 0600 files below) or the name of an
+// environment variable (`apiKeyEnv`), written as a reference so the secret is never copied to disk.
+// Both litellm (`os.environ/NAME`) and OpenCode V1 and V2 (`{env:NAME}`) resolve these at runtime.
+const litellmKey = (ep) => (ep.apiKeyEnv ? `os.environ/${ep.apiKeyEnv}` : ep.apiKey || "none");
+const opencodeKey = (ep) => (ep.apiKeyEnv ? `{env:${ep.apiKeyEnv}}` : ep.apiKey);
+
 const load = () => (existsSync(file) ? JSON.parse(readFileSync(file, "utf8")) : { endpoints: {} });
 const die = (m) => { console.error(m); process.exit(1); };
 
@@ -37,11 +43,13 @@ function save(data) {
     for (const m of ep.models) {
       yaml.push(`  - model_name: ${JSON.stringify(`${name}/${m.alias}`)}`, "    litellm_params:",
         `      model: ${JSON.stringify(`openai/${m.id}`)}`, `      api_base: ${JSON.stringify(ep.baseUrl)}`,
-        `      api_key: ${JSON.stringify(ep.apiKey || "none")}`);
+        `      api_key: ${JSON.stringify(litellmKey(ep))}`);
     }
     oc.provider[name] = {
       npm: "@ai-sdk/openai-compatible", name,
-      options: { baseURL: ep.baseUrl, ...(ep.apiKey ? { apiKey: ep.apiKey } : {}) },
+      // V1 shape on purpose: OpenCode V2 still reads it (it maps provider/npm/options in memory), so
+      // one file serves both majors the OpenCode adapter supports.
+      options: { baseURL: ep.baseUrl, ...(opencodeKey(ep) ? { apiKey: opencodeKey(ep) } : {}) },
       models: Object.fromEntries(ep.models.map((m) => [m.alias, { name: m.id }])),
     };
   }
@@ -72,7 +80,7 @@ async function prompt(q) {
 }
 
 function describe(name, ep) {
-  console.log(`${name}  ${ep.baseUrl}  key:${ep.apiKey ? "set" : "none"}`);
+  console.log(`${name}  ${ep.baseUrl}  key:${ep.apiKeyEnv ? `$${ep.apiKeyEnv}` : ep.apiKey ? "set" : "none"}`);
   for (const m of ep.models) console.log(`  ${name}/${m.alias} -> ${m.id}`);
 }
 
@@ -86,14 +94,21 @@ if (cmd === "add") {
   while (args.length) {
     const a = args.shift();
     if (a === "--key") flags.key = args.shift();
+    else if (a === "--key-env") flags.keyEnv = args.shift();
     else if (a === "--model") flags.model.push(args.shift());
     else pos.push(a);
   }
   const [name, baseUrl] = pos;
-  if (!name || !baseUrl || !/^[a-z0-9][a-z0-9_-]*$/i.test(name) || flags.model.length === 0) {
-    die("usage: subagent-mcp endpoint add <name> <openai-base-url> --model <id>[=alias] [--model ...] [--key KEY]");
+  if (!name || !baseUrl || !/^[a-z0-9][a-z0-9_-]*$/i.test(name) || flags.model.length === 0
+    || (flags.key && flags.keyEnv) || (flags.keyEnv !== undefined && !/^[A-Za-z_][A-Za-z0-9_]*$/.test(flags.keyEnv))) {
+    die("usage: subagent-mcp endpoint add <name> <openai-base-url> --model <id>[=alias] [--model ...] [--key KEY | --key-env VAR]");
   }
-  data.endpoints[name] = { baseUrl: baseUrl.replace(/\/$/, ""), ...(flags.key ? { apiKey: flags.key } : {}), models: parseModels(flags.model) };
+  data.endpoints[name] = {
+    baseUrl: baseUrl.replace(/\/$/, ""),
+    ...(flags.key ? { apiKey: flags.key } : {}),
+    ...(flags.keyEnv ? { apiKeyEnv: flags.keyEnv } : {}),
+    models: parseModels(flags.model),
+  };
   save(data);
   describe(name, data.endpoints[name]);
 } else if (cmd === "remove") {

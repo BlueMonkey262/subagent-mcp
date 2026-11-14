@@ -33,8 +33,9 @@ export async function removeWorktree(tree: Worktree): Promise<void> {
   // Keep the branch: it can contain completed work even when the worktree is clean.
 }
 export function capabilities(backend: Backend) {
-  return { effort_values: backend === 'opencode' || backend === 'cursor' ? [] : backend === 'antigravity' ? ['low','medium','high'] : ['low','medium','high','xhigh','max'],
-    effort_alternative: backend === 'cursor' ? 'Select a model ID that includes effort' : backend === 'opencode' ? 'Use a provider/model variant; no verified effort mapping is available' : null,
+  return { effort_values: backend === 'opencode' || backend === 'cursor' || backend === 'vibe' ? [] : backend === 'antigravity' ? ['low','medium','high'] : ['low','medium','high','xhigh','max'],
+    effort_alternative: backend === 'cursor' ? 'Select a model ID that includes effort' : backend === 'opencode' ? 'Use a provider/model variant; no verified effort mapping is available'
+      : backend === 'vibe' ? 'Select a Vibe model alias whose config.toml entry sets the thinking level' : null,
     permission_restrictions: backend === 'claude', structured_output: 'validated_json', filesystem_boundary_enforced: false, usage: 'when_reported' };
 }
 export function restrictPermission(base: PermissionConfig, restriction?: PermissionConfig): PermissionConfig {

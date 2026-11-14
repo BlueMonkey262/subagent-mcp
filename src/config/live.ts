@@ -15,7 +15,7 @@ import {
   type RegistryLoadOptions,
   type ResolveAgentOptions,
 } from "./registry.js";
-import type { Allowance, ModelEntry, ResolvedAgentConfig } from "./schema.js";
+import type { Allowance, ModelEntry, ProviderLimit, ResolvedAgentConfig } from "./schema.js";
 import { applyPolicyEnv, OPEN_POLICY, type ModelPolicy } from "../core/model-policy.js";
 
 export function missingConfigMessage(input: {
@@ -41,6 +41,7 @@ export function missingConfigMessage(input: {
     "     antigravity: []",
     "     cursor: []",
     "     copilot: []",
+    "     vibe: []",
     `2. ${input.agentsDirectory}/<name>.md`,
     "   One file per agent. The frontmatter name must match the filename. Example general.md:",
     "   ---",
@@ -139,6 +140,10 @@ export class LiveConfig implements AgentConfigSource {
     return applyPolicyEnv(this.#registry?.modelPolicy() ?? OPEN_POLICY);
   }
 
+  providerLimits(): Readonly<Record<string, ProviderLimit>> {
+    return this.#registry?.providerLimits() ?? {};
+  }
+
   configWarning(): string | undefined {
     return this.#warning;
   }
@@ -185,5 +190,5 @@ export class LiveConfig implements AgentConfigSource {
 }
 
 function emptyRoster(): ConfigRegistry["roster"] {
-  return { claude: [], codex: [], opencode: [], antigravity: [], cursor: [], copilot: [] };
+  return { claude: [], codex: [], opencode: [], antigravity: [], cursor: [], copilot: [], vibe: [] };
 }
