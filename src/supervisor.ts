@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { AppendOnlyJsonlStore } from './storage/jsonl.js';
-import { capabilities, discardWorktree, setupWorktree, intersectPermission, createWorktree, removeWorktree, restrictPermission, validator, type Worktree } from './execution.js';
+import { applySnapshot, capabilities, discardWorktree, setupWorktree, intersectPermission, createWorktree, removeWorktree, restrictPermission, validator, type WorkingTreeSnapshot, type Worktree } from './execution.js';
 import type { PermissionConfig } from './config/schema.js';
 
 interface ExecutionMeta {
@@ -16,10 +16,14 @@ interface ExecutionMeta {
   structured?: unknown;
   validation_errors?: unknown;
   group_id?: string;
+  /** Membership in a managed ensemble; set only by the ensemble manager, never from tool input. */
+  ensemble?: EnsembleMembership;
   /** Set when the agent was started from a queued task: the task's id and creation time, which fix its list position. */
   queued_from?: string;
   queued_at?: string;
 }
+/** Trusted ensemble membership of an agent (see src/ensemble/manager.ts). */
+export interface EnsembleMembership { readonly id: string; readonly role: string }
 type Row = Readonly<Record<string, unknown>>;
 /** Position of a listed row. An agent started from a queued task keeps that task's position, so the task turning into an agent never moves it between pages. */
 const listKey = (r: Row) => ({ at: String(r.queued_at ?? r.created_at), id: String(r.queued_from ?? r.agent_id) });
@@ -135,6 +139,29 @@ export interface SpawnAgentInput {
   readonly max_turns?: number | undefined;
   readonly timeout?: number | undefined;
   readonly max_result_chars?: number | undefined;
+  /** Internal: set by the ensemble manager. The host strips it from external spawn_agent calls. */
+  readonly ensemble?: EnsembleMembership | undefined;
+  /** Internal: with isolation worktree, start the worktree from this working-tree snapshot. Stripped like `ensemble`. */
+  readonly worktree_snapshot?: WorkingTreeSnapshot | undefined;
+}
+
+/** Lean per-agent status for the ensemble manager; resolves a queued task to the agent it started. */
+export interface AgentOutcome {
+  readonly id: string;
+  readonly agent_id?: string;
+  readonly name?: string;
+  readonly backend?: Backend;
+  readonly model?: string;
+  readonly state: string;
+  readonly turn?: number;
+  readonly result?: string;
+  readonly structured?: unknown;
+  readonly validation_errors?: unknown;
+  readonly has_schema: boolean;
+  readonly error?: unknown;
+  readonly usage?: Readonly<Record<string, number | null>>;
+  readonly pending_approval?: Readonly<Record<string, unknown>>;
+  readonly updated_at: string;
 }
 
 export interface SendMessageInput {
@@ -462,6 +489,71 @@ export class Supervisor {
 
   #changed() { for (const listener of this.#changes) listener(); }
 
+  /** Subscribe to agent/task state changes (the same signal wait_for_agents uses). Returns an unsubscribe. */
+  onChange(listener: () => void): () => void {
+    this.#changes.add(listener);
+    return () => { this.#changes.delete(listener); };
+  }
+
+  /** Current outcome of an agent or queued task, by ID or name. */
+  outcome(identifier: string): AgentOutcome {
+    const task = this.#pending.get(identifier);
+    if (task && !task.result?.agent_id) {
+      return { id: task.id, state: task.state, has_schema: task.input.result_schema !== undefined,
+        ...(task.result?.error === undefined ? {} : { error: task.result.error }),
+        ...(task.input.model === undefined ? {} : { model: task.input.model }),
+        ...(task.input.backend === undefined ? {} : { backend: task.input.backend }),
+        updated_at: task.updated_at ?? task.created_at };
+    }
+    const record = this.#requireRecord(identifier);
+    const settled = !['running', 'starting', 'needs_approval'].includes(record.state);
+    return {
+      id: identifier, agent_id: record.id, name: record.name, backend: record.backend, model: record.model,
+      state: record.state, turn: record.meta.turn, has_schema: record.meta.schema !== undefined,
+      ...(settled && record.result !== undefined ? { result: record.result } : {}),
+      ...(settled && record.meta.structured !== undefined ? { structured: record.meta.structured } : {}),
+      ...(settled && record.meta.validation_errors !== undefined ? { validation_errors: record.meta.validation_errors } : {}),
+      ...(record.lastError === undefined ? {} : { error: record.lastError }),
+      usage: this.#totalUsage(record),
+      ...(record.state === 'needs_approval' ? { pending_approval: this.#approvalDetails(record) } : {}),
+      updated_at: record.updatedAt,
+    };
+  }
+
+  /**
+   * Every check spawnAgent makes before it waits for a slot, without launching anything. The
+   * ensemble manager validates all members first so a bad member never leaves a partial launch.
+   */
+  preflightSpawn(input: SpawnAgentInput): { readonly backend: Backend; readonly model: string; readonly agentConfig: string } {
+    this.#assertConfigValid();
+    const resolved = this.#registry.resolveAgent({
+      agent: input.agent,
+      ...(input.model === undefined ? {} : { model: input.model }),
+      ...(input.backend === undefined ? {} : { backend: input.backend }),
+      ...(input.effort === undefined ? {} : { reasoningEffort: input.effort }),
+    });
+    this.#assertModelAllowed(resolved.backend, resolved.model);
+    if (input.result_schema) validator.compile(input.result_schema);
+    if (input.permission && resolved.backend !== 'claude') throw new SupervisorError('This backend cannot enforce per-spawn permission restrictions');
+    restrictPermission(resolved.permission, input.permission);
+    this.#requireAdapter(resolved.backend);
+    if (input.name !== undefined && this.#names.has(input.name)) {
+      throw new SupervisorError(`Agent name "${input.name}" is already in use by an active or completed agent`, { name: input.name });
+    }
+    return { backend: resolved.backend, model: resolved.model, agentConfig: resolved.name };
+  }
+
+  /** Agents (by id) belonging to an ensemble, found from their persisted membership. Used to reconcile after a restart. */
+  ensembleAgents(ensembleId: string): readonly { readonly agent_id: string; readonly role: string; readonly queued_from?: string }[] {
+    const agents = [...this.#agents.values()].filter(record => record.meta.ensemble?.id === ensembleId)
+      .map(record => ({ agent_id: record.id, role: record.meta.ensemble!.role,
+        ...(record.meta.queued_from === undefined ? {} : { queued_from: record.meta.queued_from }) }));
+    const started = new Set(agents.map(agent => agent.queued_from));
+    const tasks = [...this.#pending.values()].filter(task => task.input.ensemble?.id === ensembleId && !started.has(task.id) && !task.result?.agent_id)
+      .map(task => ({ agent_id: task.id, role: task.input.ensemble!.role }));
+    return [...agents, ...tasks];
+  }
+
   async #schedule(input: SpawnAgentInput) {
     const dependencies = input.depends_on!.map(agent => {
       if (this.#pending.has(agent)) return { agent, turn: 1 };
@@ -538,7 +630,11 @@ export class Supervisor {
     let worktree: Worktree | undefined;
     let launched = false;
     try {
-      if (input.isolation === 'worktree') { worktree = await createWorktree(this.#cwd); await setupWorktree(worktree, resolved.worktreeSetup ?? []); }
+      if (input.isolation === 'worktree') {
+        worktree = await createWorktree(this.#cwd, input.worktree_snapshot?.base);
+        if (input.worktree_snapshot) await applySnapshot(worktree, input.worktree_snapshot);
+        await setupWorktree(worktree, resolved.worktreeSetup ?? []);
+      }
       // Config can hot-reload while worktree setup commands run.
       this.#assertConfigValid();
       this.#assertModelAllowed(resolved.backend, resolved.model);
@@ -562,7 +658,8 @@ export class Supervisor {
       const name = picked.name;
       const record: AgentRecord = {
         meta: { turn: 1, history: [], ...(input.permission ? { permission } : {}), ...(worktree ? { worktree } : {}),
-          ...(input.group_id ? { group_id: input.group_id } : {}), ...(input.result_schema ? { schema: input.result_schema } : {}),
+          ...(input.group_id ? { group_id: input.group_id } : {}), ...(input.ensemble ? { ensemble: { id: input.ensemble.id, role: input.ensemble.role } } : {}),
+          ...(input.result_schema ? { schema: input.result_schema } : {}),
           ...(task ? { queued_from: task.id, queued_at: task.created_at } : {}) },
         id: turn.agentId,
         name,
@@ -710,6 +807,15 @@ export class Supervisor {
     delete record.pendingApprovalId;
     record.state = "running";
     record.updatedAt = new Date().toISOString();
+    const relayedAsFollowUp = decision === "deny" && message !== undefined && !adapter.relaysDenyMessage;
+    if (record.meta.ensemble !== undefined && !relayedAsFollowUp) {
+      // An ensemble member's outcome belongs to its ensemble's aggregate, not to this call: return
+      // at once and let the next approval or the settled turn route through the ensemble.
+      record.detached = true;
+      this.#changed();
+      return { agent_id: record.id, name: record.name, status: "running", ensemble_id: record.meta.ensemble.id,
+        ensemble_role: record.meta.ensemble.role, hint: "The outcome is reported by the ensemble; use get_ensemble." };
+    }
     await this.#waitForNotableState(record);
     const settledState = this.#currentState(record);
     if (
@@ -997,6 +1103,7 @@ export class Supervisor {
       storage_error: this.#storageError,
       turn: record.meta.turn,
       group_id: record.meta.group_id,
+      ...(record.meta.ensemble === undefined ? {} : { ensemble_id: record.meta.ensemble.id, ensemble_role: record.meta.ensemble.role }),
       worktree: record.meta.worktree,
       filesystem_boundary_enforced: false,
       structured_result: record.meta.structured,
@@ -1086,6 +1193,7 @@ export class Supervisor {
     return {
       turn: record.meta.turn,
       group_id: record.meta.group_id,
+      ...(record.meta.ensemble === undefined ? {} : { ensemble_id: record.meta.ensemble.id, ensemble_role: record.meta.ensemble.role }),
       worktree: record.meta.worktree,
       filesystem_boundary_enforced: false,
       result_validation: record.meta.schema ? record.meta.validation_errors ? "invalid" : record.meta.structured !== undefined ? "valid" : "pending" : undefined,
