@@ -416,7 +416,7 @@ export async function runHost(): Promise<void> {
   const antigravity = new AntigravityAdapter();
   const cursor = new CursorAdapter();
   const copilot = new CopilotAdapter();
-  const vibe = new VibeAdapter();
+  const vibe = new VibeAdapter({ catalogCachePath: join(paths.directory, "vibe-models.json") });
   let endpoint: RunningHost | undefined;
   let ensembles: EnsembleManager | undefined;
   const supervisor = new SupervisorClass({

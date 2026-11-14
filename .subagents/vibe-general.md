@@ -1,7 +1,7 @@
 ---
 name: vibe-general
 backend: vibe
-description: General-purpose Mistral Vibe subagent. Runs `vibe -p --auto-approve` (permission.default allow), so it can run shell commands and edit files; spawn it with isolation worktree for changes. A git worktree separates changes, it is not a sandbox. Set permission.default to escalate for a read-only run (read_file and grep only). Vibe cannot enforce per-command allow/deny rules, so leave those lists empty.
+description: General-purpose Mistral Vibe subagent. Runs `vibe -p --auto-approve` (permission.default allow), so it can run shell commands and edit files; spawn it with isolation worktree for changes. A git worktree separates changes, it is not a sandbox. Set permission.default to escalate for a read-only run (Vibe's ask agent runs reads and denies everything else). Vibe cannot enforce per-command allow/deny rules, so leave those lists empty.
 maxTurns: 40
 timeout: 1200
 permission:

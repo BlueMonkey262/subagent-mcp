@@ -2,6 +2,7 @@ import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
 
 import type { Allowance } from "./config/schema.js";
+import { providerOf } from "./core/providers.js";
 import { BACKENDS, type Backend } from "./core/types.js";
 
 export interface UsageTotals {
@@ -24,6 +25,23 @@ export interface UsageTotals {
 
 export interface BackendUsage extends UsageTotals {
   models: Record<string, UsageTotals>;
+  /**
+   * The same usage split by upstream provider, where it is known: OpenCode's `provider/model`
+   * prefix, or the provider Vibe reports for its alias. Lets Mistral API usage through OpenCode be
+   * told apart from Vibe plan usage and from other OpenCode providers.
+   */
+  providers: Record<string, UsageTotals>;
+}
+
+/** Usage per provider, then per backend that reached it (`{ mistral: { opencode, vibe } }`). */
+export function usageByProvider(usage: UsageSnapshot): Record<string, Partial<Record<Backend, UsageTotals>>> {
+  const grouped: Record<string, Partial<Record<Backend, UsageTotals>>> = {};
+  for (const backend of BACKENDS) {
+    for (const [provider, totals] of Object.entries(usage[backend].providers)) {
+      (grouped[provider] ??= {})[backend] = totals;
+    }
+  }
+  return grouped;
 }
 
 export type UsageSnapshot = Record<Backend, BackendUsage>;
@@ -42,7 +60,7 @@ const ZERO = (): UsageTotals => ({
 });
 
 function emptySnapshot(): UsageSnapshot {
-  return Object.fromEntries(BACKENDS.map((backend) => [backend, { ...ZERO(), models: {} }])) as UsageSnapshot;
+  return Object.fromEntries(BACKENDS.map((backend) => [backend, { ...ZERO(), models: {}, providers: {} }])) as UsageSnapshot;
 }
 
 /** Observed spend for this project. Persisted so a reconnect does not reset the counters. */
@@ -65,6 +83,7 @@ export class UsageLedger {
           ...ZERO(),
           ...readTotals(raw),
           models: readModels(raw["models"]),
+          providers: readModels(raw["providers"]),
         };
       }
       this.#usage = next;
@@ -80,6 +99,8 @@ export class UsageLedger {
   recordSpawn(backend: Backend, model: string): void {
     const totals = this.#model(backend, model);
     totals.spawns += 1;
+    const provider = this.#provider(backend, providerOf(backend, model));
+    if (provider) provider.spawns += 1;
     this.#usage[backend].spawns += 1;
     this.#schedule();
   }
@@ -87,6 +108,8 @@ export class UsageLedger {
   recordResume(backend: Backend, model: string): void {
     const totals = this.#model(backend, model);
     totals.resumes += 1;
+    const provider = this.#provider(backend, providerOf(backend, model));
+    if (provider) provider.resumes += 1;
     this.#usage[backend].resumes += 1;
     this.#schedule();
   }
@@ -110,6 +133,9 @@ export class UsageLedger {
     };
     apply(this.#model(backend, model));
     apply(this.#usage[backend]);
+    const reported = isRecord(usage) && typeof usage["provider"] === "string" && usage["provider"] !== "" ? usage["provider"] : undefined;
+    const provider = this.#provider(backend, reported ?? providerOf(backend, model));
+    if (provider) apply(provider);
     this.#schedule();
   }
 
@@ -120,6 +146,12 @@ export class UsageLedger {
     const created = ZERO();
     models[model] = created;
     return created;
+  }
+
+  #provider(backend: Backend, provider: string | undefined): UsageTotals | undefined {
+    if (provider === undefined) return undefined;
+    const providers = this.#usage[backend].providers;
+    return (providers[provider] ??= ZERO());
   }
 
   #schedule(): void {

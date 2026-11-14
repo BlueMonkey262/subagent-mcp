@@ -34,4 +34,9 @@ export interface Usage {
    * subscription usage in particular is not charged per token. Absent means unknown.
    */
   readonly costBasis?: "reported" | "estimated";
+  /**
+   * Upstream provider that served the turn, when the backend reports it (Vibe: the alias's
+   * `provider` in its config). OpenCode's provider is the model id's prefix instead.
+   */
+  readonly provider?: string;
 }

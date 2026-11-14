@@ -56,13 +56,35 @@ Two separate routes, booked separately in usage:
 
 - **Mistral Vibe** (`vibe` backend): runs the Vibe CLI with its own login (`vibe --setup`), e.g. a
   Le Chat Pro plan. Roster names are your Vibe model aliases. Its cost figure is an estimate.
+  `list_models` with `backend: vibe` lists the aliases, providers, prices and context sizes from the
+  latest Vibe run (Vibe has no command that lists them without a run) and flags roster entries Vibe
+  does not offer. Agent configs can cap a turn with `vibeMaxTokens` and `vibeMaxPriceUsd`
+  (`--max-tokens`, `--max-price`); the price cap uses Vibe's own price table, so treat it as
+  approximate, not as a billing guarantee.
 - **Mistral API** (pay-as-you-go, through OpenCode): connect Mistral in OpenCode (`/connect`,
   choose Mistral, or set `MISTRAL_API_KEY`), list what you can run with `opencode models mistral`,
   and add the ids you want under `opencode` in `models.yaml` as `mistral/<model-id>`. Spawn them with
   an OpenCode agent config (`opencode-general`). `list_models` with `backend: opencode` shows each
-  model's context, output limit and price as OpenCode reports them. Usage is tracked per model, so
-  `mistral/*` API spend stays distinct from Vibe and from other OpenCode providers. Use an API key
-  meant for API automation, not your Vibe plan's key.
+  model's context, output limit, price, `provider` and, for Mistral, `billing_channel: api`. Usage
+  is tracked per model and per provider (`usage_by_provider` in `list_models`, e.g.
+  `mistral: { opencode, vibe }`), so `mistral/*` API spend stays distinct from Vibe and from other
+  OpenCode providers. Use an API key meant for API automation, not your Vibe plan's key.
+- **Provider limits** (`providerLimits` in `models.yaml`): for OpenCode models, keyed by the provider
+  prefix of the model id.
+
+  ```yaml
+  providerLimits:
+    mistral:
+      maxConcurrent: 2     # Mistral agents at once; more spawns and resumes wait for a slot
+      cooldownSeconds: 60  # after a turn fails on a rate limit, new Mistral turns wait (±20% jitter)
+  ```
+
+  This is separate from the global `maxConcurrent` and from Vibe's plan limits. A failed OpenCode
+  turn now reports the provider's error as an `error` event (`OPENCODE_RATE_LIMITED`,
+  `OPENCODE_AUTH_FAILED`, `OPENCODE_QUOTA_EXCEEDED` or `OPENCODE_PROVIDER_ERROR`), and
+  `list_models` shows each provider's slots, cooldown, and rate-limit, auth and quota failure
+  counts under `providers`. OpenCode retries individual requests itself; subagent-mcp never replays
+  a whole turn, which may already have changed files.
 
 ### Configuration
 
@@ -304,8 +326,10 @@ against the repository, tests, and the operator's actual request.
   `--resume <session_id>` (no `--model`: a session keeps its model). The run's `export.json`, not
   the exit code, decides the outcome; a run with no readable export is a failure, never a success.
   Headless Vibe cannot ask for approval (calls that need it are denied), so `permission.default:
-  allow` → `--auto-approve --trust`, and `escalate`/`deny` → the builtin `ask` agent with only
-  `read_file` and `grep` enabled. Vibe cannot enforce per-command `allow`/`deny` lists, so configs
+  allow` → `--auto-approve --trust`, and `escalate`/`deny` → the builtin `ask` agent, which runs
+  reads and denies everything else (verified live: `bash` and `write_file` come back `tool_denied`).
+  `--enabled-tools read_file --enabled-tools grep` is passed too, but Vibe 3.1.2 does not use it to
+  hide its core tools, so the `ask` agent is what keeps the run read-only. Vibe cannot enforce per-command `allow`/`deny` lists, so configs
   that set them are refused. `effort` is refused too: Vibe sets thinking per model alias in its
   own config. The agent config's instructions go into the first prompt, not
   `--system-prompt-file`, which would replace Vibe's coding-agent instructions. `stop_agent`

@@ -1,11 +1,12 @@
 # Mistral Vibe CLI adapter protocol
 
-Status: **built against `mistral-vibe 3.1.2` (source at commit `b20313e`, 2026-11-10), not yet
-exercised against a live install.** The contract below comes from Vibe's own
-`docs/programmatic-mode.md`, the public history-entry models in `vibe/app_server/models.py`, and
-the export model in `vibe/cli-rust/src/run_export/model.rs`. Process behavior is covered by the
-offline fixture `test/vibe-fixture.mjs` + `test/vibe-adapter.test.ts`. Run a live acceptance pass
-before relying on it, and update this file with what you observe.
+Status: **built against `mistral-vibe 3.1.2` (source at commit `b20313e`, 2026-11-10) and
+exercised live against an installed Vibe 3.1.2 on 2026-11-14** (spawn, resume, resume from a fresh
+adapter as after a host restart, stop mid-turn, read-only denials, and the export shape including
+`config`). The contract comes from Vibe's own `docs/programmatic-mode.md`, the public history-entry
+models in `vibe/app_server/models.py`, and the export model in
+`vibe/cli-rust/src/run_export/model.rs`. Process behavior is also covered offline by
+`test/vibe-fixture.mjs` + `test/vibe-adapter.test.ts`.
 
 ## Invocation
 
@@ -15,7 +16,7 @@ Headless Vibe is **one process per turn**, like Cursor. The adapter launches:
 vibe --output streaming --output-dir <tmp>/subagent-vibe-XXXX --workdir <cwd> \
   --model <alias>            # new sessions only
   --resume <session-id>      # resumed turns only, instead of --model
-  [--max-turns N] [--time-limit SECONDS] \
+  [--max-turns N] [--time-limit SECONDS] [--max-tokens N] [--max-price USD] \
   <profile flags> -p
 ```
 
@@ -86,7 +87,14 @@ told so. `approve()` is unsupported and `relaysDenyMessage` is false.
 | `permission.default` | Flags | Effect |
 | --- | --- | --- |
 | `allow` | `--auto-approve --trust` | Every tool call runs. `--trust` loads the project's `.vibe/` config and `AGENTS.md`, which can run hooks and MCP servers: no wider than auto-approved shell access. Use `isolation: worktree`; a worktree separates changes, it is not a sandbox. |
-| `escalate`, `deny` | `--agent ask --enabled-tools read_file --enabled-tools grep` | Read-only. In programmatic mode `--enabled-tools` disables every unlisted tool, and the `ask` agent approves nothing on its own. The project's `.vibe/` config is not loaded. |
+| `escalate`, `deny` | `--agent ask --enabled-tools read_file --enabled-tools grep` | Read-only, enforced by the `ask` agent: it runs reads and headless mode denies every call that would need approval. The project's `.vibe/` config is not loaded. |
+
+Observed live on 3.1.2: `--enabled-tools` (and `--disabled-tools`) do **not** hide Vibe's core
+tools. The model still sees `bash`, `write_file`, `edit`, `run_typescript`, `skill` and
+`search_tool_functions`; calls to `bash` and `write_file` (also when made from inside
+`run_typescript`) come back `failed` with `error.code: "tool_denied"`. `run_typescript`'s sandbox
+has no `require`, `process`, `Deno` or filesystem of its own. The filter flags stay as a second layer
+for versions that honor them; the `ask` agent is the enforcement.
 
 Non-empty `permission.allow` or `permission.deny` lists are refused: Vibe's CLI cannot enforce
 per-command rules, and silently ignoring them would overstate the protection.
@@ -104,10 +112,24 @@ an export (`terminated`) within its 10 s wind-down. After `interruptGraceMs` (15
 SIGKILLs the process group. Signalling the whole group first would kill Vibe's app-server before
 the export is written.
 
+## Model catalog and provider
+
+The export's `config.models` lists every alias Vibe offered for the run (`alias`, `provider`,
+upstream `name`, `input_price`/`output_price`/`cached_input_price` per million tokens, `thinking`,
+`thinking_levels`, `max_context_length`), and `config.active_model` names the alias used (empty on a
+resumed run, which keeps its session's model). The adapter keeps the latest catalog (cached in
+`.subagents/memory/vibe-models.json`) and serves it as `list_models` live data, and tags each turn's
+usage with the alias's `provider` so usage can be grouped by provider.
+
+## Limits
+
+`vibeMaxTokens` and `vibeMaxPriceUsd` in an agent config become `--max-tokens` and `--max-price`
+on every turn. Both count the run's root session and Vibe's own subagents; reaching one ends the
+turn as `token_limit` / `price_limit` (`VIBE_LIMIT_REACHED`). `--max-price` relies on Vibe's price
+table, which Mistral notes may be missing or stale, so it is an approximate brake. Configs that set
+either are refused on any other backend rather than silently uncapped.
+
 ## Not covered yet
 
-- Live acceptance against an installed Vibe (entry shapes, startup time, SIGTERM export).
-- `--max-tokens` and `--max-price` are not wired to agent config. `--max-price` relies on Vibe's
-  price table, which Mistral notes may be missing or stale, so it would be an approximate brake.
 - `vibe-acp` (interactive approvals) and `vibe run-server` (experimental, needs a sandboxing
   agent socket) are not used.

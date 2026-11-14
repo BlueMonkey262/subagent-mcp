@@ -1,8 +1,8 @@
 import { randomUUID } from "node:crypto";
 import { spawn as nodeSpawn, type ChildProcessWithoutNullStreams, type SpawnOptionsWithoutStdio } from "node:child_process";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 
 import type { ApprovalResolution } from "../../approval/types.js";
 import type { Usage } from "../../core/types.js";
@@ -10,9 +10,9 @@ import { EventBuffer } from "../../events/buffer.js";
 import type { AgentEvent, NewAgentEvent, NormalizedEventData, NormalizedEventType } from "../../events/schema.js";
 import { signalProcessGroup } from "../../process-group.js";
 import { scanChildOutput } from "../../safety/output.js";
-import type { AdapterTurn, BackendAdapter, EventOptions, ResumeRequest, SpawnRequest } from "../adapter.js";
+import type { AdapterTurn, BackendAdapter, EventOptions, ProviderInfo, ResumeRequest, SpawnRequest } from "../adapter.js";
 import { buildVibeArguments, composeVibePrompt, VibeAdapterError } from "./arguments.js";
-import { parseVibeExport, parseVibeStreamEntry, vibeTerminal, type VibeExport, type VibeStreamItem } from "./parser.js";
+import { parseVibeExport, parseVibeStreamEntry, vibeTerminal, type VibeCatalogModel, type VibeExport, type VibeStreamItem } from "./parser.js";
 
 /**
  * Mistral Vibe CLI adapter (`vibe -p`, verified against mistral-vibe 3.1.2; docs/protocol/vibe.md).
@@ -63,6 +63,17 @@ export interface VibeAdapterOptions {
   readonly outputRoot?: string;
   /** Keep each turn's export and journal copy instead of deleting them once read. */
   readonly keepOutputDirs?: boolean;
+  /**
+   * Where to remember the model catalog from the latest export, so `list_models` can show Vibe's
+   * aliases after a host restart. Vibe has no command that lists them without a run.
+   */
+  readonly catalogCachePath?: string;
+}
+
+interface VibeCatalog {
+  readonly models: readonly VibeCatalogModel[];
+  readonly seen_at: string;
+  readonly vibe_version?: string;
 }
 
 interface Deferred<T> {
@@ -85,6 +96,8 @@ interface VibeTurn {
 
 interface VibeSession {
   agentId?: string;
+  /** The alias this session runs (fixed at creation; resumed turns pass it explicitly). */
+  readonly model: string;
   readonly expectedAgentId?: string;
   readonly child: ChildProcessWithoutNullStreams;
   readonly outputDir: string;
@@ -107,6 +120,8 @@ export class VibeAdapter implements BackendAdapter {
   readonly #sessions = new Map<string, VibeSession>();
   readonly #launches = new Set<VibeSession>();
   readonly #spawnProcess: SpawnProcess;
+  #catalog: VibeCatalog | undefined;
+  #catalogLoaded = false;
 
   constructor(options: VibeAdapterOptions = {}) {
     this.#options = {
@@ -172,7 +187,7 @@ export class VibeAdapter implements BackendAdapter {
   }
 
   async #launch(
-    request: Pick<SpawnRequest, "model" | "cwd" | "permission" | "env" | "maxTurns" | "timeoutMs">,
+    request: Pick<SpawnRequest, "model" | "cwd" | "permission" | "env" | "maxTurns" | "timeoutMs" | "vibeMaxTokens" | "vibeMaxPriceUsd">,
     prompt: string,
     expectedAgentId?: string,
   ): Promise<VibeSession> {
@@ -195,6 +210,7 @@ export class VibeAdapter implements BackendAdapter {
       detached: true,
     });
     const session: VibeSession = {
+      model: request.model,
       ...(expectedAgentId === undefined ? {} : { expectedAgentId }),
       child,
       outputDir,
@@ -408,8 +424,62 @@ export class VibeAdapter implements BackendAdapter {
         },
       });
     }
+    if (exported.catalog !== undefined && exported.catalog.length > 0) this.#rememberCatalog(exported);
+    const model = exported.activeModel ?? session.model;
+    const provider = (exported.catalog ?? this.#catalog?.models)?.find((entry) => entry.id === model)?.provider;
+    const usage = exported.usage === undefined || provider === undefined ? exported.usage : { ...exported.usage, provider };
     // Partial output is kept whatever the outcome.
-    this.#completeTurn(session, terminal.status, turn.lastAssistantText, exported.usage);
+    this.#completeTurn(session, terminal.status, turn.lastAssistantText, usage);
+  }
+
+  /**
+   * Vibe's model aliases as of the most recent run's export (`config.models`): Vibe has no command
+   * that lists them without starting a run. Before any run, nothing is reported.
+   */
+  async providerInfo(): Promise<ProviderInfo> {
+    await this.#loadCatalog();
+    if (this.#catalog === undefined) {
+      return { source: "none", note: "Vibe reports its model aliases only in a run's export; none has been seen yet. Spawn any Vibe agent once to populate this." };
+    }
+    return {
+      source: "latest run export",
+      seen_at: this.#catalog.seen_at,
+      ...(this.#catalog.vibe_version === undefined ? {} : { vibe_version: this.#catalog.vibe_version }),
+      cost_basis: "estimated from Vibe's configured prices; plan usage is not billed per token",
+      models: this.#catalog.models,
+    };
+  }
+
+  #rememberCatalog(exported: VibeExport): void {
+    this.#catalog = {
+      models: exported.catalog!,
+      seen_at: new Date().toISOString(),
+      ...(exported.vibeVersion === undefined ? {} : { vibe_version: exported.vibeVersion }),
+    };
+    this.#catalogLoaded = true;
+    const path = this.#options.catalogCachePath;
+    if (path === undefined) return;
+    const temporary = `${path}.${process.pid}.tmp`;
+    void mkdir(dirname(path), { recursive: true })
+      .then(() => writeFile(temporary, `${JSON.stringify(this.#catalog, null, 2)}\n`, "utf8"))
+      .then(() => rename(temporary, path))
+      .catch(() => undefined);
+  }
+
+  async #loadCatalog(): Promise<void> {
+    if (this.#catalogLoaded) return;
+    this.#catalogLoaded = true;
+    const path = this.#options.catalogCachePath;
+    if (path === undefined) return;
+    try {
+      const parsed: unknown = JSON.parse(await readFile(path, "utf8"));
+      if (typeof parsed === "object" && parsed !== null && Array.isArray((parsed as VibeCatalog).models)
+          && typeof (parsed as VibeCatalog).seen_at === "string") {
+        this.#catalog = parsed as VibeCatalog;
+      }
+    } catch {
+      // No cache yet, or unreadable: report nothing rather than guess.
+    }
   }
 
   #armBackstop(session: VibeSession, timeoutMs: number): void {

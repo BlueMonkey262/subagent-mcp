@@ -4,23 +4,30 @@ Implementation status (branch feat/mistral-vibe, 2026-11-14). The plan below is 
 Done:
 - Milestone 0: `vibe` backend, optional models.vibe roster, effort rejected, capabilities,
   usage cost basis (Vibe cost booked as estimatedCostUsd; still counts against maxCostUsd).
-- Milestone 1: Vibe CLI adapter (src/adapters/vibe/), offline fixture tests, docs/protocol/vibe.md.
-- Milestone 2 (partial): Mistral API via OpenCode's native provider documented in README;
-  `endpoint add --key-env VAR` keeps API keys out of generated files.
+- Milestone 1: Vibe CLI adapter (src/adapters/vibe/), offline fixture tests, docs/protocol/vibe.md,
+  live acceptance against Vibe 3.1.2, `vibeMaxTokens`/`vibeMaxPriceUsd` wired to --max-tokens/--max-price.
+- Milestone 2: Mistral API via OpenCode's native provider; `endpoint add --key-env VAR`; model
+  discovery (`provider`, `billing_channel` on OpenCode models; Vibe's alias catalog from its
+  exports); usage grouped by provider (`usage_by_provider`); provider-aware limits
+  (`providerLimits`: per-provider concurrency and rate-limit cooldown with jitter) and classified
+  provider errors from OpenCode (rate limit, auth, quota).
 
 Deviations from the plan:
 - No separate session store (0.3/1.3): the agent id is Vibe's own session_id, taken from the
   first streamed entry (every entry carries sessionId) or the export, so the supervisor's
-  persisted record is enough to resume after a host restart.
+  persisted record is enough to resume after a host restart. Verified live.
 - No `vibeTransport` setting yet (0.3): deferred until a second transport (ACP) exists.
 - System prompt (1.7): sent in the first prompt, not --system-prompt-file, which replaces Vibe's
   own coding-agent instructions.
 - Tool events (1.4): Vibe streams an effect only once it has settled, so tool.start and
   tool.end are emitted together.
+- Restricted profile (1.6): on Vibe 3.1.2 `--enabled-tools` does not hide core tools; the `ask`
+  agent's headless denial is the enforcement (verified live).
 - Endpoint generator (2.3): kept the V1 opencode.json shape; OpenCode 2.x still reads it.
+- Retries (2.5): OpenCode retries individual requests; subagent-mcp adds a cooldown but never
+  replays a turn.
 
-Not done: provider-aware rate limiting (2.5), --max-tokens/--max-price wiring,
-Milestone 3 (ACP), Milestone 4 (run-server). Live acceptance against an installed Vibe is pending.
+Not done: Milestone 3 (ACP), Milestone 4 (run-server).
 -->
 
 # Mistral Integration Implementation Plan

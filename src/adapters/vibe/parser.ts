@@ -96,8 +96,28 @@ export const VIBE_OUTCOMES = [
 ] as const;
 export type VibeOutcome = (typeof VIBE_OUTCOMES)[number];
 
+/** One model alias from the export's effective config (`config.models`). */
+export interface VibeCatalogModel {
+  readonly id: string;
+  readonly provider?: string;
+  readonly upstream_model?: string;
+  readonly name?: string;
+  readonly context?: number;
+  readonly max_output?: number;
+  /** Vibe's configured price per million tokens; the basis of its cost estimate. */
+  readonly cost_per_mtok?: { readonly input?: number; readonly output?: number; readonly cache_read?: number };
+  readonly thinking?: string;
+  readonly thinking_levels?: readonly string[];
+  readonly images?: boolean;
+  readonly [key: string]: unknown;
+}
+
 export interface VibeExport {
   readonly outcome: VibeOutcome | string;
+  /** The alias this run used (`config.active_model`); empty on some resumed runs. */
+  readonly activeModel?: string;
+  /** Every alias Vibe's config offered for this run. */
+  readonly catalog?: readonly VibeCatalogModel[];
   readonly sessionId?: string;
   readonly exitCode?: number;
   readonly errorMessage?: string;
@@ -126,8 +146,40 @@ export function parseVibeExport(value: unknown): VibeExport | undefined {
     ...(usage === undefined ? {} : { usage }),
     ...(typeof value.steps === "number" ? { steps: value.steps } : {}),
     ...(typeof value.vibe_version === "string" ? { vibeVersion: value.vibe_version } : {}),
+    ...(isRecord(value.config) && typeof value.config.active_model === "string" && value.config.active_model !== ""
+      ? { activeModel: value.config.active_model } : {}),
+    ...(isRecord(value.config) && isRecord(value.config.models) ? { catalog: parseVibeCatalog(value.config.models) } : {}),
     warnings,
   };
+}
+
+export function parseVibeCatalog(models: JsonRecord): VibeCatalogModel[] {
+  return Object.entries(models).flatMap(([key, raw]) => {
+    if (!isRecord(raw)) return [];
+    const alias = typeof raw.alias === "string" && raw.alias !== "" ? raw.alias : key;
+    const input = nonNegative(raw.input_price);
+    const output = nonNegative(raw.output_price);
+    const cacheRead = nonNegative(raw.cached_input_price);
+    const levels = Array.isArray(raw.thinking_levels) ? raw.thinking_levels.filter((level): level is string => typeof level === "string") : [];
+    return [{
+      id: alias,
+      ...(typeof raw.provider === "string" ? { provider: raw.provider } : {}),
+      ...(typeof raw.name === "string" ? { upstream_model: raw.name } : {}),
+      ...(typeof raw.display_name === "string" ? { name: raw.display_name } : {}),
+      ...(typeof raw.max_context_length === "number" ? { context: raw.max_context_length } : {}),
+      ...(typeof raw.max_output_tokens === "number" ? { max_output: raw.max_output_tokens } : {}),
+      ...(input === undefined && output === undefined ? {} : {
+        cost_per_mtok: {
+          ...(input === undefined ? {} : { input }),
+          ...(output === undefined ? {} : { output }),
+          ...(cacheRead === undefined ? {} : { cache_read: cacheRead }),
+        },
+      }),
+      ...(typeof raw.thinking === "string" ? { thinking: raw.thinking } : {}),
+      ...(levels.length === 0 ? {} : { thinking_levels: levels }),
+      ...(typeof raw.supports_images === "boolean" ? { images: raw.supports_images } : {}),
+    }];
+  });
 }
 
 /**

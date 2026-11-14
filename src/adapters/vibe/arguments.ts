@@ -9,19 +9,24 @@ export class VibeAdapterError extends SubagentError {
 }
 
 /**
- * Read-only tool set for the restricted profile. These are Vibe's built-in file reader and search
- * tool (the same set Vibe's own read-only `explore` subagent uses, minus `skill`). Everything else,
- * shell and file writes included, is disabled by `--enabled-tools`, which in programmatic mode
- * turns every unlisted tool off.
+ * Tool filter for the restricted profile: Vibe's file reader and search tool. Observed live on
+ * Vibe 3.1.2, this filter does NOT hide Vibe's core tools (`bash`, `write_file`, `edit`,
+ * `run_typescript`, `skill`); neither does `--disabled-tools`. What keeps the profile read-only is
+ * the `ask` agent below: headless Vibe denies every call that needs approval (`tool_denied`),
+ * including tool calls made from inside `run_typescript`, whose sandbox has no filesystem access
+ * of its own. The filter is kept as a second layer for Vibe versions that honor it.
  */
 export const VIBE_READ_ONLY_TOOLS = ["read_file", "grep"] as const;
 
-/** Builtin Vibe agent profile that runs no tool without approval; headless mode denies those. */
+/**
+ * Builtin Vibe agent that runs no tool without approval except reads; headless mode denies the rest.
+ * This is the enforcement for the restricted profile (see VIBE_READ_ONLY_TOOLS).
+ */
 export const VIBE_RESTRICTED_AGENT = "ask";
 
 export type VibeProfile = "restricted" | "trusted";
 
-export interface VibeArgumentRequest extends Pick<SpawnRequest, "model" | "cwd" | "permission" | "maxTurns" | "timeoutMs"> {
+export interface VibeArgumentRequest extends Pick<SpawnRequest, "model" | "cwd" | "permission" | "maxTurns" | "timeoutMs" | "vibeMaxTokens" | "vibeMaxPriceUsd"> {
   readonly outputDir: string;
 }
 
@@ -62,6 +67,10 @@ export function buildVibeArguments(request: VibeArgumentRequest, resumeId?: stri
   else args.push("--resume", resumeId);
   if (request.maxTurns !== undefined) args.push("--max-turns", String(request.maxTurns));
   if (request.timeoutMs !== undefined) args.push("--time-limit", String(Math.max(1, Math.ceil(request.timeoutMs / 1000))));
+  // Both count this run's root session and Vibe's own subagents; hitting one ends the turn as
+  // token_limit / price_limit. --max-price is approximate (Vibe's price table may be stale).
+  if (request.vibeMaxTokens !== undefined) args.push("--max-tokens", String(request.vibeMaxTokens));
+  if (request.vibeMaxPriceUsd !== undefined) args.push("--max-price", String(request.vibeMaxPriceUsd));
   if (vibeProfile(request.permission) === "trusted") {
     // `--trust` loads the project's .vibe/ config and AGENTS.md. That config can run hooks and MCP
     // servers, which is no wider than what an auto-approved agent can already do in this directory.
@@ -86,7 +95,7 @@ export function validateVibePermission(permission: PermissionConfig): void {
   if (permission.allow.length > 0 || permission.deny.length > 0) {
     throw new VibeAdapterError(
       "Vibe CLI cannot enforce per-command permission rules. Leave permission.allow and permission.deny empty and choose " +
-        "permission.default: allow (auto-approve, use a worktree) or escalate/deny (read-only: read_file and grep).",
+        "permission.default: allow (auto-approve, use a worktree) or escalate/deny (read-only: the ask agent denies writes and shell).",
       { allow: permission.allow, deny: permission.deny },
     );
   }

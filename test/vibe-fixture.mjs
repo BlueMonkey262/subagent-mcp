@@ -70,7 +70,15 @@ function writeExport(outcome, exitCode, extra = {}) {
     usage: { input_tokens: 1200, output_tokens: 80, cached_input_tokens: 1000, total_tokens: 1280 },
     cost_usd: 0.0042,
     steps: 2,
-    config: {},
+    // "CATALOG" in the prompt: the effective config names the alias used and Vibe's model table.
+    config: prompt.includes("CATALOG") ? {
+      active_model: resumed === undefined ? "mistral-medium-3.5" : "",
+      models: {
+        "mistral-medium-3.5": { name: "mistral-vibe-cli-latest", provider: "mistral", alias: "mistral-medium-3.5", display_name: "Mistral Medium 3.5",
+          input_price: 1.5, output_price: 7.5, cached_input_price: 0.15, thinking: "high", thinking_levels: ["off", "high"], supports_images: true, max_context_length: 262144, max_output_tokens: null },
+        "zai-glm-5-3-flash": { name: "zai-glm-5-3-flash-vibe-free", provider: "mistral", alias: "zai-glm-5-3-flash", input_price: 0.0, output_price: 0.0 },
+      },
+    } : {},
     schema_version: 1,
     vibe_version: "3.1.2",
     journal_dir: "session",

@@ -15,7 +15,7 @@ import {
   type RegistryLoadOptions,
   type ResolveAgentOptions,
 } from "./registry.js";
-import type { Allowance, ModelEntry, ResolvedAgentConfig } from "./schema.js";
+import type { Allowance, ModelEntry, ProviderLimit, ResolvedAgentConfig } from "./schema.js";
 import { applyPolicyEnv, OPEN_POLICY, type ModelPolicy } from "../core/model-policy.js";
 
 export function missingConfigMessage(input: {
@@ -138,6 +138,10 @@ export class LiveConfig implements AgentConfigSource {
   /** The project's policy with the MCP server's environment applied, so one setting can cover every project. */
   modelPolicy(): ModelPolicy {
     return applyPolicyEnv(this.#registry?.modelPolicy() ?? OPEN_POLICY);
+  }
+
+  providerLimits(): Readonly<Record<string, ProviderLimit>> {
+    return this.#registry?.providerLimits() ?? {};
   }
 
   configWarning(): string | undefined {

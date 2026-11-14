@@ -20,6 +20,7 @@ import {
   type ModelRoster,
   type PermissionConfig,
   type PermissionDefault,
+  type ProviderLimit,
   type ResolvedAgentConfig,
   type ServerLimits,
 } from "./schema.js";
@@ -46,6 +47,7 @@ export interface AgentConfigSource {
   codexResumeIdleMs(): number;
   allowances(): Readonly<Partial<Record<Backend, Allowance>>>;
   modelPolicy(): ModelPolicy;
+  providerLimits(): Readonly<Record<string, ProviderLimit>>;
   configWarning(): string | undefined;
 }
 
@@ -110,6 +112,10 @@ export class ConfigRegistry implements AgentConfigSource {
     return this.limits.modelPolicy;
   }
 
+  providerLimits(): Readonly<Record<string, ProviderLimit>> {
+    return this.limits.providerLimits;
+  }
+
   configWarning(): string | undefined {
     return undefined;
   }
@@ -146,6 +152,13 @@ export class ConfigRegistry implements AgentConfigSource {
     if (reasoningEffort !== undefined && EFFORT_REJECTED_BACKENDS.has(backend)) {
       throw effortIgnoredError(backend, reasoningEffort);
     }
+    if (backend !== "vibe" && (agent.vibeMaxTokens !== undefined || agent.vibeMaxPriceUsd !== undefined)) {
+      // A cap the chosen backend would silently drop overstates the protection; refuse instead.
+      throw new ConfigurationError(
+        `Agent "${agent.name}" sets vibeMaxTokens/vibeMaxPriceUsd, which only the Vibe backend enforces; it cannot run on ${backend}`,
+        { agent: agent.name, backend },
+      );
+    }
     if (backend === "antigravity" && agent.antigravityAgent === undefined) {
       throw new ConfigurationError(
         `Agent "${agent.name}" uses the Antigravity backend but does not set antigravityAgent`,
@@ -168,6 +181,7 @@ export function defaultServerLimits(): ServerLimits {
     codexResumeIdleMs: DEFAULT_CODEX_RESUME_IDLE_MS,
     allowances: {},
     modelPolicy: OPEN_POLICY,
+    providerLimits: {},
   };
 }
 
@@ -213,6 +227,8 @@ export async function loadAgentConfig(path: string): Promise<AgentConfig> {
   const model = optionalString(value, "model", path);
   const reasoningEffort = optionalString(value, "reasoningEffort", path);
   const antigravityAgent = optionalString(value, "antigravityAgent", path);
+  const vibeMaxTokens = optionalPositiveInteger(value, "vibeMaxTokens", path);
+  const vibeMaxPriceUsd = optionalPositiveNumber(value, "vibeMaxPriceUsd", path);
   const description = requiredString(value, "description", path);
   const maxTurns = optionalPositiveInteger(value, "maxTurns", path);
   const timeout = optionalPositiveInteger(value, "timeout", path);
@@ -227,6 +243,8 @@ export async function loadAgentConfig(path: string): Promise<AgentConfig> {
     ...(model === undefined ? {} : { model }),
     ...(reasoningEffort === undefined ? {} : { reasoningEffort }),
     ...(antigravityAgent === undefined ? {} : { antigravityAgent }),
+    ...(vibeMaxTokens === undefined ? {} : { vibeMaxTokens }),
+    ...(vibeMaxPriceUsd === undefined ? {} : { vibeMaxPriceUsd }),
     description,
     systemPrompt: body.trim(),
     ...(maxTurns === undefined ? {} : { maxTurns }),
@@ -407,7 +425,30 @@ function parseServerLimits(root: UnknownRecord, path: string): ServerLimits {
       disabledBackends: parseBackendList(stringArray(root["disabledBackends"], `${path}: disabledBackends`), `${path}: disabledBackends`),
       blockModels: parsePatternList(stringArray(root["blockModels"], `${path}: blockModels`), `${path}: blockModels`),
     },
+    providerLimits: parseProviderLimits(root["providerLimits"], path),
   };
+}
+
+function parseProviderLimits(value: unknown, path: string): Readonly<Record<string, ProviderLimit>> {
+  if (value === undefined) return {};
+  if (!isRecord(value)) throw new ConfigurationError(`${path}: providerLimits must be an object keyed by provider id`);
+  const limits: Record<string, ProviderLimit> = {};
+  for (const [key, raw] of Object.entries(value)) {
+    if (!/^[A-Za-z0-9._-]+$/.test(key)) {
+      throw new ConfigurationError(`${path}: providerLimits.${key} is not a provider id (the part of an OpenCode model id before "/")`);
+    }
+    if (!isRecord(raw)) throw new ConfigurationError(`${path}: providerLimits.${key} must be an object`);
+    const context = `${path}: providerLimits.${key}`;
+    const unknown = Object.keys(raw).filter((field) => field !== "maxConcurrent" && field !== "cooldownSeconds");
+    if (unknown.length > 0) throw new ConfigurationError(`${context}: unknown field(s) ${unknown.join(", ")}; expected maxConcurrent, cooldownSeconds`);
+    const maxConcurrent = optionalPositiveInteger(raw, "maxConcurrent", context);
+    const cooldownSeconds = optionalPositiveInteger(raw, "cooldownSeconds", context);
+    limits[key] = {
+      ...(maxConcurrent === undefined ? {} : { maxConcurrent }),
+      ...(cooldownSeconds === undefined ? {} : { cooldownSeconds }),
+    };
+  }
+  return limits;
 }
 
 function parseAllowances(value: unknown, path: string): Readonly<Partial<Record<Backend, Allowance>>> {

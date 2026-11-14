@@ -19,6 +19,10 @@ export interface SpawnRequest {
   readonly permission: PermissionConfig;
   readonly maxTurns?: number;
   readonly timeoutMs?: number;
+  /** Vibe only: per-turn token cap (`--max-tokens`). */
+  readonly vibeMaxTokens?: number;
+  /** Vibe only: approximate per-turn dollar cap (`--max-price`), from Vibe's own price table. */
+  readonly vibeMaxPriceUsd?: number;
   /**
    * Reasoning effort (e.g. "low"/"medium"/"high"/"xhigh"/"max"). Claude maps it to `--effort` at
    * launch; Codex, Antigravity and Copilot apply it per turn. The registry rejects it for OpenCode and
@@ -43,6 +47,10 @@ export interface ResumeRequest {
   readonly permission: PermissionConfig;
   readonly maxTurns?: number;
   readonly timeoutMs?: number;
+  /** Vibe only: per-turn token cap (`--max-tokens`). */
+  readonly vibeMaxTokens?: number;
+  /** Vibe only: approximate per-turn dollar cap (`--max-price`), from Vibe's own price table. */
+  readonly vibeMaxPriceUsd?: number;
   /**
    * Reasoning effort (e.g. "low"/"medium"/"high"/"xhigh"/"max"). Claude maps it to `--effort` at
    * launch; Codex, Antigravity and Copilot apply it per turn. The registry rejects it for OpenCode and
