@@ -32,6 +32,11 @@ export interface AgentConfig {
   readonly reasoningEffort?: string;
   /** Antigravity-only custom-agent name, passed to `agy --agent`. */
   readonly antigravityAgent?: string;
+  /**
+   * Vibe only: `cli` (default) runs headless `vibe -p`, which cannot ask for approval; `acp` runs
+   * `vibe-acp` and routes each tool permission through the approval flow. Fixed per agent at spawn.
+   */
+  readonly vibeTransport?: "cli" | "acp";
   /** Vibe only: per-turn cap on prompt + completion tokens (`vibe --max-tokens`). */
   readonly vibeMaxTokens?: number;
   /**

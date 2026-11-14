@@ -5,6 +5,8 @@ import type { AgentEvent } from "../events/schema.js";
 
 export interface SpawnRequest {
   readonly prompt: string;
+  /** Vibe only: which transport a new agent uses. A resumed agent keeps its own (see the Vibe adapter). */
+  readonly vibeTransport?: "cli" | "acp";
   readonly description: string;
   /** Always resolved and roster-validated before reaching an adapter. */
   readonly model: string;

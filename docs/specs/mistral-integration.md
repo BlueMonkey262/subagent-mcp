@@ -1,5 +1,5 @@
 <!--
-Implementation status (branch feat/mistral-vibe, 2026-11-14). The plan below is kept as proposed.
+Implementation status (branches feat/mistral-vibe and feat/vibe-acp, 2026-11-14). The plan below is kept as proposed.
 
 Done:
 - Milestone 0: `vibe` backend, optional models.vibe roster, effort rejected, capabilities,
@@ -11,12 +11,19 @@ Done:
   exports); usage grouped by provider (`usage_by_provider`); provider-aware limits
   (`providerLimits`: per-provider concurrency and rate-limit cooldown with jitter) and classified
   provider errors from OpenCode (rate limit, auth, quota).
+- Milestone 3: `vibeTransport: acp` (src/adapters/vibe/acp-*.ts) behind a facade
+  (adapter.ts) with the CLI transport; approval bridge into the supervisor's policy and
+  resolve_approval; session resume/load; interrupt, timeout, crash and idle handling; per-turn
+  usage from cumulative counters; verified live against vibe-acp 3.1.2 (docs/protocol/vibe-acp.md).
+  Deviations: the model is set by `VIBE_ACTIVE_MODEL`, not ACP's model option (which persists to
+  ~/.vibe/config.toml); thinking levels stay refused for the same reason; the transport is
+  fixed by an `acp:` agent-id prefix rather than a stored field.
 
 Deviations from the plan:
 - No separate session store (0.3/1.3): the agent id is Vibe's own session_id, taken from the
   first streamed entry (every entry carries sessionId) or the export, so the supervisor's
   persisted record is enough to resume after a host restart. Verified live.
-- No `vibeTransport` setting yet (0.3): deferred until a second transport (ACP) exists.
+- `vibeTransport` (0.3): added with Milestone 3; immutability comes from the agent-id prefix.
 - System prompt (1.7): sent in the first prompt, not --system-prompt-file, which replaces Vibe's
   own coding-agent instructions.
 - Tool events (1.4): Vibe streams an effect only once it has settled, so tool.start and
@@ -27,7 +34,9 @@ Deviations from the plan:
 - Retries (2.5): OpenCode retries individual requests; subagent-mcp adds a cooldown but never
   replays a turn.
 
-Not done: Milestone 3 (ACP), Milestone 4 (run-server).
+Milestone 4 (run-server): evaluated, not adopted. run-server refuses any run whose agent socket
+serves no sandbox (verified live), so subagent-mcp would have to provide a real sandbox; warm ACP
+already removes per-turn startup (0.85 s vs 4.1 s on the CLI). See docs/evaluations/vibe-run-server.md.
 -->
 
 # Mistral Integration Implementation Plan

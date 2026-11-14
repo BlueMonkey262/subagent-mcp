@@ -336,6 +336,17 @@ against the repository, tests, and the operator's actual request.
   sends SIGTERM to Vibe itself (it stops its tools and writes the export), then kills the
   process group after a grace period. See [`docs/protocol/vibe.md`](docs/protocol/vibe.md).
 
+- **Vibe over ACP** (`vibeTransport: acp` in the agent config; sample `.subagents/vibe-acp.md`):
+  runs `vibe-acp` (Agent Client Protocol), one warm process per agent, and bridges Vibe's
+  permission requests into the normal approval flow: the agent's `allow`/`deny` rules, the
+  safety heuristics and `permission.default` decide, and anything escalated waits for
+  `resolve_approval`. Unlike the CLI transport, per-command rules work here. Every shell command
+  is checked (Vibe's own command allowlist is emptied for the process), and a tool named by a deny
+  rule is made to ask too; reads otherwise run unasked. `allow_for_session` maps to Vibe's
+  session-only grant, never its "always allow", which Vibe saves to its config. The model is set
+  per process (`VIBE_ACTIVE_MODEL`), so `~/.vibe/config.toml` is never written. ACP agent ids start
+  with `acp:` and keep their transport for life. `vibeMaxPriceUsd` and `effort` are refused.
+  See [`docs/protocol/vibe-acp.md`](docs/protocol/vibe-acp.md).
 ## Operational limits
 
 - **Turn cap.** Whatever `timeout` the agent config or the tool call sets is returned as

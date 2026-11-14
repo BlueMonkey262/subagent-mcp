@@ -152,6 +152,18 @@ export class ConfigRegistry implements AgentConfigSource {
     if (reasoningEffort !== undefined && EFFORT_REJECTED_BACKENDS.has(backend)) {
       throw effortIgnoredError(backend, reasoningEffort);
     }
+    if (backend !== "vibe" && agent.vibeTransport !== undefined) {
+      throw new ConfigurationError(
+        `Agent "${agent.name}" sets vibeTransport, which only applies to the Vibe backend; it cannot run on ${backend}`,
+        { agent: agent.name, backend },
+      );
+    }
+    if (agent.vibeTransport === "acp" && agent.vibeMaxPriceUsd !== undefined) {
+      throw new ConfigurationError(
+        `Agent "${agent.name}" sets vibeMaxPriceUsd, which vibe-acp cannot enforce; remove it or use vibeTransport: cli`,
+        { agent: agent.name },
+      );
+    }
     if (backend !== "vibe" && (agent.vibeMaxTokens !== undefined || agent.vibeMaxPriceUsd !== undefined)) {
       // A cap the chosen backend would silently drop overstates the protection; refuse instead.
       throw new ConfigurationError(
@@ -227,6 +239,10 @@ export async function loadAgentConfig(path: string): Promise<AgentConfig> {
   const model = optionalString(value, "model", path);
   const reasoningEffort = optionalString(value, "reasoningEffort", path);
   const antigravityAgent = optionalString(value, "antigravityAgent", path);
+  const vibeTransport = optionalString(value, "vibeTransport", path);
+  if (vibeTransport !== undefined && vibeTransport !== "cli" && vibeTransport !== "acp") {
+    throw new ConfigurationError(`vibeTransport in ${path} must be "cli" or "acp"`);
+  }
   const vibeMaxTokens = optionalPositiveInteger(value, "vibeMaxTokens", path);
   const vibeMaxPriceUsd = optionalPositiveNumber(value, "vibeMaxPriceUsd", path);
   const description = requiredString(value, "description", path);
@@ -243,6 +259,7 @@ export async function loadAgentConfig(path: string): Promise<AgentConfig> {
     ...(model === undefined ? {} : { model }),
     ...(reasoningEffort === undefined ? {} : { reasoningEffort }),
     ...(antigravityAgent === undefined ? {} : { antigravityAgent }),
+    ...(vibeTransport === undefined ? {} : { vibeTransport: vibeTransport as "cli" | "acp" }),
     ...(vibeMaxTokens === undefined ? {} : { vibeMaxTokens }),
     ...(vibeMaxPriceUsd === undefined ? {} : { vibeMaxPriceUsd }),
     description,
