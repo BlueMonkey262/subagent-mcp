@@ -993,6 +993,12 @@ export class Supervisor {
             continue;
           }
           if (event.type === "turn.completed") {
+            // A turn that ended while an approval was parked (timeout, crash, interrupt) no longer
+            // waits for it: settle it now, so it is not answerable until its watchdog fires.
+            if (record.pendingApprovalId !== undefined) {
+              try { this.#approvals.cancel(record.pendingApprovalId); } catch { /* already settled */ }
+              delete record.pendingApprovalId;
+            }
             // The final usage wins; without one (an interrupt or crash), keep what was observed live.
             const turnUsage = event.data.usage ?? record.liveUsage;
             delete record.liveUsage;

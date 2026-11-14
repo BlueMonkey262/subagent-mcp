@@ -43,13 +43,17 @@ export function selectPermissionOption(decision: ApprovalDecision, options: read
     case "allow":
       return pick(byId("allow_once") ?? options.find((option) => option.kind === "allow_once" && !PERSISTENT.test(option.optionId)));
     case "allow_for_session":
-      // Narrowest session grant first; never a permanent one.
-      return pick(byId("allow_session_exact") ?? byId("allow_always") ?? byId("allow_session_directory_recursive"));
+      // An exact or whole-session grant only. A directory-recursive grant would let Vibe auto-run
+      // paths the parent never saw, so it fails closed; never a permanent one.
+      return pick(byId("allow_session_exact") ?? byId("allow_always"));
     case "deny":
       // ACP treats a cancelled outcome as "not allowed", so a deny never depends on the offer.
       return pick(byId("reject_once") ?? options.find((option) => option.kind === "reject_once")) ?? { outcome: "cancelled" };
   }
 }
+
+/** Tools that change files, run commands, reach the network or start subagents: always asked about. */
+const ALWAYS_ASK = ["bash", "git_bash", "powershell", "write_file", "edit", "search_replace", "web_fetch", "web_search", "task"] as const;
 
 /** Vibe tools behind each policy name (the inverse of acp-events' POLICY_TOOL_NAMES). */
 const VIBE_TOOLS_BY_POLICY_NAME: Readonly<Record<string, readonly string[]>> = {
@@ -76,6 +80,8 @@ export function vibeAcpToolEnv(deny: readonly string[]): Record<string, string> 
     VIBE_TOOLS__POWERSHELL__ALLOWLIST: "[]",
   };
   const ask = (tool: string) => { env[`VIBE_TOOLS__${tool.toUpperCase()}__PERMISSION`] = "ask"; };
+  // Vibe asks for these by default, but a user's config can set them to run unasked; pin them.
+  for (const tool of ALWAYS_ASK) ask(tool);
   for (const rule of deny) {
     const toolPattern = /^([^()]+?)(?:\(.*\))?$/.exec(rule.trim())?.[1]?.trim();
     if (toolPattern === undefined || toolPattern === "") continue;

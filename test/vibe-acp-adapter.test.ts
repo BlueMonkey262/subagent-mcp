@@ -83,17 +83,20 @@ test("permission selection never picks a persistent option and fails closed", ()
   assert.equal(selectPermissionOption("allow", permanentOnly), undefined);
   assert.deepEqual(selectPermissionOption("deny", permanentOnly), { outcome: "cancelled" });
   const scoped = [{ optionId: "allow_once" }, { optionId: "allow_session_directory_recursive" }, { optionId: "allow_session_exact" }, { optionId: "allow_permanent_exact" }, { optionId: "reject_once" }];
-  assert.deepEqual(selectPermissionOption("allow_for_session", scoped), { outcome: "selected", optionId: "allow_session_exact" }, "narrowest scope first");
+  assert.deepEqual(selectPermissionOption("allow_for_session", scoped), { outcome: "selected", optionId: "allow_session_exact" }, "exact scope");
+  assert.equal(selectPermissionOption("allow_for_session", [{ optionId: "allow_once" }, { optionId: "allow_session_directory_recursive" }]), undefined,
+    "a directory-wide grant is wider than what was approved: fail closed");
   assert.deepEqual(supportedDecisions([{ optionId: "allow_once" }, { optionId: "reject_once" }]), ["allow", "deny"]);
 });
 
 test("tool env empties Vibe's shell allowlists and makes every tool a deny rule names ask", () => {
-  const base = { VIBE_TOOLS__BASH__ALLOWLIST: "[]", VIBE_TOOLS__GIT_BASH__ALLOWLIST: "[]", VIBE_TOOLS__POWERSHELL__ALLOWLIST: "[]" };
-  assert.deepEqual(vibeAcpToolEnv([]), base);
-  assert.deepEqual(vibeAcpToolEnv(["Read(**/.env)", "Bash(rm:*)"]), {
-    ...base, VIBE_TOOLS__READ_FILE__PERMISSION: "ask",
-    VIBE_TOOLS__BASH__PERMISSION: "ask", VIBE_TOOLS__GIT_BASH__PERMISSION: "ask", VIBE_TOOLS__POWERSHELL__PERMISSION: "ask",
-  });
+  const base = vibeAcpToolEnv([]);
+  assert.equal(base.VIBE_TOOLS__BASH__ALLOWLIST, "[]");
+  for (const tool of ["BASH", "WRITE_FILE", "EDIT", "SEARCH_REPLACE", "WEB_FETCH", "TASK"]) {
+    assert.equal(base[`VIBE_TOOLS__${tool}__PERMISSION`], "ask", `${tool} is pinned to ask whatever the user's Vibe config says`);
+  }
+  assert.equal(base.VIBE_TOOLS__READ_FILE__PERMISSION, undefined, "reads run unasked unless a deny rule names them");
+  assert.deepEqual(vibeAcpToolEnv(["Read(**/.env)"]), { ...base, VIBE_TOOLS__READ_FILE__PERMISSION: "ask" });
   const all = vibeAcpToolEnv(["*"]);
   for (const tool of ["READ_FILE", "GREP", "WRITE_FILE", "EDIT", "WEB_FETCH", "WEB_SEARCH"]) assert.equal(all[`VIBE_TOOLS__${tool}__PERMISSION`], "ask");
   assert.equal(vibeAcpToolEnv(["skill"]).VIBE_TOOLS__SKILL__PERMISSION, "ask", "an unmapped tool name is passed through");
@@ -335,6 +338,32 @@ test("supervisor: deny rules answer Vibe without asking; dangerous requests wait
     const resolved = await supervisor.resolveApproval(requestId, "allow");
     assert.equal(resolved.status, "completed");
     assert.equal(resolved.result, "done:allow_once");
+  } finally {
+    await vibe.closeAll();
+  }
+});
+
+test("supervisor: an approval parked when the turn times out is settled, not left answerable", async () => {
+  const h = await harness();
+  const agent: AgentConfig = {
+    name: "vibe-acp", backend: "vibe", model: "zai-glm-5-3-flash", vibeTransport: "acp", description: "d", systemPrompt: "",
+    permission: escalate, env: {}, sourcePath: "test",
+  };
+  const roster: ModelRoster = { claude: [], codex: [], opencode: [], antigravity: [], cursor: [], copilot: [], vibe: [{ name: "zai-glm-5-3-flash" }] };
+  const vibe = new VibeAdapter({ acp: {
+    executable: process.execPath, executableArgs: [fixture], startupTimeoutMs: 5_000, usageBaselineWaitMs: 500, interruptGraceMs: 500,
+    env: { VIBE_ACP_FIXTURE_LOG: path.join(h.dir, "log.jsonl"), VIBE_ACP_FIXTURE_STATE: path.join(h.dir, "state.json") },
+  } });
+  const supervisor = new Supervisor({ registry: new ConfigRegistry([agent], roster), adapters: new AdapterRegistry([vibe]), cwd: h.dir });
+  try {
+    const parked = await supervisor.spawnAgent({ agent: "vibe-acp", prompt: "SLOW PERMISSION", description: "d", timeout: 1 });
+    assert.equal(parked.status, "needs_approval");
+    const requestId = String(parked.request_id);
+    const deadline = Date.now() + 5_000;
+    while (supervisor.listAgents()[0]?.state === "needs_approval" && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 50));
+    assert.equal(supervisor.listAgents()[0]?.state, "failed", "the turn timed out");
+    // Settled by the supervisor itself, not left for Vibe's adapter to reject ("No pending Vibe approval").
+    await assert.rejects(supervisor.resolveApproval(requestId, "allow"), /No agent has pending approval/);
   } finally {
     await vibe.closeAll();
   }

@@ -18,7 +18,8 @@ One `vibe-acp` process per agent, spawned in the agent's cwd with its own proces
 1. `initialize` with `protocolVersion: 1` and no `fs`, `terminal` or elicitation capabilities:
    Vibe does its own file and shell I/O, and disables its ask-the-user tool.
 2. `session/new {cwd, mcpServers: []}`, or `session/resume {sessionId, cwd}` for a later turn when
-   no process is warm (`session/load` if resume is unsupported; its replayed history is dropped).
+   no process is warm (`session/load` if resume is unsupported; its replayed history is dropped,
+   and its permission requests answered `cancelled`; no turn runs before step 3).
 3. `session/set_mode {modeId: "ask"}` always. Without it Vibe uses the user's `default_agent`
    (`accept-edits` here), which writes files without asking.
 4. Optional `session/set_config_option` for `max_turns` (agent `maxTurns`) and `max_tokens`
@@ -54,19 +55,23 @@ Vibe's options by **id**:
 | Decision | Option |
 | --- | --- |
 | `allow` | `allow_once` |
-| `allow_for_session` | `allow_session_exact`, else `allow_always` (session), else `allow_session_directory_recursive` |
+| `allow_for_session` | `allow_session_exact`, else `allow_always` (session); a directory-recursive grant is wider than what was approved, so it fails closed |
 | `deny` | `reject_once`, else a `cancelled` outcome |
 
 `allow_always_permanent` and `allow_permanent_*` are never chosen: they share `kind:
 allow_always` with the session option but persist the grant in Vibe's config. A decision with no
 safe option fails closed: `approve()` throws and the request stays answerable. A deny `message`
 is not relayed (Vibe sends its own fixed feedback), so `relaysDenyMessage` is false. On interrupt
-or timeout, open requests are answered `cancelled`, as ACP requires.
+or timeout, open requests are answered `cancelled`, as ACP requires, and when the turn ends the
+supervisor cancels any approval still parked for it (this applies to every backend).
 
 **What Vibe asks about.** In `ask` mode Vibe still auto-runs `read_file`, `grep` and shell
 commands on its own prefix allowlist (`ls` ran unasked live). So every process gets
 `VIBE_TOOLS__BASH__ALLOWLIST=[]` (also `GIT_BASH`, `POWERSHELL`): each shell command reaches the
-policy. A tool named by a `deny` rule is also switched to `VIBE_TOOLS__<TOOL>__PERMISSION=ask`
+policy. Tools that change files, run commands, reach the network or start Vibe subagents
+(`bash`, `git_bash`, `powershell`, `write_file`, `edit`, `search_replace`, `web_fetch`,
+`web_search`, `task`) are pinned to `ask`, since a user's Vibe config could set them to run
+unasked. A tool named by a `deny` rule is also switched to `VIBE_TOOLS__<TOOL>__PERMISSION=ask`
 (`Read(...)` → `read_file`, `*` → all), so the rule is enforced. These overrides apply to that
 process only and are set after the agent's own `env`. Vibe's private session scratchpad tool runs
 without approval; it writes outside the project.
