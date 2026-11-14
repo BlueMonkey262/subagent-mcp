@@ -666,6 +666,7 @@ export class Supervisor {
         ...(timeoutSeconds === null ? {} : { timeoutMs: timeoutSeconds * 1000 }),
         ...(resolved.vibeMaxTokens === undefined ? {} : { vibeMaxTokens: resolved.vibeMaxTokens }),
         ...(resolved.vibeMaxPriceUsd === undefined ? {} : { vibeMaxPriceUsd: resolved.vibeMaxPriceUsd }),
+        ...(resolved.vibeTransport === undefined ? {} : { vibeTransport: resolved.vibeTransport }),
         ...(resolved.reasoningEffort === undefined ? {} : { reasoningEffort: resolved.reasoningEffort }),
       });
       launched = true;

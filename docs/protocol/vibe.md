@@ -131,5 +131,5 @@ either are refused on any other backend rather than silently uncapped.
 
 ## Not covered yet
 
-- `vibe-acp` (interactive approvals) and `vibe run-server` (experimental, needs a sandboxing
-  agent socket) are not used.
+- Interactive approvals: use the ACP transport (`vibeTransport: acp`, [vibe-acp.md](vibe-acp.md)).
+- `vibe run-server` (experimental, needs a sandboxing agent socket) is not used.
