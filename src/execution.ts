@@ -2,16 +2,17 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { dirname, join } from 'node:path';
 import { randomUUID } from 'node:crypto';
-import { mkdir } from 'node:fs/promises';
+import { access, copyFile, lstat, mkdir, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
 import { Ajv } from 'ajv';
 import type { Backend } from './core/types.js';
 import type { PermissionConfig } from './config/schema.js';
 const exec = promisify(execFile);
 export const validator = new Ajv({ allErrors: true, strict: true });
 export interface Worktree { path: string; branch: string; base_commit: string; repository: string }
-export async function createWorktree(cwd: string): Promise<Worktree> {
+export async function createWorktree(cwd: string, base?: string): Promise<Worktree> {
   const repository = (await exec('git', ['rev-parse', '--show-toplevel'], { cwd })).stdout.trim();
-  const base_commit = (await exec('git', ['rev-parse', 'HEAD'], { cwd })).stdout.trim();
+  const base_commit = base ?? (await exec('git', ['rev-parse', 'HEAD'], { cwd })).stdout.trim();
   const id = randomUUID();
   const path = join(dirname(repository), '.subagent-worktrees', id);
   const branch = `subagent/${id}`;
@@ -54,4 +55,59 @@ export function intersectPermission(base: PermissionConfig, saved?: PermissionCo
 
 export async function setupWorktree(tree: Worktree, commands: readonly string[]): Promise<void> {
   for (const command of commands) await exec('/bin/sh', ['-c', command], { cwd: tree.path, timeout: 300_000, maxBuffer: 1024 * 1024 });
+}
+
+/** A commit holding the working tree as it is now (tracked changes and non-ignored new files), on top of HEAD. */
+export interface WorkingTreeSnapshot {
+  readonly commit: string; readonly base: string; readonly dirty: boolean;
+  /** The repository has submodules: their contents are not captured and snapshot worktrees leave them empty. */
+  readonly submodules?: boolean;
+}
+
+/**
+ * Captures the working tree without touching the user's index, HEAD or files: `git add -A` runs
+ * against a throwaway copy of the index, and the resulting tree becomes a parentless-to-the-user
+ * commit object on top of HEAD that only the snapshot worktrees reference.
+ */
+export async function snapshotWorkingTree(cwd: string): Promise<WorkingTreeSnapshot> {
+  const repository = (await exec('git', ['rev-parse', '--show-toplevel'], { cwd })).stdout.trim();
+  const base = (await exec('git', ['rev-parse', 'HEAD'], { cwd: repository })).stdout.trim();
+  const index = join(tmpdir(), `subagent-snapshot-${randomUUID()}.index`);
+  const env = { ...process.env, GIT_INDEX_FILE: index };
+  try {
+    // Starting from a copy of the real index keeps its stat cache, so unchanged files are not rehashed.
+    try {
+      const realIndex = (await exec('git', ['rev-parse', '--path-format=absolute', '--git-path', 'index'], { cwd: repository })).stdout.trim();
+      await copyFile(realIndex, index);
+    } catch { await exec('git', ['read-tree', 'HEAD'], { cwd: repository, env }); }
+    await exec('git', ['add', '-A', '--', '.'], { cwd: repository, env, maxBuffer: 16 * 1024 * 1024 });
+    const tree = (await exec('git', ['write-tree'], { cwd: repository, env })).stdout.trim();
+    const headTree = (await exec('git', ['rev-parse', 'HEAD^{tree}'], { cwd: repository })).stdout.trim();
+    const submodules = await access(join(repository, '.gitmodules')).then(() => true, () => false);
+    const extra = submodules ? { submodules: true } : {};
+    if (tree === headTree) return { commit: base, base, dirty: false, ...extra };
+    const identity = { GIT_AUTHOR_NAME: 'subagent-mcp', GIT_AUTHOR_EMAIL: 'subagent-mcp@localhost', GIT_COMMITTER_NAME: 'subagent-mcp', GIT_COMMITTER_EMAIL: 'subagent-mcp@localhost' };
+    const commit = (await exec('git', ['commit-tree', tree, '-p', base, '-m', 'subagent-mcp working tree snapshot'], { cwd: repository, env: { ...process.env, ...identity } })).stdout.trim();
+    return { commit, base, dirty: true, ...extra };
+  } finally {
+    await rm(index, { force: true }).catch(() => undefined);
+  }
+}
+
+/**
+ * Makes a worktree created at the snapshot's base hold the snapshot's files as uncommitted changes,
+ * so `git diff` and `git status` there show what the user had uncommitted.
+ */
+export async function applySnapshot(tree: Worktree, snapshot: WorkingTreeSnapshot): Promise<void> {
+  if (!snapshot.dirty || snapshot.commit === tree.base_commit) return;
+  await exec('git', ['checkout', snapshot.commit, '--', '.'], { cwd: tree.path, maxBuffer: 16 * 1024 * 1024 });
+  const deleted = (await exec('git', ['diff', '--name-only', '--diff-filter=D', '-z', snapshot.base, snapshot.commit], { cwd: tree.path, maxBuffer: 16 * 1024 * 1024 })).stdout
+    .split('\0').filter(Boolean);
+  for (const file of deleted) {
+    // A deleted file the user replaced with a directory: the checkout above already wrote the snapshot's files under it.
+    const target = join(tree.path, file);
+    if ((await lstat(target).catch(() => undefined))?.isDirectory()) continue;
+    await rm(target, { force: true });
+  }
+  await exec('git', ['reset', '-q'], { cwd: tree.path });
 }

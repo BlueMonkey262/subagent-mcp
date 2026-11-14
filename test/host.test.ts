@@ -7,12 +7,13 @@ import test from "node:test";
 import { fileURLToPath } from "node:url";
 
 import { AdapterRegistry } from "../src/adapters/adapter.js";
-import { FakeAdapter } from "../src/adapters/fake.js";
+import { FakeAdapter, type FakeStep } from "../src/adapters/fake.js";
 import { LiveConfig } from "../src/config/live.js";
 import { ConfigRegistry } from "../src/config/registry.js";
 import type { AgentConfig, ModelRoster } from "../src/config/schema.js";
 import { buildInfo, connectHost, HOST_PROTOCOL, hostDisposition, hostPaths, HostClient, HostSession, serveHost } from "../src/host.js";
 import { Supervisor } from "../src/supervisor.js";
+import { EnsembleManager } from "../src/ensemble/manager.js";
 
 // Daemon integration tests must never contact the release API.
 process.env.SUBAGENT_MCP_UPDATE_CHECK = "0";
@@ -485,6 +486,58 @@ test("restart is refused while an agent waits for approval, and the host stays u
     assert.equal((await session.call("hello") as { active: number }).active, 1, "the busy host is still serving");
   } finally {
     session.close();
+    await endpoint.close();
+    await rm(paths.socketPath, { force: true });
+  }
+});
+
+test("the host runs ensembles over the socket, strips forged membership and pushes one ensemble event", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "subagent-host-ensemble-"));
+  const adapter = new FakeAdapter("codex");
+  const done = (text: string): FakeStep[] => [{
+    create: (context) => ({
+      type: "turn.completed" as const, agentId: context.agentId, backend: context.backend,
+      data: { turnId: context.turnId, status: "completed" as const, finalText: text },
+    }),
+    delayMs: 20,
+  }];
+  adapter.queueScript(done("forged"));
+  adapter.queueScript(done("one"));
+  adapter.queueScript(done("two"));
+  let endpoint: Awaited<ReturnType<typeof serveHost>> | undefined;
+  let ensembles: EnsembleManager | undefined;
+  const supervisor = new Supervisor({
+    registry: registry(), adapters: new AdapterRegistry([adapter]), cwd,
+    onDetachedSettled: (result) => { if (ensembles?.routeDetached(result) !== true) endpoint?.notify({ event: "detached", data: result }); },
+  });
+  ensembles = new EnsembleManager({ supervisor, cwd, profileSources: [], launchWaitMs: 50,
+    onSettled: (event) => endpoint?.notify({ event: "ensemble", data: event }) });
+  const paths = hostPaths(cwd);
+  endpoint = await serveHost({ socketPath: paths.socketPath, supervisor, ensembles });
+  try {
+    const client = await HostClient.connect(paths.socketPath);
+    const detached: Record<string, unknown>[] = [];
+    const settled: Record<string, unknown>[] = [];
+    client.onDetached((data) => detached.push(data));
+    client.onEnsemble((data) => settled.push(data));
+    const forged = await client.call("spawn_agent", {
+      agent: "general", prompt: "p", description: "d", run_in_background: true, ensemble: { id: "ens-x", role: "r" },
+    }) as Record<string, unknown>;
+    assert.equal(forged.ensemble_id, undefined);
+    const started = await client.call("start_ensemble", {
+      task: "t", agents: [{ role: "a", config: "general" }, { role: "b", config: "general" }],
+    }) as Record<string, unknown>;
+    assert.equal(started.agents_requested, 2);
+    const deadline = Date.now() + 3_000;
+    while (settled.length === 0 && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 10));
+    assert.equal(settled.length, 1);
+    assert.equal(settled[0]!.status, "completed");
+    assert.deepEqual(detached.map((data) => data.agent_id), [forged.agent_id], "only the ordinary agent notified");
+    const fetched = await client.call("get_ensemble", { ensemble: String(started.ensemble_id), role: "b" }) as Record<string, unknown>;
+    assert.ok(["one", "two"].includes(String(fetched.result)));
+    client.close();
+  } finally {
+    ensembles.close();
     await endpoint.close();
     await rm(paths.socketPath, { force: true });
   }

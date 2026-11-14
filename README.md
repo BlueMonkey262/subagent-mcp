@@ -51,13 +51,149 @@ uses the examples bundled in this repo's `.subagents/`.
 ## Tools
 
 `spawn_agent`, `send_message`, `list_agents`, `stop_agent`, `resolve_approval`,
-`get_agent_events`, `list_models`, `restart_host` — see each tool's description for details. A spawn blocks
+`get_agent_events`, `list_models`, `restart_host`, and the ensemble tools below — see each tool's description for details. A spawn blocks
 until the child completes or needs your approval; when it needs approval, call
 `resolve_approval` to continue.
 
 Every spawned agent has a human-memorable name (a mathematician, philosopher, or figure from Greek mythology), assigned automatically unless
 `spawn_agent.name` is supplied. Results and agent listings include it, and tools that accept an
 agent can use either that name or the agent ID; names persist across reconnects.
+
+## Ensembles
+
+`start_ensemble`, `get_ensemble` and `cancel_ensemble` run several agents (any mix of configs,
+backends and models) on one task and return one aggregated result, so the orchestrator makes one
+call and reads one compact summary instead of one report per agent.
+
+```json
+{
+  "name": "diff-review",
+  "task": "Review the uncommitted changes for correctness bugs and regressions.",
+  "agents": [
+    { "role": "primary", "config": "codex-general", "model": "gpt-5.6-sol" },
+    { "role": "second-opinion", "config": "opencode-general", "model": "opencode-go/deepseek-v4.1-flash" },
+    { "role": "thorough", "config": "cursor-general", "model": "grok-4.7-xhigh" }
+  ],
+  "aggregation": { "strategy": "review_findings", "max_items": 5 }
+}
+```
+
+- **Members are ordinary spawns.** Each one goes through the same config, model-policy and
+  permission checks as `spawn_agent`, and every member is validated before any launches. Membership
+  grants no extra authority. Children see the shared `task`, their role and their own
+  `instructions`; they never see the parent conversation.
+- **Modes.** `parallel` (default); `specialist` (every member needs `instructions`); `competitive`
+  (each member gets its own managed worktree; `isolation: none` is refused); `pipeline` (each member
+  starts after the previous one succeeds and receives its result; `depends_on` lists earlier roles
+  explicitly and works in any mode). With `on_dependency_failure: continue` a member starts once its
+  dependencies have settled, successful or not, and receives each outcome cut to
+  `dependency_max_chars` (default 4000).
+- **Isolation.** `isolation` per member, or as the ensemble default: `none` shares your checkout;
+  `worktree` gives a managed worktree at HEAD; `snapshot` gives a worktree holding your working tree
+  as it was when the ensemble started (uncommitted and new, non-ignored files included, shown as
+  uncommitted changes), the same snapshot for every member. Taking it never touches your index or
+  files. Use `snapshot` for reviews of uncommitted work. The host cannot enforce read-only access, so
+  the start response warns when more than one member shares your checkout. Worktrees are not
+  filesystem sandboxes.
+- **Completion** is separate from aggregation: `all`, `first_valid`, `quorum` (finishes early as
+  `partial` once the quorum can no longer be reached) or `deadline` (`deadline_seconds`, which also
+  caps the others). Members still running when the ensemble finishes keep running unless
+  `cancel_remaining` is set. A result counts as valid only when the member completed and, when a
+  result schema applies, its JSON matches; JSON wrapped in a code fence or a sentence is recovered.
+  Final status: `completed`, `partial`, `failed`, `cancelled` or `interrupted` (host restart).
+- **Aggregation is deterministic** (no model calls): `collect` (attributed results), `compare`
+  (agreed and differing fields), `vote` (`field`, `choices`; reports abstentions and ties; a
+  majority is not proof), `merge` (conflicting values are reported and omitted, or taken from the
+  `prefer` role order, never silently overwritten) and `review_findings` (built-in findings schema;
+  normalizes file locations, merges the same issue from different reviewers conservatively, ranks by
+  severity and corroboration, and keeps severity disagreements). `get_ensemble` with `aggregation`
+  re-aggregates the stored results another way at no model cost.
+- **Compact output.** Responses are compact JSON measured in full, metadata included, against
+  `output.max_chars` (default 1600). `get_ensemble` with `role` returns one member's full result;
+  `detail: "members"` lists states, errors and usage. Unknown cost or token counts are reported as
+  `null`, never as zero. `budget` (`max_cost_usd`, `max_total_tokens`) stops the ensemble when the
+  reported usage reaches it.
+- **Synthesis (opt-in).** `aggregation.synthesize: { config, model, max_input_chars, timeout_seconds }`
+  runs one more agent after the members finish. It gets the task, the deterministic aggregate and
+  the valid results, cut to `max_input_chars` (default 12000) and marked as untrusted data, and must
+  return `{summary, consensus, disagreements, recommendation, confidence}`. Its reading is added as
+  `synthesis` (marked advisory) next to the unchanged aggregate; if it fails, times out or returns
+  the wrong shape, the summary says so and the deterministic aggregate stands. It is validated with
+  the members before anything launches, counts toward `budget`, and is skipped when the budget is
+  already reached or nothing is valid.
+- **Notifications.** A background ensemble (the default) returns at once. Members' own channel
+  events are suppressed and one `kind="ensemble"` event carries the summary when it finishes. When
+  members were still running at that point (`first_valid`, `quorum`, `deadline` without
+  `cancel_remaining`), their results update the stored aggregate, and one `update="true"` event
+  follows once the last of them settles, if any added a valid result. An event that could not be
+  delivered (no session connected) is retried after the next tool call.
+  Member approval requests still arrive individually with their original `request_id`;
+  `resolve_approval` returns immediately for a member instead of blocking on its turn.
+- **Durability.** Each ensemble is saved in `.subagents/memory/ensembles/<id>.json` and reloaded by a
+  restarted host. A member whose launch was in flight when the host stopped is adopted if the agent
+  exists and otherwise marked failed; it is never relaunched. Starting an ensemble identical to one
+  still running returns the running one unless `allow_duplicate` is set. An ensemble has at most 12
+  members.
+- **Profiles.** Named rosters live under `ensembles:` in `.subagents/ensembles.yaml`, or in
+  `~/.config/subagent-mcp/ensembles.yaml` for every project (a project profile wins on a name
+  clash). They are read on every call. `start_ensemble` with `profile` uses one, and fields in the
+  call override it; `get_ensemble` with no arguments lists recent ensembles and the profiles.
+
+### Model selection
+
+A member can give `select` instead of `config`/`model`, and `selection: { count, ... }` adds
+`count` selected members (roles `auto-1`…, or `roles`). Candidates are every unblocked roster model
+of every config (a config that pins a model offers only that model), so selection can never pick
+what `models.yaml`'s model policy refuses, and explicit members are never changed. Criteria:
+`category`, `objective` (`balanced`, `quality`, `cost`, `latency`, `reliability`), `backends`,
+`exclude_backends`, `configs`, `exclude_models`, `require` (capabilities), `min_quality`,
+`distinct` (`model` default, `backend`, `none`), `explore`, and `live_quota` with
+`min_remaining_percent` (default 5).
+
+Each candidate gets an explainable score from:
+
+- **Quality and capabilities**, declared by you under `routing.models` in `ensembles.yaml`. Undeclared
+  quality scores as middling and is excluded by `min_quality`; undeclared capabilities fail `require`.
+- **Reliability**, measured: the share of valid results among completed or failed runs (interrupted
+  runs are ignored), Laplace-smoothed, per category when there is data for it. A bounded
+  exploration bonus lets rarely tried models earn a record.
+- **Cost and latency**, measured median per run when known, else the declared tier. Unknown cost
+  ranks below a declared `medium` tier; it is never treated as free.
+- **Quota**: a backend whose `allowances` in `models.yaml` are used up is excluded. With
+  `live_quota`, so is a backend whose live plan usage (`list_models` live) is below the threshold,
+  and a model its live catalog does not offer. With neither, quota is reported as unknown, not as
+  unlimited.
+- **Load**: a small penalty per agent already active on the backend.
+
+Every member's outcome (backend, model, category, validity, duration, reported cost and tokens) is
+appended to `.subagents/memory/routing-history.jsonl`. The start response (and `dry_run`) lists each
+pick with its score and the reasons, and `get_ensemble` with `detail: "members"` shows the full
+selection report including rejected candidates. `test/routing.test.ts` includes a seeded simulation
+in which the router, learning from its own history, matches or beats a fixed configured model.
+
+```yaml
+routing:
+  models:
+    codex/gpt-5.6-sol: { quality: { review: 5, default: 4 }, cost: high, capabilities: [tools] }
+    codex/gpt-5.6-luna: { quality: 3, cost: low, latency: fast, capabilities: [tools] }
+    opencode/opencode-go/deepseek-v4.1-flash: { quality: 3, cost: low, latency: fast, capabilities: [tools] }
+
+ensembles:
+  standard-review:
+    description: Three-model review of the working tree
+    agents:
+      - { role: primary, config: codex-general, model: gpt-5.6-sol }
+      - { role: second-opinion, config: opencode-general, model: opencode-go/deepseek-v4.1-flash }
+      - { role: quick, config: codex-general, model: gpt-5.6-luna }
+    aggregation: { strategy: review_findings }
+    completion: { strategy: all }
+    isolation: snapshot
+  auto-review:
+    description: Three reviewers chosen by the router
+    category: review
+    selection: { count: 3, objective: quality, distinct: backend }
+    aggregation: { strategy: review_findings }
+```
 
 ## Orchestrator and subagent authority
 
