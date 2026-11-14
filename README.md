@@ -34,7 +34,7 @@ them by `subagent-mcp endpoint add` either (it has its own provider config in `~
 
 ```bash
 subagent-mcp nim set-key                       # prompts for your NVIDIA NIM key
-subagent-mcp endpoint add my-vllm http://localhost:8000/v1 --model qwen3-32b [--key KEY]
+subagent-mcp endpoint add my-vllm http://localhost:8000/v1 --model qwen3-32b [--key KEY | --key-env VAR]
 subagent-mcp endpoint list
 subagent-mcp endpoint remove my-vllm
 ```
@@ -45,6 +45,24 @@ rosters. Codex and Claude agents reach endpoints through a local litellm proxy (
 To run the Claude harness on an endpoint model, spawn the `claude-endpoint` agent config. See
 `nim/README.md`. Claude-via-proxy and generic endpoints are newly added and have fixture-level
 coverage only.
+
+`--key-env VAR` stores only the variable's name: the generated litellm and OpenCode files reference
+it (`os.environ/VAR`, `{env:VAR}`), so the key is never copied to disk. The generated `opencode.json`
+uses the V1 provider shape, which OpenCode 2.x still reads.
+
+### Mistral: Vibe subscription vs. API
+
+Two separate routes, booked separately in usage:
+
+- **Mistral Vibe** (`vibe` backend): runs the Vibe CLI with its own login (`vibe --setup`), e.g. a
+  Le Chat Pro plan. Roster names are your Vibe model aliases. Its cost figure is an estimate.
+- **Mistral API** (pay-as-you-go, through OpenCode): connect Mistral in OpenCode (`/connect`,
+  choose Mistral, or set `MISTRAL_API_KEY`), list what you can run with `opencode models mistral`,
+  and add the ids you want under `opencode` in `models.yaml` as `mistral/<model-id>`. Spawn them with
+  an OpenCode agent config (`opencode-general`). `list_models` with `backend: opencode` shows each
+  model's context, output limit and price as OpenCode reports them. Usage is tracked per model, so
+  `mistral/*` API spend stays distinct from Vibe and from other OpenCode providers. Use an API key
+  meant for API automation, not your Vibe plan's key.
 
 ### Configuration
 

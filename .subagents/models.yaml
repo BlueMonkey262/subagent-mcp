@@ -26,6 +26,7 @@ models:
       description: Codex CLI default model
     - name: gpt-5.6-luna
       description: Fast and affordable agentic coding model
+    # Mistral API (pay-as-you-go) runs through OpenCode, not Codex; see the opencode section.
     # Endpoint models (NVIDIA NIM, any OpenAI-compatible URL) are added automatically from
     # `subagent-mcp endpoint add ...` as "<endpoint>/<alias>" in the claude, codex and opencode rosters.
     # Policy checks both that alias and the endpoint's upstream model id.
@@ -34,6 +35,8 @@ models:
       description: >-
         OpenCode model IDs are "provider/model" (matching config/providers). Run
         `opencode models` to see what's configured locally, then add entries here.
+    # Mistral API models after connecting Mistral in OpenCode (`opencode models mistral`), e.g.:
+    # - name: mistral/devstral-medium-latest
   antigravity:
     - name: gemini-3.8-flash-low
       description: Fast, low-effort Gemini 3.8 Flash tier from `agy models`.
