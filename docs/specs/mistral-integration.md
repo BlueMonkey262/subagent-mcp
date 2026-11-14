@@ -34,7 +34,9 @@ Deviations from the plan:
 - Retries (2.5): OpenCode retries individual requests; subagent-mcp adds a cooldown but never
   replays a turn.
 
-Not done: Milestone 4 (run-server).
+Milestone 4 (run-server): evaluated, not adopted. run-server refuses any run whose agent socket
+serves no sandbox (verified live), so subagent-mcp would have to provide a real sandbox; warm ACP
+already removes per-turn startup (0.85 s vs 4.1 s on the CLI). See docs/evaluations/vibe-run-server.md.
 -->
 
 # Mistral Integration Implementation Plan
