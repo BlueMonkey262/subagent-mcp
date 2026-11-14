@@ -51,3 +51,8 @@ models:
     # Copilot plan and model settings; `auto` routes to a model your plan allows.
     - name: auto
       description: Copilot routes each request to a model your plan allows (rejects effort).
+  vibe:
+    # Mistral Vibe model aliases, exactly as `[[models]] alias` in ~/.vibe/config.toml (`vibe` then
+    # /model lists them). Vibe uses its own login (`vibe --setup`); thinking is set per alias there.
+    - name: devstral-2
+      description: Mistral Vibe default coding model (Devstral 2) through your Vibe plan or API key.

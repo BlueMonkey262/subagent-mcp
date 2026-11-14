@@ -13,7 +13,13 @@ export interface UsageTotals {
   inputTokens: number;
   outputTokens: number;
   cachedInputTokens: number;
+  /** Provider-reported (or unknown-basis) cost. */
   costUsd: number;
+  /**
+   * Cost computed locally from configured prices (Vibe's `cost_usd`), kept apart from `costUsd` so an
+   * estimate is never summed into a figure that reads as a bill. Both count against `maxCostUsd`.
+   */
+  estimatedCostUsd: number;
 }
 
 export interface BackendUsage extends UsageTotals {
@@ -32,6 +38,7 @@ const ZERO = (): UsageTotals => ({
   outputTokens: 0,
   cachedInputTokens: 0,
   costUsd: 0,
+  estimatedCostUsd: 0,
 });
 
 function emptySnapshot(): UsageSnapshot {
@@ -98,7 +105,8 @@ export class UsageLedger {
       totals.inputTokens += extracted.inputTokens;
       totals.outputTokens += extracted.outputTokens;
       totals.cachedInputTokens += extracted.cachedInputTokens;
-      totals.costUsd += extracted.costUsd;
+      if (extracted.estimated) totals.estimatedCostUsd += extracted.costUsd;
+      else totals.costUsd += extracted.costUsd;
     };
     apply(this.#model(backend, model));
     apply(this.#usage[backend]);
@@ -141,15 +149,17 @@ export function remainingAllowances(
       ...(allowance.maxSpawns === undefined ? {} : { spawns: allowance.maxSpawns - spent.spawns }),
       ...(allowance.maxInputTokens === undefined ? {} : { inputTokens: allowance.maxInputTokens - spent.inputTokens }),
       ...(allowance.maxOutputTokens === undefined ? {} : { outputTokens: allowance.maxOutputTokens - spent.outputTokens }),
-      ...(allowance.maxCostUsd === undefined ? {} : { costUsd: allowance.maxCostUsd - spent.costUsd }),
+      ...(allowance.maxCostUsd === undefined ? {} : { costUsd: allowance.maxCostUsd - spent.costUsd - spent.estimatedCostUsd }),
     };
   }
   return remaining;
 }
 
-function extractUsage(usage: Readonly<Record<string, unknown>> | undefined): Pick<UsageTotals, "inputTokens" | "outputTokens" | "cachedInputTokens" | "costUsd"> {
-  if (usage === undefined) return { inputTokens: 0, outputTokens: 0, cachedInputTokens: 0, costUsd: 0 };
+function extractUsage(usage: Readonly<Record<string, unknown>> | undefined):
+  Pick<UsageTotals, "inputTokens" | "outputTokens" | "cachedInputTokens" | "costUsd"> & { readonly estimated: boolean } {
+  if (usage === undefined) return { inputTokens: 0, outputTokens: 0, cachedInputTokens: 0, costUsd: 0, estimated: false };
   return {
+    estimated: usage["costBasis"] === "estimated",
     inputTokens: numberField(usage, ["inputTokens", "input_tokens", "prompt_tokens"]),
     outputTokens: numberField(usage, ["outputTokens", "output_tokens", "completion_tokens"]),
     cachedInputTokens: numberField(usage, ["cachedInputTokens", "cached_input_tokens", "cache_read_input_tokens"]),
@@ -169,6 +179,7 @@ function readTotals(raw: Readonly<Record<string, unknown>>): UsageTotals {
     outputTokens: nonNegative(raw["outputTokens"], zero.outputTokens),
     cachedInputTokens: nonNegative(raw["cachedInputTokens"], zero.cachedInputTokens),
     costUsd: nonNegative(raw["costUsd"], zero.costUsd),
+    estimatedCostUsd: nonNegative(raw["estimatedCostUsd"], zero.estimatedCostUsd),
   };
 }
 

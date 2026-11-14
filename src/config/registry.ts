@@ -49,8 +49,14 @@ export interface AgentConfigSource {
   configWarning(): string | undefined;
 }
 
-/** Backends with no effort parameter. Cursor folds effort into the model id instead. */
-const EFFORT_REJECTED_BACKENDS = new Set<Backend>(["opencode", "cursor"]);
+/**
+ * Backends with no effort parameter. Cursor folds effort into the model id instead; Vibe sets
+ * thinking per model alias in its own config.toml and has no per-run CLI flag for it.
+ */
+const EFFORT_REJECTED_BACKENDS = new Set<Backend>(["opencode", "cursor", "vibe"]);
+
+/** Backends added after the original roster format; a models.yaml may omit them. */
+const LATER_BACKENDS = new Set<Backend>(["antigravity", "cursor", "copilot", "vibe"]);
 
 export class ConfigRegistry implements AgentConfigSource {
   readonly #agents = new Map<string, AgentConfig>();
@@ -248,10 +254,10 @@ export async function loadModelsFile(path: string): Promise<ModelsFile> {
   const roster = Object.fromEntries(
     BACKENDS.map((backend) => [
       backend,
-      // Antigravity, Cursor and Copilot were added after the original roster format. Let older projects
+      // Antigravity, Cursor, Copilot and Vibe were added after the original roster format. Let older projects
       // load until they deliberately add a model, while preserving strict array validation for
       // every key they do provide and for the pre-existing backends.
-      (backend === "antigravity" || backend === "cursor" || backend === "copilot") && rawModels[backend] === undefined
+      LATER_BACKENDS.has(backend) && rawModels[backend] === undefined
         ? []
         : parseModelEntries(rawModels[backend], path, backend),
     ]),
@@ -440,7 +446,9 @@ function optionalPositiveNumber(record: UnknownRecord, key: string, context: str
 function effortIgnoredError(backend: Backend, effort: string): ConfigurationError {
   const detail = backend === "cursor"
     ? `Cursor folds effort into the model id (for example grok-4.7-high). Pass that model and omit effort.`
-    : `OpenCode has no reasoning-effort parameter, so the run would silently use the model's default.`;
+    : backend === "vibe"
+      ? `Vibe sets thinking per model alias in ~/.vibe/config.toml and has no per-run flag. Use an alias configured with the thinking level you want.`
+      : `OpenCode has no reasoning-effort parameter, so the run would silently use the model's default.`;
   return new ConfigurationError(
     `Backend "${backend}" does not honor effort "${effort}". ${detail} Remove effort, or use Claude, Codex, Antigravity, or Copilot.`,
     { backend, effort },

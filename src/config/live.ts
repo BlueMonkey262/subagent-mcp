@@ -41,6 +41,7 @@ export function missingConfigMessage(input: {
     "     antigravity: []",
     "     cursor: []",
     "     copilot: []",
+    "     vibe: []",
     `2. ${input.agentsDirectory}/<name>.md`,
     "   One file per agent. The frontmatter name must match the filename. Example general.md:",
     "   ---",
@@ -185,5 +186,5 @@ export class LiveConfig implements AgentConfigSource {
 }
 
 function emptyRoster(): ConfigRegistry["roster"] {
-  return { claude: [], codex: [], opencode: [], antigravity: [], cursor: [], copilot: [] };
+  return { claude: [], codex: [], opencode: [], antigravity: [], cursor: [], copilot: [], vibe: [] };
 }

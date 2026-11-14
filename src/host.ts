@@ -13,6 +13,7 @@ import { ClaudeAdapter } from "./adapters/claude/adapter.js";
 import { CodexAdapter } from "./adapters/codex/adapter.js";
 import { CursorAdapter } from "./adapters/cursor/adapter.js";
 import { CopilotAdapter } from "./adapters/copilot/adapter.js";
+import { VibeAdapter } from "./adapters/vibe/adapter.js";
 import { OpenCodeAdapter } from "./adapters/opencode/adapter.js";
 import { LiveConfig } from "./config/live.js";
 import { isBackend } from "./core/types.js";
@@ -415,11 +416,12 @@ export async function runHost(): Promise<void> {
   const antigravity = new AntigravityAdapter();
   const cursor = new CursorAdapter();
   const copilot = new CopilotAdapter();
+  const vibe = new VibeAdapter();
   let endpoint: RunningHost | undefined;
   let ensembles: EnsembleManager | undefined;
   const supervisor = new SupervisorClass({
     registry: live,
-    adapters: new AdapterRegistry([claude, codex, opencode, antigravity, cursor, copilot]),
+    adapters: new AdapterRegistry([claude, codex, opencode, antigravity, cursor, copilot, vibe]),
     cwd,
     usage,
     updateCachePath: join(paths.directory, "update.json"),
@@ -475,6 +477,7 @@ export async function runHost(): Promise<void> {
       antigravity.closeAll(),
       cursor.closeAll(),
       copilot.closeAll(),
+      vibe.closeAll(),
     ]).catch(() => undefined);
     const ownsPaths = await ownsHostPaths(paths, process.pid);
     // net.Server.close() unlinks Unix sockets, so an orphan must exit without closing a replacement's path.

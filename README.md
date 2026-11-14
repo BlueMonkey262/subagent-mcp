@@ -1,8 +1,9 @@
 # subagent-mcp
 
 A resumable, approval-aware MCP server for delegating work from a Claude Code session to
-subagents across six backends: Claude Code, Codex, OpenCode, Google Antigravity CLI, the
-Cursor Agent CLI, and the GitHub Copilot CLI. All six have been exercised live against their installed CLIs.
+subagents across seven backends: Claude Code, Codex, OpenCode, Google Antigravity CLI, the
+Cursor Agent CLI, the GitHub Copilot CLI, and Mistral Vibe. All seven have been exercised live
+against their installed CLIs (Vibe's contract: [`docs/protocol/vibe.md`](docs/protocol/vibe.md)).
 
 ## Setup
 
@@ -20,11 +21,14 @@ That installs: the server (user-scoped MCP), the `subagent-mcp` launcher, and th
 | Cursor | needs the `agent` CLI; model IDs from `agent --list-models` |
 | GitHub Copilot | needs the `copilot` CLI, signed in; model IDs as `copilot --model` accepts them (`auto` routes within your plan) |
 | Antigravity (AGY) | needs `agy`; agent config also sets `antigravityAgent` |
+| Mistral Vibe | needs `vibe` (logged in with `vibe --setup`); model names are your Vibe model aliases |
+| Mistral API | through OpenCode's `mistral` provider: roster entries `mistral/<model-id>` under `opencode` |
 | NVIDIA NIM | free-tier models via an API key; usable from Claude, Codex and OpenCode agents |
 | Generic OpenAI-compatible API | any `/v1` endpoint, optional key, add as many as you like; same harnesses as NIM |
 
 Only the CLIs you actually use need to be installed. Cursor, Antigravity and Copilot are closed harnesses with
-no custom-endpoint setting, so NIM/generic endpoints cannot be routed through them.
+no custom-endpoint setting, so NIM/generic endpoints cannot be routed through them. Vibe is not routed to
+them by `subagent-mcp endpoint add` either (it has its own provider config in `~/.vibe/config.toml`).
 
 ### Endpoints (NIM and generic OpenAI-compatible)
 
@@ -275,6 +279,20 @@ against the repository, tests, and the operator's actual request.
   prompt. `effort` maps to `--reasoning-effort` (not every model accepts it; `auto` rejects it).
   Copilot reports premium requests, not tokens, so its turns carry no token usage. See
   [`docs/protocol/copilot.md`](docs/protocol/copilot.md).
+- **Vibe**: drives Mistral Vibe's headless mode, `vibe --output streaming --output-dir <tmp>
+  --workdir <cwd> --model <alias> ... -p` with the prompt on stdin (built against
+  `mistral-vibe 3.1.2`). Like Cursor it is **one process per turn**: the agent ID is Vibe's own
+  `session_id` (every streamed entry carries it), and `send_message` starts a new process with
+  `--resume <session_id>` (no `--model`: a session keeps its model). The run's `export.json`, not
+  the exit code, decides the outcome; a run with no readable export is a failure, never a success.
+  Headless Vibe cannot ask for approval (calls that need it are denied), so `permission.default:
+  allow` → `--auto-approve --trust`, and `escalate`/`deny` → the builtin `ask` agent with only
+  `read_file` and `grep` enabled. Vibe cannot enforce per-command `allow`/`deny` lists, so configs
+  that set them are refused. `effort` is refused too: Vibe sets thinking per model alias in its
+  own config. The agent config's instructions go into the first prompt, not
+  `--system-prompt-file`, which would replace Vibe's coding-agent instructions. `stop_agent`
+  sends SIGTERM to Vibe itself (it stops its tools and writes the export), then kills the
+  process group after a grace period. See [`docs/protocol/vibe.md`](docs/protocol/vibe.md).
 
 ## Operational limits
 
@@ -320,16 +338,21 @@ against the repository, tests, and the operator's actual request.
   in `models.yaml` produce a `remaining` object (allowance minus observed usage).
 - **Per-agent token counts.** `list_agents` reports each agent's `cumulative_usage`: its finished
   turns plus the turn in progress. Claude, Codex and OpenCode 2.x report usage mid-turn (as
-  `usage.updated` events in `get_agent_events`); Cursor and Antigravity report it when a turn ends.
+  `usage.updated` events in `get_agent_events`); Cursor, Antigravity and Vibe report it when a turn ends.
   Copilot reports no token counts.
   Usage fields:
 
   | Field | Meaning |
   |---|---|
-  | `inputTokens` | Input as the backend reports it. Codex includes cache reads; Claude, OpenCode and Cursor do not. |
+  | `inputTokens` | Input as the backend reports it. Codex and Vibe include cache reads; Claude, OpenCode and Cursor do not. |
   | `cachedInputTokens` | Input served from the prompt cache. |
-  | `uncachedInputTokens` | Input processed fresh, including cache writes. Set for Claude, Codex, OpenCode and Cursor; Antigravity's semantics are unverified, so it is left unset. |
+  | `uncachedInputTokens` | Input processed fresh, including cache writes. Set for Claude, Codex, OpenCode, Cursor and Vibe; Antigravity's semantics are unverified, so it is left unset. |
   | `outputTokens`, `costUsd` | As reported. Codex reports no cost. |
+  | `costBasis` | `estimated` when the cost is computed locally from configured prices (Vibe), not billed. |
+
+  Vibe's `cost_usd` is an estimate from the per-token prices in your Vibe config, and on a Vibe
+  subscription you are not billed per token at all. The usage ledger books it as
+  `estimatedCostUsd`, separate from `costUsd`; both count against a `maxCostUsd` allowance.
 
   Compare backends with `uncachedInputTokens` + `cachedInputTokens`, not `inputTokens`.
 - **Live models and plan usage.** `list_models` with a `backend` (or `live: true`) adds a `live`
@@ -471,6 +494,8 @@ Spawn options:
   result lookup, and cancellation after launch.
 
 Effort support is reported by discovery. OpenCode currently has no verified effort
-mapping in this adapter; Cursor uses model IDs containing effort; Copilot passes `--reasoning-effort`. Unsupported
+mapping in this adapter; Cursor uses model IDs containing effort; Copilot passes `--reasoning-effort`;
+Vibe uses model aliases whose own config sets thinking. Unsupported
 values remain errors. Usage and monetary cost are reported only when supplied by
-the backend; the bridge does not invent price estimates.
+the backend; the bridge does not invent price estimates (Vibe's own estimate is
+labelled `costBasis: estimated`).
