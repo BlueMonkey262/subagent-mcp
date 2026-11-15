@@ -232,15 +232,35 @@ export async function serveHost(options: {
   readonly onShutdown?: () => void;
   /** Set once the host begins shutting down; no further mutating RPCs are accepted. */
   readonly shuttingDown?: () => boolean;
+  /** Bound on one ping write, exposed so tests can exercise a stalled peer quickly. */
+  readonly sendTimeoutMs?: number;
 }): Promise<RunningHost> {
   const sockets = new Set<Socket>();
   const attached = new Set<Socket>();
   let shuttingDown = false;
-  const send = sendSocketMessage;
+  const send = (socket: WritablePeer, message: Readonly<Record<string, unknown>>) =>
+    sendSocketMessage(socket, message, options.sendTimeoutMs);
   const broadcast = async (message: Readonly<Record<string, unknown>>): Promise<number> => {
     const targets = [...attached].filter((socket) => !socket.destroyed && socket.writable);
-    const results = await Promise.all(targets.map((socket) => send(socket, message)));
-    return results.filter((delivered) => delivered).length;
+    let timedOut = false;
+    const results = await Promise.all(targets.map(async (socket) => {
+      const delivered = await send(socket, message);
+      if (!delivered && socket.destroyed) {
+        // The peer stopped reading and sendSocketMessage destroyed it. Do not keep counting it as
+        // an attached consumer; the ping must be delivered to it later instead of being lost.
+        attached.delete(socket);
+        timedOut = true;
+      }
+      return delivered;
+    }));
+    const delivered = results.filter((result) => result).length;
+    if (timedOut && delivered > 0 && message["event"] === "detached" && isRecord(message["data"])) {
+      // At least one other session received it, so the caller would otherwise treat it as fully
+      // delivered. Requeue it for the dropped session's next attach. When nobody received it,
+      // runHost's `delivered === 0` path enqueues it once instead.
+      await options.supervisor.enqueueUndeliveredPing(message["data"]).catch(() => undefined);
+    }
+    return delivered;
   };
   let redeliverTimer: NodeJS.Timeout | undefined;
   const redeliverQueued = async (): Promise<void> => {

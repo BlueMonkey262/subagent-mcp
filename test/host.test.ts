@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import { spawn, type ChildProcess } from "node:child_process";
+import { once } from "node:events";
 import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { createConnection } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -369,6 +371,50 @@ test("a stalled socket write is bounded and destroys that peer", async () => {
     assert.ok(Date.now() - started < 1_000, "the timeout bounds the wait");
   } finally {
     clearTimeout(keepAlive);
+  }
+});
+
+test("a timed-out ping write drops the stalled session and requeues the ping", { timeout: 10_000 }, async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "subagent-host-ping-timeout-"));
+  const supervisor = new Supervisor({ registry: registry(), adapters: new AdapterRegistry([new FakeAdapter("codex")]), cwd });
+  const paths = hostPaths(cwd);
+  const endpoint = await serveHost({ socketPath: paths.socketPath, supervisor, sendTimeoutMs: 300 });
+  const healthy = await HostClient.connect(paths.socketPath);
+  const received: Readonly<Record<string, unknown>>[] = [];
+  healthy.onDetached((data) => received.push(data));
+  const raw = createConnection(paths.socketPath);
+  await once(raw, "connect");
+  let late: HostClient | undefined;
+  try {
+    await healthy.call("attach_session");
+    raw.write(`${JSON.stringify({ id: 1, method: "attach_session" })}\n`);
+    await waitUntil(() => endpoint.attached === 2);
+    // Stop reading so a multi-megabyte ping cannot finish writing within the timeout.
+    raw.pause();
+
+    const delivered = await endpoint.notify({
+      event: "detached",
+      data: { agent_id: "stalled", backend: "codex", status: "completed", result: "x".repeat(4_000_000) },
+    });
+    assert.equal(delivered, 1, "only the healthy session received the ping");
+    assert.equal(endpoint.attached, 1, "the stalled session was dropped from the attached set");
+    assert.equal(received.length, 1, "the healthy session was not counted as the dropped one");
+    assert.equal(supervisor.undeliveredPingCount(), 1, "the ping is queued for the dropped session");
+
+    late = await HostClient.connect(paths.socketPath);
+    const latePings: Readonly<Record<string, unknown>>[] = [];
+    late.onDetached((data) => latePings.push(data));
+    await late.call("attach_session");
+    await waitUntil(() => latePings.length === 1);
+    assert.equal(latePings[0]?.["agent_id"], "stalled");
+    assert.equal(supervisor.undeliveredPingCount(), 0, "the queued ping was delivered on the next attach");
+  } finally {
+    raw.destroy();
+    healthy.close();
+    late?.close();
+    await endpoint.close();
+    await rm(paths.socketPath, { force: true });
+    await rm(cwd, { recursive: true, force: true });
   }
 });
 
