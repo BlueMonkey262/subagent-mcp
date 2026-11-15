@@ -385,6 +385,29 @@ test("draining in-flight notifier tasks is bounded so shutdown always proceeds",
   }
 });
 
+test("draining waits through a settle period for a notifier that starts late", async () => {
+  const keepAlive = setTimeout(() => undefined, 1_000);
+  const tasks = new Set<Promise<unknown>>();
+  let lastActivity = Date.now();
+  let resolveLate: (() => void) | undefined;
+  const late = new Promise<void>((resolve) => { resolveLate = resolve; });
+  const added = setTimeout(() => {
+    tasks.add(late);
+    lastActivity = Date.now();
+    const finished = setTimeout(() => resolveLate?.(), 15);
+    void late.finally(() => { tasks.delete(late); lastActivity = Date.now(); clearTimeout(finished); });
+  }, 10);
+  const started = Date.now();
+  try {
+    await drainNotifierTasks(tasks, 500, 30, () => lastActivity);
+    assert.equal(tasks.size, 0, "the late notifier was awaited");
+    assert.ok(Date.now() - started >= 50, "an empty set is watched for a settle period");
+  } finally {
+    clearTimeout(keepAlive);
+    clearTimeout(added);
+  }
+});
+
 test("hostDisposition: replace only an older, idle host no other session uses; never downgrade", () => {
   const local = { build: "new", builtAt: 2_000 };
   const host = (extra: Record<string, unknown>) => ({ protocol: HOST_PROTOCOL, clients: 1, ...extra });

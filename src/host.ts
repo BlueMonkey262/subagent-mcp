@@ -121,6 +121,8 @@ export const SEND_TIMEOUT_MS = 5_000;
 export const NOTIFIER_DRAIN_TIMEOUT_MS = 3_000;
 /** Delay before retrying pings still queued when a bounded attach flush ends. */
 export const ATTACH_REDELIVER_DELAY_MS = 1_000;
+/** How long the notifier set must stay empty before shutdown trusts it is drained. */
+export const NOTIFIER_SETTLE_MS = 50;
 
 /** The part of a net.Socket this module needs, so a stalled peer can be tested without a real socket. */
 export interface WritablePeer {
@@ -590,26 +592,33 @@ export class HostSession {
 
 /**
  * Wait for in-flight completion notifiers, bounded so a stuck notifier cannot hold shutdown open.
- * A settle can enqueue a ping after the final snapshot is captured, so shutdown drains here and
- * re-checks after each wait in case one settle started another notifier.
+ * A settle can start a notifier asynchronously after closeAll() (real adapters emit their
+ * interrupted turn.completed later), so an empty set must stay empty for a short settle period
+ * before shutdown takes its final snapshot.
  */
 export async function drainNotifierTasks(
   tasks: ReadonlySet<Promise<unknown>>,
   timeoutMs = NOTIFIER_DRAIN_TIMEOUT_MS,
+  settleMs = NOTIFIER_SETTLE_MS,
+  lastActivity?: () => number,
 ): Promise<void> {
   const deadline = Date.now() + timeoutMs;
-  while (tasks.size > 0) {
+  const started = Date.now();
+  const wait = (ms: number): Promise<void> => new Promise<void>((resolve) => {
+    const timer = setTimeout(resolve, Math.max(0, ms));
+    timer.unref();
+  });
+  for (;;) {
     const remaining = deadline - Date.now();
     if (remaining <= 0) return;
-    let timer: NodeJS.Timeout | undefined;
-    await Promise.race([
-      Promise.allSettled([...tasks]),
-      new Promise<void>((resolve) => {
-        timer = setTimeout(resolve, remaining);
-        timer.unref();
-      }),
-    ]);
-    if (timer !== undefined) clearTimeout(timer);
+    if (tasks.size === 0) {
+      const quietSince = Math.max(started, lastActivity?.() ?? started);
+      const quietFor = Date.now() - quietSince;
+      if (quietFor >= settleMs) return;
+      await wait(Math.min(settleMs - quietFor, remaining));
+      continue;
+    }
+    await Promise.race([Promise.allSettled([...tasks]), wait(remaining)]);
   }
 }
 
@@ -654,6 +663,8 @@ export async function runHost(): Promise<void> {
   const cursor = new CursorAdapter();
   let endpoint: RunningHost | undefined;
   const notifierTasks = new Set<Promise<unknown>>();
+  /** Last time a completion notifier was added or settled; shutdown's drain waits for it to go quiet. */
+  let notifierActivity = Date.now();
   const supervisor = new SupervisorClass({
     registry: live,
     adapters: new AdapterRegistry([claude, codex, opencode, antigravity, cursor]),
@@ -679,7 +690,8 @@ export async function runHost(): Promise<void> {
         }
       })();
       notifierTasks.add(task);
-      void task.finally(() => notifierTasks.delete(task));
+      notifierActivity = Date.now();
+      void task.finally(() => { notifierTasks.delete(task); notifierActivity = Date.now(); });
     },
   });
   live.watch(() => {
@@ -734,7 +746,7 @@ export async function runHost(): Promise<void> {
       antigravity.closeAll(),
       cursor.closeAll(),
     ]).catch(() => undefined);
-    await drainNotifierTasks(notifierTasks);
+    await drainNotifierTasks(notifierTasks, NOTIFIER_DRAIN_TIMEOUT_MS, NOTIFIER_SETTLE_MS, () => notifierActivity);
     const ownsPaths = await ownsHostPaths(paths, process.pid);
     // Persist the final snapshot before closing the endpoint or removing the socket/pid/lock. Once
     // those are gone a replacement host can start, and it must not later be overwritten by ours.
