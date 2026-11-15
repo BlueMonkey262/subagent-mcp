@@ -150,3 +150,80 @@ test("spawn captures the real Antigravity definition, snapshots it, and refuses 
   });
   assert.equal(resumed["status"], "running");
 });
+
+test("a queued send_message keeps allow_agent_definition_change and classifies definition errors", async () => {
+  const project = await mkdtemp(join(tmpdir(), "antigravity-queued-"));
+  const global = await mkdtemp(join(tmpdir(), "antigravity-global-"));
+  const definitionPath = join(project, ".agents", "agents", "reviewer.md");
+  await writeDefinition(definitionPath, "reviewer");
+  const agent: AgentConfig = {
+    name: "reviewer",
+    backend: "antigravity",
+    model: "gemini-fixture",
+    antigravityAgent: "reviewer",
+    description: "Antigravity reviewer",
+    systemPrompt: "",
+    permission,
+    env: {},
+    sourcePath: join(project, ".subagents", "reviewer.md"),
+  };
+  const roster: ModelRoster = {
+    claude: [],
+    codex: [],
+    opencode: [],
+    antigravity: [{ name: "gemini-fixture" }],
+    cursor: [],
+  };
+  const registry = new ConfigRegistry([agent], roster, defaultServerLimits());
+  const adapter = new FakeAdapter("antigravity");
+  const resolver = new FileAntigravityAgentResolver();
+  const supervisor = new Supervisor({
+    registry,
+    adapters: new AdapterRegistry([adapter]),
+    cwd: project,
+    antigravityResolver: { resolve: input => resolver.resolve({ ...input, globalDirectory: global }) },
+    sendMessageWaitMs: 0,
+  });
+  const spawnAgent = () => supervisor.spawnAgent({
+    agent: "reviewer",
+    prompt: "review this",
+    description: "review",
+    run_in_background: true,
+  });
+  const isState = (id: unknown, state: string) =>
+    supervisor.listAgents().some(item => item["agent_id"] === id && item["state"] === state);
+
+  // Queueing without the opt-in must end the agent with the real definition error, not a
+  // retryable supervisor stream error from the pump's outer catch.
+  adapter.queueScript([]);
+  const refused = await spawnAgent();
+  const refusedId = String(refused["agent_id"]);
+  await waitUntil(() => isState(refusedId, "running"));
+  await writeDefinition(definitionPath, "reviewer", "Changed instructions.");
+  const queued = await supervisor.sendMessage({ agent: refusedId, prompt: "continue", run_in_background: true });
+  assert.equal(queued["queued"], true);
+  adapter.emit(refusedId, "turn.completed", { turnId: "first", status: "completed", finalText: "done" });
+  await waitUntil(() => isState(refusedId, "completed"));
+  const refusedResult = supervisor.getAgentResult(refusedId) as Record<string, unknown>;
+  assert.equal((refusedResult["error"] as { code: string }).code, "ANTIGRAVITY_AGENT_CHANGED");
+  assert.equal(adapter.resumeRequests.length, 0);
+
+  // Queueing with the opt-in carries it through delivery and resumes normally.
+  adapter.queueScript([]);
+  const allowed = await spawnAgent();
+  const allowedId = String(allowed["agent_id"]);
+  await waitUntil(() => isState(allowedId, "running"));
+  await writeDefinition(definitionPath, "reviewer", "Third instructions.");
+  await supervisor.sendMessage({
+    agent: allowedId,
+    prompt: "continue",
+    run_in_background: true,
+    allow_agent_definition_change: true,
+  });
+  adapter.emit(allowedId, "turn.completed", { turnId: "first-allowed", status: "completed", finalText: "done" });
+  await waitUntil(() => adapter.resumeRequests.length === 1);
+  assert.equal(adapter.resumeRequests[0]?.agentId, allowedId);
+  adapter.emit(allowedId, "turn.completed", { turnId: "second-allowed", status: "completed", finalText: "resumed" });
+  await waitUntil(() => isState(allowedId, "completed"));
+  assert.equal((supervisor.getAgentResult(allowedId) as Record<string, unknown>)["error"], undefined);
+});

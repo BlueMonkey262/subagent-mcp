@@ -127,7 +127,13 @@ interface AgentRecord {
   currentTurnId?: string;
   pendingApprovalId?: string;
   /** One queued send_message, delivered once the current turn reaches turn.completed. */
-  pendingMessage?: { readonly prompt: string; readonly effort?: string; readonly timeout?: number };
+  pendingMessage?: {
+    readonly prompt: string;
+    readonly effort?: string;
+    readonly timeout?: number;
+    /** Carried so a queued Antigravity resume can accept a changed agent definition. */
+    readonly allowDefinitionChange?: boolean;
+  };
   /** Seconds. Null when neither the call nor the agent config set a cap. */
   timeoutSeconds: number | null;
   timedOut: boolean;
@@ -958,6 +964,7 @@ export class Supervisor {
         prompt: input.prompt,
         ...(input.effort === undefined ? {} : { effort: input.effort }),
         ...(input.timeout === undefined ? {} : { timeout: input.timeout }),
+        ...(input.allow_agent_definition_change === true ? { allowDefinitionChange: true } : {}),
       };
       if (input.timeout !== undefined) record.timeoutSeconds = input.timeout;
       record.updatedAt = new Date().toISOString();
@@ -1282,15 +1289,19 @@ export class Supervisor {
               });
               record.timedOut = false;
               try {
-                await this.#deliverResume(record, adapter, pending.prompt, pending.effort, pending.timeout);
+                await this.#deliverResume(record, adapter, pending.prompt, pending.effort, pending.timeout,
+                  pending.allowDefinitionChange === true);
               } catch (error) {
-                if (!(error instanceof ModelBlockedError) && !(error instanceof ConfigInvalidError)) throw error;
-                // The queued message is refused; the agent ends on the turn that just finished.
+                // Every supervisor error (a blocked model/config, an Antigravity definition change,
+                // etc.) is a real refusal for the queued message, not a broken event stream. The
+                // agent ends on the turn that just finished, carrying the classified error.
+                if (!(error instanceof SubagentError)) throw error;
                 this.#setLastError(record, classifyFailure({
                   code: error.code,
                   message: error.message,
                   backend: record.backend,
                   source: "supervisor",
+                  ...(error.details === undefined ? {} : { details: error.details }),
                 }));
                 if (event.data.status === "failed") this.#ensureFailure(record, event.data.finalText);
                 record.state = event.data.status === "completed" ? "completed"
