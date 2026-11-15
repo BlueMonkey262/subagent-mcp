@@ -3,7 +3,7 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, On } from 'claude-code'
 
-import type { PanelAgent, PanelState } from '../types'
+import type { PanelAgent, PanelDiff, PanelEnsemble, PanelState } from '../types'
 import { BACKENDS, readDisabled, writeDisabled } from './policy'
 
 const PANE = 'subagent-mcp'
@@ -25,8 +25,10 @@ const panel = atom(
     showAll: false,
     disabled: [],
     locked: [],
+    ensembles: [],
+    diff: null,
   } as PanelState,
-  { shape: 'panel-3' },
+  { shape: 'panel-4' },
 )
 
 const INIT_PROMPT =
@@ -51,6 +53,66 @@ const ago = (iso: string) => {
 const RECENT = 5
 const MODELS_FILE = '.subagents/models.yaml'
 const isRunning = (a: PanelAgent) => RUNNING.includes(a.state)
+const OPEN_ENSEMBLE = ['launching', 'running', 'synthesizing']
+// A server that predates get_dashboard answers with a protocol error naming the tool.
+const MISSING_TOOL = /get_dashboard.*(not found|unknown)|(not found|unknown).*get_dashboard/i
+
+/** What a running agent is doing, in a few words: its open tool call, else what it last ran. */
+export function activityOf(a: PanelAgent): string {
+  if (a.state === 'needs_approval') return 'waiting for approval'
+  if (a.activity !== undefined) return a.activity
+  if (a.phase === 'thinking') return a.lastTool === undefined ? 'thinking' : `thinking, last ran ${a.lastTool}`
+  return 'working'
+}
+
+/** Splits a unified diff into one section per file (`diff --git` headers). */
+export function splitDiff(patch: string): { path: string; patch: string }[] {
+  const parts = patch.split(/^(?=diff --git )/m).filter(part => part.trim() !== '')
+  return parts.map(part => {
+    const head = /^diff --git a\/(.+?) b\/(.+)$/m.exec(part)
+    return { path: head?.[2] ?? head?.[1] ?? '(diff)', patch: part }
+  })
+}
+
+function toAgent(a: Record<string, unknown>): PanelAgent {
+  const usage = (a['cumulative_usage'] ?? {}) as Record<string, unknown>
+  const role = a['ensemble_role']
+  return {
+    id: str(a['agent_id']),
+    name: str(a['name']),
+    backend: str(a['backend']),
+    model: str(a['model']),
+    state: str(a['state']),
+    updated: str(a['updated_at']),
+    tokensIn: num(usage['inputTokens']),
+    tokensOut: num(usage['outputTokens']),
+    ...(typeof a['current_activity'] === 'string' && a['current_activity'] !== '' ? { activity: a['current_activity'] } : {}),
+    ...(typeof a['phase'] === 'string' ? { phase: a['phase'] } : {}),
+    ...(typeof a['last_tool'] === 'string' && a['last_tool'] !== '' ? { lastTool: a['last_tool'] } : {}),
+    ...(typeof a['worktree'] === 'object' && a['worktree'] !== null ? { worktree: true } : {}),
+    ...(typeof role === 'string' ? { ensemble: role } : {}),
+    ...(a['request_id'] === undefined || a['request_id'] === null
+      ? {}
+      : { approval: { requestId: str(a['request_id']), tool: str(a['tool_name']), command: str(a['command'] ?? JSON.stringify(a['input'] ?? '')).slice(0, 200) } }),
+  }
+}
+
+function toEnsemble(e: Record<string, unknown>): PanelEnsemble {
+  const members = Array.isArray(e['members']) ? (e['members'] as Record<string, unknown>[]) : []
+  return {
+    id: str(e['ensemble_id']),
+    name: str(e['name'] ?? e['ensemble_id']),
+    status: str(e['status']),
+    valid: num(e['valid']),
+    of: num(e['of']),
+    members: members.map(m => ({
+      role: str(m['role']),
+      state: str(m['state']),
+      ...(typeof m['name'] === 'string' ? { name: m['name'] } : {}),
+      ...(typeof m['valid'] === 'boolean' ? { valid: m['valid'] } : {}),
+    })),
+  }
+}
 
 type Dollar = Pick<EngineInterface, 'mcp' | 'fs'>
 type Call = { isError?: boolean; structuredContent?: unknown; content: { type: string; text?: string }[] }
@@ -83,7 +145,8 @@ function digest(d: Record<string, unknown>): string[] {
 export function declarePanelCommand($: EngineInterface) {
   return $.command.register({
     name: 'subagent-mcp',
-    description: 'Open the subagent control panel',
+    description: 'Open the subagent control panel (`widget` for the desktop app\'s small floating form)',
+    argumentHint: '[widget]',
   })
 }
 
@@ -113,31 +176,37 @@ export const registerPanel = (on: On) => {
   let timer: { cancel: () => void } | undefined
   // Bumped by every open and every hand-off; a late refresh checks it before reclaiming focus.
   let epoch = 0
+  // Cleared once a server answers that it has no get_dashboard; list_agents serves from then on.
+  let dashboard = true
 
-  on('command.run', { command: 'subagent-mcp' }, async $ => {
+  on('command.run', { command: 'subagent-mcp' }, async ($, e) => {
     const mine = ++epoch
-    const opened = await $.ui.open({ id: PANE, title: 'Subagents', focus: true, closeOnEscape: true, rows: 16 })
+    // `/subagent-mcp widget` asks the desktop app for the small floating form; other surfaces ignore it.
+    const widget = e.args.trim() === 'widget'
+    const opened = await $.ui.open({ id: PANE, title: 'Subagents', closeOnEscape: true, rows: 16, ...(widget ? { placement: 'widget' as const } : { focus: true as const }) })
 
     const refresh = async () => {
       try {
-        const listed = await callTool($, 'list_agents', { limit: 30 })
-        const agents = ((listed['agents'] as Record<string, unknown>[] | undefined) ?? []).map(a => {
-          const usage = (a['cumulative_usage'] ?? {}) as Record<string, unknown>
-          return {
-            id: str(a['agent_id']),
-            name: str(a['name']),
-            backend: str(a['backend']),
-            model: str(a['model']),
-            state: str(a['state']),
-            updated: str(a['updated_at']),
-            tokensIn: num(usage['inputTokens']),
-            tokensOut: num(usage['outputTokens']),
-            ...(typeof a['current_activity'] === 'string' && a['current_activity'] !== '' ? { activity: a['current_activity'] } : {}),
-            ...(a['request_id'] === undefined || a['request_id'] === null
-              ? {}
-              : { approval: { requestId: str(a['request_id']), tool: str(a['tool_name']), command: str(a['command'] ?? JSON.stringify(a['input'] ?? '')).slice(0, 200) } }),
+        let rows: Record<string, unknown>[] | undefined
+        let ensembles: PanelEnsemble[] = []
+        if (dashboard) {
+          try {
+            // One read for agents, approvals and ensembles.
+            const board = await callTool($, 'get_dashboard', { recent: 25 })
+            if (Array.isArray(board['agents'])) {
+              rows = board['agents'] as Record<string, unknown>[]
+              ensembles = ((board['ensembles'] as Record<string, unknown>[] | undefined) ?? []).map(toEnsemble)
+            }
+          } catch (error) {
+            if (!MISSING_TOOL.test(str((error as Error).message))) throw error
+            dashboard = false
           }
-        })
+        }
+        if (rows === undefined) {
+          const listed = await callTool($, 'list_agents', { limit: 30 })
+          rows = (listed['agents'] as Record<string, unknown>[] | undefined) ?? []
+        }
+        const agents = rows.map(toAgent)
         // Running agents lead; the server's order (newest first) holds within each group.
         agents.sort((x, y) => Number(isRunning(y)) - Number(isRunning(x)))
         let latest: string | null = null
@@ -150,7 +219,9 @@ export const registerPanel = (on: On) => {
         const before = await read($, panel)
         const selected = agents.some(a => a.id === before.selected) ? before.selected : (agents[0]?.id ?? null)
         let detail = before.detailFor === selected ? before.detail : []
-        if (selected !== null) {
+        const chosen = agents.find(a => a.id === selected)
+        // A settled agent's digest does not change: fetch it once, keep polling only running ones.
+        if (selected !== null && (chosen === undefined || isRunning(chosen) || before.detailFor !== selected || detail.length === 0)) {
           try {
             detail = digest(await callTool($, 'get_agent_events', { agent: selected, summary: true }))
           } catch {
@@ -160,6 +231,7 @@ export const registerPanel = (on: On) => {
         await update($, panel, s => ({
           ...s,
           agents,
+          ensembles,
           selected,
           detail,
           detailFor: selected,
@@ -191,10 +263,34 @@ export const registerPanel = (on: On) => {
   })
 
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
-    const { Box, Text, Button, Input } = $.ui.resolve(e)
+    const { Box, Text, Button, Input, Code } = $.ui.resolve(e)
     const state = await read($, panel)
     const selected = state.agents.find(a => a.id === state.selected)
     const running = state.agents.filter(isRunning)
+    const openEnsembles = state.ensembles.filter(x => OPEN_ENSEMBLE.includes(x.status))
+
+    // The desktop app's minimized form: a glance, no keys (clicks may not reach a widget).
+    if (e.props.placement === 'widget') {
+      const waiting = state.agents.filter(a => a.state === 'needs_approval').length
+      return (
+        <Box flexDirection="column">
+          <Text bold>
+            {running.length} running{waiting > 0 ? ` · ${waiting} need approval` : ''}{openEnsembles.length > 0 ? ` · ${openEnsembles.length} ensemble(s)` : ''}
+          </Text>
+          {running.slice(0, 4).map(a => (
+            <Text key={`w-${a.id}`} dimColor={a.state !== 'needs_approval'}>
+              {a.name}: {activityOf(a).slice(0, 48)}
+            </Text>
+          ))}
+          {openEnsembles.slice(0, 2).map(x => (
+            <Text key={`we-${x.id}`} dimColor>
+              {x.name}: {x.members.filter(m => !RUNNING.includes(m.state) && m.state !== 'pending').length}/{x.members.length} settled
+            </Text>
+          ))}
+          {running.length === 0 && state.message !== '' && <Text dimColor>{state.message}</Text>}
+        </Box>
+      )
+    }
     const say = (message: string) => update($, panel, s => ({ ...s, message, confirm: null, at: Date.now() }))
     const ask = (confirm: PanelState['confirm']) => update($, panel, s => ({ ...s, confirm }))
 
@@ -223,6 +319,37 @@ export const registerPanel = (on: On) => {
       } catch (error) {
         $.ui.toast(`Could not send the prompt to Claude: ${str((error as Error).message).slice(0, 80)}`)
       }
+    }
+
+    const d = state.diff
+    if (d !== null) {
+      const section = d.sections[d.index]
+      const page = (by: number) => update($, panel, s => (s.diff === null ? s : { ...s, diff: { ...s.diff, index: Math.min(s.diff.sections.length - 1, Math.max(0, s.diff.index + by)) } }))
+      const back = () => update($, panel, s => ({ ...s, diff: null }))
+      return (
+        <Box flexDirection="column">
+          <Box>
+            <Text bold>{d.agent}: {d.summary}</Text>
+          </Box>
+          <Box>
+            <Button key="diff-next" hotkey="j" plain onPress={() => page(1)}>next file</Button>
+            <Text>  </Text>
+            <Button key="diff-prev" hotkey="k" plain onPress={() => page(-1)}>prev file</Button>
+            <Text>  </Text>
+            <Button key="diff-back" hotkey="b" plain autoFocus onPress={back}>back</Button>
+          </Box>
+          {section === undefined ? (
+            <Text dimColor>No changes.</Text>
+          ) : (
+            <Box flexDirection="column">
+              <Text dimColor>
+                {section.path} ({d.index + 1}/{d.sections.length}){d.truncated ? ' · diff cut at the size limit' : ''}
+              </Text>
+              <Code key={`diff-${d.index}`} source={section.patch} path={section.path} format="diff" />
+            </Box>
+          )}
+        </Box>
+      )
     }
 
     const c = state.confirm
@@ -295,6 +422,22 @@ export const registerPanel = (on: On) => {
         await say(`${label} failed: ${str((error as Error).message).slice(0, 100)}`)
       }
     }
+    const showDiff = async (agent: PanelAgent) => {
+      try {
+        const body = await callTool($, 'get_agent_diff', { agent: agent.id, max_chars: 60000 })
+        const files = Array.isArray(body['files']) ? (body['files'] as Record<string, unknown>[]) : []
+        const diff: PanelDiff = {
+          agent: agent.name,
+          summary: `${files.length} file(s), +${num(body['insertions'])} -${num(body['deletions'])} on ${str(body['branch'])}`,
+          sections: splitDiff(str(body['patch'])),
+          index: 0,
+          truncated: body['truncated'] === true,
+        }
+        await update($, panel, s => ({ ...s, diff, confirm: null }))
+      } catch (error) {
+        await say(`Diff failed: ${str((error as Error).message).slice(0, 100)}`)
+      }
+    }
     const toggle = async (backend: string) => {
       if (state.locked.includes(backend)) return say(`${backend} is disabled by an environment variable; change it where the server starts`)
       try {
@@ -315,7 +458,7 @@ export const registerPanel = (on: On) => {
     const row = (a: PanelAgent) => (
       <Button key={`agent-${a.id}`} onPress={() => select(a.id)}>
         {state.selected === a.id ? '> ' : '  '}
-        {a.name} <Text dimColor>{a.backend} {a.model} {a.state} {k(a.tokensIn)}in/{k(a.tokensOut)}out {ago(a.updated)}</Text>
+        {a.name} <Text dimColor>{a.backend} {a.model} {a.state}{a.ensemble === undefined ? '' : ` [${a.ensemble}]`} {k(a.tokensIn)}in/{k(a.tokensOut)}out {ago(a.updated)}</Text>
       </Button>
     )
     // Inline, the pane shows a window over the tree, so the key bar and message come first and the selected
@@ -326,8 +469,23 @@ export const registerPanel = (on: On) => {
         {visible.map(a => (
           <Box key={`g-${a.id}`} flexDirection="column">
             {row(a)}
-            {isRunning(a) && <Text dimColor>{'    ' + (a.activity ?? (a.state === 'needs_approval' ? 'waiting for approval' : 'working'))}</Text>}
+            {isRunning(a) && <Text dimColor>{'    ' + activityOf(a)}</Text>}
             {!wide && state.selected === a.id && detailLines.map((line, i) => <Text key={`d${i}`} dimColor>{'    ' + line}</Text>)}
+          </Box>
+        ))}
+      </Box>
+    )
+    const ensembleBlock = state.ensembles.length === 0 ? null : (
+      <Box flexDirection="column">
+        <Text bold>Ensembles</Text>
+        {state.ensembles.map(x => (
+          <Box key={`ens-${x.id}`} flexDirection="column">
+            <Text>
+              {'  '}{x.name} <Text dimColor>{x.status} {x.valid}/{x.of} valid</Text>
+            </Text>
+            <Text dimColor>
+              {'    ' + x.members.map(m => `${m.role}${m.name === undefined ? '' : ` (${m.name})`}: ${m.state}${m.valid === true ? ' ✓' : m.valid === false ? ' ✗' : ''}`).join(' · ')}
+            </Text>
           </Box>
         ))}
       </Box>
@@ -362,6 +520,8 @@ export const registerPanel = (on: On) => {
             <Button key="cleanup" hotkey="w" plain onPress={() => ask({ kind: 'cleanup', agent: selected.name })}>clean worktree</Button>
           )}
           {selected !== undefined && !isRunning(selected) && <Text>  </Text>}
+          {selected?.worktree === true && <Button key="diff" hotkey="v" plain onPress={() => showDiff(selected)}>diff</Button>}
+          {selected?.worktree === true && <Text>  </Text>}
           {selected !== undefined && <Button key="message" hotkey="m" plain onPress={() => ask({ kind: 'message', agent: selected.name })}>message</Button>}
           {selected !== undefined && <Text>  </Text>}
           <Button
@@ -402,6 +562,7 @@ export const registerPanel = (on: On) => {
         ) : (
           list
         )}
+        {ensembleBlock}
         {(hidden > 0 || state.showAll) && (
           <Button key="all" hotkey="l" plain onPress={() => update($, panel, s => ({ ...s, showAll: !s.showAll }))}>
             {state.showAll ? 'show recent only' : `show ${hidden} older`}
