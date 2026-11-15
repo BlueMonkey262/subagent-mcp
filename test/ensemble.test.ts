@@ -347,3 +347,11 @@ test("ordinary spawn_agent results are unchanged and still notify", async () => 
   await until(() => f.detached.length === 1);
   assert.equal(f.detached[0]!.status, "completed");
 });
+
+test("extractJson pairs each bracket with its own close: arrays after the safety notice or a bracketed aside", () => {
+  assert.deepEqual(extractJson("[Safety notice: child output mentions permission-control settings.]\n[{\"a\":1},{\"b\":2}]"),
+    { ok: true, value: [{ a: 1 }, { b: 2 }] });
+  assert.deepEqual(extractJson("Here it is [as requested]:\n[{\"t\":1}]"), { ok: true, value: [{ t: 1 }] });
+  assert.deepEqual(extractJson("Result: {\"s\":\"a ] and } in a string\"} done"), { ok: true, value: { s: "a ] and } in a string" } });
+  assert.deepEqual(extractJson("no json [here] at all"), { ok: false });
+});

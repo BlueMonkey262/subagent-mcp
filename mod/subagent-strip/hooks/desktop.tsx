@@ -328,7 +328,7 @@ export function desktopPane(el: El, v: DesktopView) {
           <Text weight="semibold">{x.name}</Text>
           <Text size="caption" dimColor>{`${x.status} · ${x.valid}/${x.of} valid`}</Text>
         </Box>
-        <Progress label={`${x.name} members settled`} value={settled} max={Math.max(1, x.members.length)} valueText={`${settled} of ${x.members.length} settled`} color={HEX['claude'] ?? '#D97757'} />
+        <Progress label={`${x.name} members settled`} value={settled / Math.max(1, x.members.length)} valueText={`${settled} of ${x.members.length} settled`} color={HEX['claude'] ?? '#D97757'} />
         {x.members.map((m, i) => (
           <Box key={`m${i}`} flexDirection="row" alignItems="center" justifyContent="space-between" gap="sm">
             <Text size="footnote">

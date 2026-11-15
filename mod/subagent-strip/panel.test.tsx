@@ -509,6 +509,13 @@ test('desktop ensembles draw a card with one row per member', async ($, on) => {
   await ui.unmount()
 })
 
+test('splitDiff unquotes the paths git quotes', () => {
+  const patch = 'diff --git "a/sp ace\\"q.txt" "b/sp ace\\"q.txt"\n+x\n' +
+    'diff --git "a/caf\\303\\251.txt" "b/caf\\303\\251.txt"\n+y\n' +
+    'diff --git "a/tab\\tname" "b/tab\\tname"\n+z\n'
+  expect(splitDiff(patch).map(s => s.path)).toEqual(['sp ace"q.txt', 'café.txt', 'tab\tname'])
+})
+
 // Kept last: the models.yaml path the server reports is remembered for the rest of the session.
 test('a project without its own models.yaml edits the bundled file the server reports', async ($, on) => {
   const bundled = '/opt/subagent-mcp/.subagents/models.yaml'
@@ -543,5 +550,33 @@ test('a project without its own models.yaml edits the bundled file the server re
   expect(writes.map(w => w.path)).toEqual([`${bundled}.bak`, bundled])
   expect(file).toContain('disabledBackends: [cursor]')
   expect(reads.some(path => path.startsWith('/Users/me/MeshCore/.subagents/models.yaml'))).toBe(false)
+  await ui.unmount()
+})
+
+test('a backend the environment also disables is not reported as enabled when its file entry is removed', async ($, on) => {
+  let file = 'disabledBackends: [cursor]\nmodels:\n'
+  const said: string[] = []
+  on('mcp.call', (_, e) => {
+    const body = e.tool === 'list_models'
+      ? { model_policy: { disabled_backends: ['cursor'], disabled_backends_env: ['cursor'] } }
+      : e.tool === 'list_agents' ? { agents: [] } : {}
+    return { value: { content: [{ type: 'text', text: JSON.stringify(body) }], structuredContent: body } }
+  })
+  on('command.register', () => ({ value: { command: 'subagent-mcp' } }))
+  on('ui.open', () => ({ value: { isPlaced: true } }))
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+  on('fs.read', (_, e) => ({ value: String((e as { path?: string }).path).endsWith('models.yaml') ? file : '{}' }))
+  on('fs.write', (_, e) => {
+    const { path, text } = e as { path?: string; text?: string }
+    if (String(path).endsWith('models.yaml')) file = String(text)
+    return { value: undefined }
+  })
+  on('ui.notify', (_, e) => (said.push(String((e as { message?: string }).message)), { value: undefined }))
+  await open($)
+
+  const ui = await $.ui.mount(PANE)
+  await ui.press({ key: 'backend-cursor' })
+  expect(file).toContain('disabledBackends: []')
+  expect(await ui.find({ type: 'Text', text: / off \(env\)/ })).toBeTruthy()
   await ui.unmount()
 })
