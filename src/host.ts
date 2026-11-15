@@ -1,4 +1,5 @@
 import { buildDashboard } from "./dashboard.js";
+import { catalogJson, validateToolInput } from "./tool-catalog.js";
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { readdirSync, readFileSync, realpathSync, statSync } from "node:fs";
@@ -269,8 +270,19 @@ export class HostSession {
   #error: Error | undefined;
   readonly #detached: ((data: Readonly<Record<string, unknown>>) => void)[] = [];
   readonly #ensemble: ((data: Readonly<Record<string, unknown>>) => void)[] = [];
+  readonly #attached: (() => void)[] = [];
 
   constructor(readonly options: Parameters<typeof connectHost>[0]) {}
+
+  /** Called after every (re)connection to a host, which may run a different build than before. */
+  onAttach(listener: () => void): void {
+    this.#attached.push(listener);
+  }
+
+  /** The connected host's build id, if it reported one. */
+  hostBuild(): string | undefined {
+    return this.#client?.host?.build;
+  }
 
   async connect(): Promise<void> {
     try {
@@ -294,10 +306,26 @@ export class HostSession {
   }
 
   async call(method: string, params?: unknown): Promise<unknown> {
+    // Another session's restart_host (or a crash) closes the socket; connect to the host that is up now
+    // instead of failing every call until the user reconnects with /mcp.
+    if (this.#client?.closed === true) {
+      try {
+        this.#attach(await connectHost(this.options));
+      } catch (error) {
+        this.#fail(error);
+      }
+    }
     if (this.#client === undefined) {
       throw this.#error ?? new Error("subagent-mcp host is not connected. Ask the user to run `/mcp` and then reconnect subagent-mcp.");
     }
     return this.#client.call(method, params);
+  }
+
+  /** The connected host runs a newer build than this proxy. */
+  hostIsNewer(): boolean {
+    const host = this.#client?.host;
+    const local = buildInfo();
+    return host !== undefined && host.build !== local.build && typeof host.builtAt === "number" && host.builtAt > local.builtAt;
   }
 
   /** Why the connected host's code differs from this proxy's, if it does. */
@@ -368,6 +396,7 @@ export class HostSession {
     this.#error = undefined;
     for (const listener of this.#detached) client.onDetached(listener);
     for (const listener of this.#ensemble) client.onEnsemble(listener);
+    for (const listener of this.#attached) listener();
   }
 
   #fail(error: unknown): void {
@@ -531,6 +560,11 @@ export class HostClient {
   /** The host's `hello` when this client connected: its build, and whether it was kept as stale or newer. */
   host: HostHello | undefined;
 
+  /** The socket closed (the host exited or restarted); calls fail until a new client connects. */
+  get closed(): boolean {
+    return this.#closed;
+  }
+
   static connect(socketPath: string, timeoutMs = 5_000): Promise<HostClient> {
     return new Promise((resolve, reject) => {
       const socket = createConnection(socketPath);
@@ -683,8 +717,13 @@ interface DispatchContext {
 }
 
 async function dispatch(supervisor: Supervisor, method: string, params: unknown, context: DispatchContext): Promise<unknown> {
-  const input = isRecord(params) ? params : {};
+  // Front ends that list this host's catalog forward calls without checking them, so the host does.
+  const checked = validateToolInput(method, isRecord(params) ? params : {});
+  if (!checked.ok) throw new Error(checked.error);
+  const input = isRecord(checked.value) ? checked.value : {};
   switch (method) {
+    case "tool_catalog":
+      return { build: HOST_BUILD.build, tools: catalogJson() };
     case "hello":
       return {
         protocol: HOST_PROTOCOL,
