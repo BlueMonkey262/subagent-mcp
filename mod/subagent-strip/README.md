@@ -42,7 +42,7 @@ has focus:
 | `m` | message or resume the selected agent (an input row; Enter sends) |
 | `w` | remove the selected agent's managed worktree (asks first; the branch is kept) |
 | `i` | close the pane and ask Claude to run the setup interview for `.subagents/` |
-| `1`-`7` | turn a backend off or on (edits only the `disabledBackends` line of `.subagents/models.yaml`; a copy goes to `models.yaml.bak`) |
+| `1`-`7` | turn a backend off or on (edits only the `disabledBackends` line of the `models.yaml` the server loaded, which is the bundled one for a project without its own; a copy goes to `models.yaml.bak`) |
 | `l` | show or hide older finished agents (the list keeps running agents and the 5 most recent) |
 | `v` | show the selected agent's worktree diff (`get_agent_diff`), one file at a time: `j` / `k` next / previous file, `b` back |
 | `u` | when an update is available, close the pane and ask Claude to follow `UPDATING.md` (asks first) |

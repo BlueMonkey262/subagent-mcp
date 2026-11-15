@@ -161,6 +161,8 @@ export async function serveHost(options: {
   readonly socketPath: string;
   readonly supervisor: Supervisor;
   readonly ensembles?: EnsembleManager;
+  /** The models.yaml this host loaded: list_models reports it so the panel edits the same file. */
+  readonly modelsFile?: string;
   readonly onClients?: (count: number) => void;
   readonly onShutdown?: () => void;
 }): Promise<RunningHost> {
@@ -183,7 +185,11 @@ export async function serveHost(options: {
           if (shuttingDown) return;
           shuttingDown = true;
           options.onShutdown?.();
-        }, { clients: () => sockets.size, ...(options.ensembles === undefined ? {} : { ensembles: options.ensembles }) });
+        }, {
+          clients: () => sockets.size,
+          ...(options.ensembles === undefined ? {} : { ensembles: options.ensembles }),
+          ...(options.modelsFile === undefined ? {} : { modelsFile: options.modelsFile }),
+        });
       }
     });
     const drop = (): void => {
@@ -559,6 +565,7 @@ export async function runHost(): Promise<void> {
     socketPath: paths.socketPath,
     supervisor,
     ensembles,
+    modelsFile,
     onClients: scheduleIdle,
     onShutdown: () => void shutdown(),
   });
@@ -734,6 +741,7 @@ interface DispatchContext {
   /** Clients currently connected to this host. */
   readonly clients: () => number;
   readonly ensembles?: EnsembleManager;
+  readonly modelsFile?: string;
 }
 
 async function dispatch(supervisor: Supervisor, method: string, params: unknown, context: DispatchContext): Promise<unknown> {
@@ -804,11 +812,14 @@ async function dispatch(supervisor: Supervisor, method: string, params: unknown,
         ? supervisor.getAgentEvents(agent, since, input["limit"], options)
         : supervisor.getAgentEvents(agent, since, undefined, options);
     }
-    case "list_models":
-      return supervisor.listModels(
+    case "list_models": {
+      const models = await supervisor.listModels(
         isBackend(input["backend"]) ? input["backend"] : undefined,
         ...(typeof input["live"] === "boolean" ? [input["live"]] : []),
       );
+      // A project without its own models.yaml runs on the bundled one (bin/run-server.sh); name the file in use.
+      return context.modelsFile === undefined ? models : { ...models, models_file: context.modelsFile };
+    }
     case "shutdown": {
       const { active, waiting } = supervisor.concurrency();
       if (active > 0 || waiting > 0) {
