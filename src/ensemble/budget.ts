@@ -93,19 +93,47 @@ function largestArray(root: unknown): unknown[] | undefined {
 
 /** Pull a JSON value out of a reply that wraps it in a code fence or a sentence. */
 export function extractJson(text: string): { readonly ok: true; readonly value: unknown } | { readonly ok: false } {
-  const trimmed = text.trim();
+  // The safety notice scanChildOutput puts in front of a report is a bracketed line, not data.
+  const trimmed = text.trim().replace(/^\[Safety notice:[^\]\n]*\]\s*/, "");
   const candidates: string[] = [];
   const fence = /```(?:json|JSON)?\s*\n([\s\S]*?)\n?```/.exec(trimmed);
   if (fence?.[1]) candidates.push(fence[1]);
-  // An object and an array are both tried, earliest first: prose before the JSON can hold a bracket,
-  // as the safety notice scanChildOutput puts in front of a report does ("[Safety notice: ...]").
-  const spans = (["{", "["] as const)
-    .map((open) => ({ start: trimmed.indexOf(open), end: trimmed.lastIndexOf(open === "{" ? "}" : "]") }))
-    .filter((span) => span.start >= 0 && span.end > span.start)
-    .sort((a, b) => a.start - b.start);
-  for (const span of spans) candidates.push(trimmed.slice(span.start, span.end + 1));
+  // Otherwise each `{` or `[`, earliest first, with its own matching close: prose before the JSON can
+  // hold a bracketed aside ("[as requested]"), which pairing the first opener with the last closer misses.
+  let tries = 0;
+  for (let start = 0; start < trimmed.length && tries < MAX_JSON_STARTS; start += 1) {
+    const char = trimmed[start];
+    if (char !== "{" && char !== "[") continue;
+    tries += 1;
+    const end = matchingClose(trimmed, start);
+    if (end !== undefined) candidates.push(trimmed.slice(start, end + 1));
+  }
   for (const candidate of candidates) {
     try { return { ok: true, value: JSON.parse(candidate) as unknown }; } catch { /* next */ }
   }
   return { ok: false };
+}
+
+/** Openers tried before giving up, so a long reply full of brackets stays cheap. */
+const MAX_JSON_STARTS = 64;
+
+/** Index of the bracket that closes the one at `start`, skipping brackets inside JSON strings. */
+function matchingClose(text: string, start: number): number | undefined {
+  const stack: string[] = [];
+  let inString = false;
+  for (let index = start; index < text.length; index += 1) {
+    const char = text[index]!;
+    if (inString) {
+      if (char === "\\") index += 1;
+      else if (char === '"') inString = false;
+      continue;
+    }
+    if (char === '"') inString = true;
+    else if (char === "{" || char === "[") stack.push(char === "{" ? "}" : "]");
+    else if (char === "}" || char === "]") {
+      if (stack.pop() !== char) return undefined;
+      if (stack.length === 0) return index;
+    }
+  }
+  return undefined;
 }

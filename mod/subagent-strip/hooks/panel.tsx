@@ -83,10 +83,41 @@ export const statusOf = (state: string) => STATUS[state] ?? { glyph: '·', color
 /** Splits a unified diff into one section per file (`diff --git` headers). */
 export function splitDiff(patch: string): { path: string; patch: string }[] {
   const parts = patch.split(/^(?=diff --git )/m).filter(part => part.trim() !== '')
-  return parts.map(part => {
-    const head = /^diff --git a\/(.+?) b\/(.+)$/m.exec(part)
-    return { path: head?.[2] ?? head?.[1] ?? '(diff)', patch: part }
-  })
+  return parts.map(part => ({ path: diffPath(part.slice(0, part.indexOf('\n') < 0 ? part.length : part.indexOf('\n'))) ?? '(diff)', patch: part }))
+}
+
+/** The b/ path of a `diff --git` header, unquoting the C-style quotes git puts on unusual names. */
+function diffPath(header: string): string | undefined {
+  const rest = header.startsWith('diff --git ') ? header.slice('diff --git '.length) : undefined
+  if (rest === undefined) return undefined
+  if (!rest.startsWith('"')) {
+    const plain = /^a\/(.+?) b\/(.+)$/.exec(rest)
+    return plain?.[2] ?? plain?.[1]
+  }
+  const first = unquote(rest, 0)
+  if (first === undefined) return undefined
+  const second = rest[first.end + 1] === '"' ? unquote(rest, first.end + 1)?.text : rest.slice(first.end + 1)
+  const path = second ?? first.text
+  return path.replace(/^[ab]\//, '')
+}
+
+/** Git's C-style quoted path starting at `start`: escapes, and octal bytes decoded as UTF-8. */
+function unquote(text: string, start: number): { text: string; end: number } | undefined {
+  const simple: Record<string, string> = { n: '\n', t: '\t', r: '\r', a: '\x07', b: '\b', f: '\f', v: '\v', '\\': '\\', '"': '"' }
+  let encoded = ''
+  for (let i = start + 1; i < text.length; i += 1) {
+    const char = text[i]!
+    if (char === '"') {
+      try { return { text: decodeURIComponent(encoded), end: i + 1 } } catch { return undefined }
+    }
+    if (char !== '\\') { encoded += encodeURIComponent(char); continue }
+    const next = text[i + 1] ?? ''
+    const octal = /^[0-7]{3}/.exec(text.slice(i + 1, i + 4))
+    if (octal) { encoded += `%${parseInt(octal[0], 8).toString(16).padStart(2, '0')}`; i += 3; continue }
+    encoded += encodeURIComponent(simple[next] ?? next)
+    i += 1
+  }
+  return undefined
 }
 
 function toAgent(a: Record<string, unknown>): PanelAgent {
@@ -184,6 +215,9 @@ export function declarePanelCommand($: EngineInterface, cwd?: string) {
 
 // What the server refuses (list_models reports it, environment variables included) against what the
 // project's models.yaml says; the difference is locked, because only the file can be edited here.
+// Backends the server's environment disables (list_models `disabled_backends_env`); older servers don't say.
+let envDisabled: string[] = []
+
 async function loadPolicy($: EngineInterface) {
   let live: string[] = []
   let file: string[] = []
@@ -192,6 +226,7 @@ async function loadPolicy($: EngineInterface) {
     noteModelsFile(models)
     const policy = (models['model_policy'] ?? {}) as Record<string, unknown>
     live = ((policy['disabled_backends'] as unknown[] | undefined) ?? []).map(str)
+    envDisabled = ((policy['disabled_backends_env'] as unknown[] | undefined) ?? []).map(str)
   } catch {
     // keep what the file says
   }
@@ -201,7 +236,8 @@ async function loadPolicy($: EngineInterface) {
     file = []
   }
   const disabled = [...new Set([...live, ...file])]
-  const locked = disabled.filter(b => !file.includes(b))
+  // Locked: what the file alone can't turn on, because the environment disables it too.
+  const locked = [...new Set([...envDisabled, ...disabled.filter(b => !file.includes(b))])]
   await update($, panel, s => ({ ...s, disabled, locked }))
 }
 
@@ -505,10 +541,13 @@ export const registerPanel = (on: On) => {
         // Show the file's new list now; the server reloads models.yaml a moment after the write, so asking it
         // straight away would still report the old list (and mark the backend env-locked). Ask again shortly.
         await update($, panel, s => {
-          const locked = s.locked.filter(b => b !== backend)
+          const locked = s.locked.filter(b => b !== backend || envDisabled.includes(backend))
           return { ...s, disabled: [...new Set([...next, ...locked])], locked }
         })
         $.clock.after(1500, () => loadPolicy($))
+        if (!next.includes(backend) && envDisabled.includes(backend)) {
+          return say(`${backend} removed from models.yaml, but the environment still disables it; change it where the server starts`)
+        }
         const where = sharedModelsFile() ? `the bundled ${modelsFile()}, shared by projects without their own; i gives this one its own` : 'models.yaml reloads live'
         await say(`${backend} ${next.includes(backend) ? 'disabled' : 'enabled'} (${where}; previous copy in models.yaml.bak)`)
       } catch (error) {

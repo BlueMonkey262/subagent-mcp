@@ -2,7 +2,7 @@ import { execFile, spawn } from 'node:child_process';
 import { promisify } from 'node:util';
 import { dirname, join } from 'node:path';
 import { randomUUID } from 'node:crypto';
-import { access, copyFile, lstat, mkdir, rm } from 'node:fs/promises';
+import { access, copyFile, lstat, mkdir, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { Ajv } from 'ajv';
 import type { Backend } from './core/types.js';
@@ -127,12 +127,19 @@ export interface WorktreeDiff {
   readonly deletions: number;
   readonly patch: string;
   readonly truncated: boolean;
+  /** Set when part of the worktree can't be diffed (a sparse checkout). */
+  readonly warning?: string;
 }
 
 /**
  * Everything the agent changed in its worktree, committed or not, untracked files included, against
  * the commit it started from. A throwaway index stages the whole tree, so the worktree's own index
  * and files are never touched.
+ *
+ * The agent can't hide a change from it: assume-unchanged and skip-worktree flags copied from its
+ * index are cleared, and untracked files are filtered by the tree's .gitignore files only, never by
+ * the shared repository's info/exclude or core.excludesFile, which sit outside the worktree. A new
+ * .gitignore is always included, so a rule that hides files (or itself) shows up in the diff.
  */
 export async function diffWorktree(tree: Worktree, maxChars: number): Promise<WorktreeDiff> {
   const against = tree.snapshot_commit ?? tree.base_commit;
@@ -146,7 +153,25 @@ export async function diffWorktree(tree: Worktree, maxChars: number): Promise<Wo
       const realIndex = (await exec('git', ['rev-parse', '--path-format=absolute', '--git-path', 'index'], { cwd: tree.path })).stdout.trim();
       await copyFile(realIndex, index);
     } catch { await exec('git', ['read-tree', 'HEAD'], { cwd: tree.path, env }); }
-    await exec('git', ['add', '-A', '--', '.'], { cwd: tree.path, env, maxBuffer: big });
+    const sparse = (await exec('git', ['config', '--bool', 'core.sparseCheckout'], { cwd: tree.path }).catch(() => ({ stdout: '' }))).stdout.trim() === 'true';
+    await clearIndexFlags(tree.path, env, big, sparse);
+    // Tracked changes and deletions; ignore rules never apply to tracked files.
+    await exec('git', ['add', '-u', '--', '.'], { cwd: tree.path, env, maxBuffer: big });
+    const untracked = (await exec('git', ['ls-files', '-z', '--others', '--exclude-per-directory=.gitignore', '--', '.'], { cwd: tree.path, env, maxBuffer: big })).stdout
+      .split('\0').filter(Boolean);
+    const ignoreFiles = (await exec('git', ['ls-files', '-z', '--others', '--', ':(glob)**/.gitignore'], { cwd: tree.path, env, maxBuffer: big })).stdout
+      .split('\0').filter(Boolean);
+    const toAdd = [...new Set([...untracked, ...ignoreFiles])];
+    if (toAdd.length > 0) {
+      const list = `${index}.paths`;
+      await writeFile(list, toAdd.join('\0'));
+      try {
+        // -f: these were filtered above; info/exclude must not drop them again.
+        await exec('git', ['add', '-f', `--pathspec-from-file=${list}`, '--pathspec-file-nul'], { cwd: tree.path, env, maxBuffer: big });
+      } finally {
+        await rm(list, { force: true }).catch(() => undefined);
+      }
+    }
     const numstat = (await exec('git', ['diff', '--cached', '--numstat', '-z', '--no-renames', against], { cwd: tree.path, env, maxBuffer: big })).stdout;
     const files = numstat.split('\0').filter(Boolean).map((line) => {
       const [added, deleted, ...rest] = line.split('\t');
@@ -156,15 +181,33 @@ export async function diffWorktree(tree: Worktree, maxChars: number): Promise<Wo
     const { text, more } = await readCapped('git', ['diff', '--cached', '--no-color', '--no-renames', against], { cwd: tree.path, env }, maxChars + 1);
     const truncated = more || text.length > maxChars;
     // Cut at a line end so the patch stays parseable up to its last whole hunk line.
-    const cut = truncated ? text.slice(0, text.lastIndexOf('\n', maxChars - 1) + 1) : text;
+    const lineEnd = text.lastIndexOf('\n', maxChars - 1);
+    // A first line longer than the cap has no line end to cut at: keep the cap's worth of it instead of nothing.
+    const cut = !truncated ? text : lineEnd >= 0 ? text.slice(0, lineEnd + 1) : text.slice(0, maxChars);
     return {
       path: tree.path, branch: tree.branch, against, files,
       insertions: files.reduce((sum, file) => sum + (file.added ?? 0), 0),
       deletions: files.reduce((sum, file) => sum + (file.deleted ?? 0), 0),
       patch: cut, truncated,
+      ...(sparse ? { warning: 'Sparse checkout is on: files outside the sparse set are not diffed.' } : {}),
     };
   } finally {
     await rm(index, { force: true }).catch(() => undefined);
+  }
+}
+
+/** Clears assume-unchanged (and, outside a sparse checkout, skip-worktree) on the throwaway index. */
+async function clearIndexFlags(cwd: string, env: NodeJS.ProcessEnv, maxBuffer: number, sparse: boolean): Promise<void> {
+  const listed = (await exec('git', ['ls-files', '-z', '-v'], { cwd, env, maxBuffer })).stdout.split('\0').filter(Boolean);
+  // `-v` tags assume-unchanged entries with a lowercase letter and skip-worktree ones with S (s: both).
+  const tagged = listed.map((entry) => ({ tag: entry[0] ?? 'H', path: entry.slice(2) }));
+  const assumed = tagged.filter(({ tag }) => tag !== tag.toUpperCase()).map(({ path }) => path);
+  const skipped = sparse ? [] : tagged.filter(({ tag }) => tag.toUpperCase() === 'S').map(({ path }) => path);
+  // One flag per call: update-index applies only the last of several mark options.
+  for (const [flag, paths] of [['--no-assume-unchanged', assumed], ['--no-skip-worktree', skipped]] as const) {
+    for (let start = 0; start < paths.length; start += 500) {
+      await exec('git', ['update-index', flag, '--', ...paths.slice(start, start + 500)], { cwd, env, maxBuffer });
+    }
   }
 }
 

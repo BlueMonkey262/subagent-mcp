@@ -102,7 +102,10 @@ until the child completes or needs your approval; when it needs approval, call
 - `get_agent_diff` returns an isolated agent's changes: everything in its managed worktree,
   committed or not and untracked files included, against the commit it started from (for snapshot
   isolation, the snapshot, so your own uncommitted edits are not shown as the agent's). Per-file
-  line counts plus a unified diff capped at `max_chars`.
+  line counts plus a unified diff capped at `max_chars`. The agent can't hide a change from it:
+  `skip-worktree` and `assume-unchanged` flags are ignored, untracked files are filtered only by the
+  tree's `.gitignore` files (not the shared repository's `info/exclude` or your global excludes), and
+  a new `.gitignore` always appears.
 - `get_dashboard` is for status UIs such as the `/subagent-mcp` panel and its poller (its
   description steers the model to `list_agents`; hiding it with a `tool.list` hook would also take
   it from the mod's own `$.mcp.call`): live agents, the most recent finished ones (`recent`, default 10) and any that settled in

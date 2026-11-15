@@ -186,6 +186,11 @@ export function applyPolicyEnv(file: ModelPolicy, env: NodeJS.ProcessEnv = proce
   };
 }
 
+/** The backends `SUBAGENT_MCP_DISABLED_BACKENDS` disables, whatever models.yaml says. */
+export function envDisabledBackends(env: NodeJS.ProcessEnv = process.env): Backend[] {
+  return parseBackendList(readList(env, DISABLED_BACKENDS_ENV), DISABLED_BACKENDS_ENV);
+}
+
 /** True when any rule is active. */
 export function isRestrictive(policy: ModelPolicy): boolean {
   return policy.blockClaudeModels || policy.disabledBackends.length > 0 || policy.blockModels.length > 0;
