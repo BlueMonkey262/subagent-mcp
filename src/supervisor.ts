@@ -1942,7 +1942,8 @@ export class Supervisor {
           this.#setTaskState(task, 'completed');
           task.result = { agent_id: record.id };
         } else {
-          // No agent record means spawnAgent never launched; run the task instead of losing it.
+          // No agent record means spawnAgent never launched, so run the task instead of losing it.
+          // This is at-least-once: a crash between adapter.spawn and the snapshot can rerun the task.
           this.#setTaskState(task, 'queued');
           rerun.add(task.id);
         }

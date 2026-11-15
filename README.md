@@ -420,8 +420,10 @@ Spawn options:
   also be dependencies for further chaining. Only successful, schema-valid
   results launch dependents. Failed prerequisites block them. Dependency results
   are passed as delimited input data. Cycles cannot be created because only
-  existing prerequisites may be referenced. Queues survive restart; tasks caught
-  during launch become interrupted to avoid duplicate execution.
+  existing prerequisites may be referenced. Queues survive restart. A task
+  caught during launch is re-run only when no agent record was persisted; spawn
+  is at-least-once, so a crash between `adapter.spawn` and the snapshot can run
+  the task again.
 - `start_at` / `delay_seconds` schedule a spawn for later (see "Delayed agents"). They can be
   combined with `depends_on`: the task waits for both the clock and its prerequisites.
   `stop_agents` cancels a scheduled task before it starts.
