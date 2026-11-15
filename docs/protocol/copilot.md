@@ -45,7 +45,9 @@ Two live quirks the adapter handles:
 
 - Copilot **locks a session while its process runs**. A resume launched before the previous
   turn's process exits fails with `SessionInUseError`, so the adapter waits for that process to
-  exit (up to 10 s, then SIGTERM) before resuming.
+  exit (up to 10 s), then SIGTERMs the group, then SIGKILLs it, waiting a bounded time after each
+  step. If the process still has not closed, the resume is rejected with a retryable error
+  instead of launching a second process.
 - Some startup errors are printed as **plain text** on stdout or stderr (for example
   `Error: Model "auto" does not support reasoning effort configuration`), followed by a `result`
   with `exitCode: 1` and **no `session.start`**. Non-JSON stdout lines and stderr are kept as diagnostics, and a

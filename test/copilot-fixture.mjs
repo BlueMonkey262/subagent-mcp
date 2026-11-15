@@ -99,6 +99,11 @@ if (prompt.includes("STARTUP_ERROR")) {
   } else if (prompt.includes("HANG") || prompt.includes("SIGTERM_RESULT")) {
     send("assistant.message", { messageId: "m-0", content: "working on it", toolRequests: [], turnId: "0" });
     setInterval(() => {}, 1_000);
+  } else if (prompt.includes("STUBBORN")) {
+    // Finish the turn, then linger while ignoring SIGTERM until the adapter escalates to SIGKILL.
+    send("assistant.message", { messageId: "m-0", content: "stubborn result", toolRequests: [], turnId: "0" });
+    result(0);
+    setInterval(() => {}, 1_000);
   } else if (prompt.includes("MODEL_UNAVAILABLE")) {
     send("session.error", { errorType: "query", message: `Execution failed: Model "${model}" is not available.` });
     send("assistant.idle", {}, { ephemeral: true });
@@ -152,6 +157,7 @@ process.on("SIGTERM", () => {
     }
     return;
   }
+  if (prompt.includes("STUBBORN")) return; // Ignore SIGTERM; only SIGKILL ends this process.
   process.exit(0);
 });
 process.on("SIGINT", () => process.exit(0));

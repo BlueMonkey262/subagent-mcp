@@ -199,18 +199,18 @@ export class CopilotAdapter implements BackendAdapter {
   }
 
   async #awaitExit(session: CopilotSession): Promise<void> {
-    let timer: NodeJS.Timeout | undefined;
-    const timedOut = await Promise.race([
-      session.closed.promise.then(() => false),
-      new Promise<boolean>((resolve) => { timer = setTimeout(() => resolve(true), this.#options.exitWaitMs); }),
-    ]);
-    if (timer) clearTimeout(timer);
-    if (!timedOut) return;
+    if (await this.#waitForClose(session, this.#options.exitWaitMs)) return;
+    // The turn finished but its process is still alive. Copilot locks the session while that
+    // process runs, so a resume would fail with SessionInUseError. Escalate: SIGTERM, then SIGKILL.
     this.#terminate(session);
-    await Promise.race([
-      session.closed.promise,
-      new Promise<void>((resolve) => setTimeout(resolve, this.#options.interruptGraceMs).unref()),
-    ]);
+    if (await this.#waitForClose(session, this.#options.interruptGraceMs)) return;
+    signalProcessGroup(session.child, "SIGKILL");
+    if (await this.#waitForClose(session, this.#options.interruptGraceMs)) return;
+    // Never launch a second process while the previous one still owns the session.
+    throw new CopilotAdapterError(
+      `Copilot session ${session.agentId ?? "unknown"} is still running after SIGKILL; retry the resume once the previous process exits`,
+      { agentId: session.agentId, retryable: true },
+    );
   }
 
   #launch(
