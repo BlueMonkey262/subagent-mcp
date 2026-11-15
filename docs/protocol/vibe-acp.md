@@ -72,7 +72,10 @@ policy. Tools that change files, run commands, reach the network or start Vibe s
 (`bash`, `git_bash`, `powershell`, `write_file`, `edit`, `search_replace`, `web_fetch`,
 `web_search`, `task`) are pinned to `ask`, since a user's Vibe config could set them to run
 unasked. A tool named by a `deny` rule is also switched to `VIBE_TOOLS__<TOOL>__PERMISSION=ask`
-(`Read(...)` → `read_file`, `*` → all), so the rule is enforced. These overrides apply to that
+(`Read(...)` → `read_file`; `*` → every built-in tool, including `run_typescript`, `skill` and
+`search_tool_functions`; a glob may also use Vibe's own names, such as `web_*`), so the rule is
+enforced. Tools from MCP servers in the user's Vibe config aren't known here: a deny rule must name
+them. These overrides apply to that
 process only and are set after the agent's own `env`. Vibe's private session scratchpad tool runs
 without approval; it writes outside the project.
 

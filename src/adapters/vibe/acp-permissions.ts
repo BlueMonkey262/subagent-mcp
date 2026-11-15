@@ -66,6 +66,11 @@ const VIBE_TOOLS_BY_POLICY_NAME: Readonly<Record<string, readonly string[]>> = {
   WebSearch: ["web_search"],
 };
 
+/** Every Vibe built-in tool, policy-mapped or not: what a `*` deny rule (or a glob over Vibe's names) covers. */
+const VIBE_BUILTIN_TOOLS: readonly string[] = [
+  ...new Set([...Object.values(VIBE_TOOLS_BY_POLICY_NAME).flat(), ...ALWAYS_ASK, "run_typescript", "skill", "search_tool_functions"]),
+];
+
 /**
  * Environment overrides (`VIBE_TOOLS__<TOOL>__...`, applied to this vibe-acp process only) that
  * make Vibe ask before every call the agent's rules must see. Vibe auto-runs shell commands on its
@@ -86,8 +91,12 @@ export function vibeAcpToolEnv(deny: readonly string[]): Record<string, string> 
     const toolPattern = /^([^()]+?)(?:\(.*\))?$/.exec(rule.trim())?.[1]?.trim();
     if (toolPattern === undefined || toolPattern === "") continue;
     const matcher = new RegExp(`^${toolPattern.split("*").map(escapeRegExp).join(".*")}$`);
-    const known = Object.entries(VIBE_TOOLS_BY_POLICY_NAME).filter(([name]) => matcher.test(name));
-    if (known.length > 0) for (const [, tools] of known) tools.forEach(ask);
+    // A rule may name policy tools (Bash, Read(...)) or Vibe's own (run_typescript, web_*).
+    const matched = new Set([
+      ...Object.entries(VIBE_TOOLS_BY_POLICY_NAME).filter(([name]) => matcher.test(name)).flatMap(([, tools]) => tools),
+      ...VIBE_BUILTIN_TOOLS.filter((tool) => matcher.test(tool)),
+    ]);
+    if (matched.size > 0) matched.forEach(ask);
     else if (/^[A-Za-z0-9_]+$/.test(toolPattern)) ask(toolPattern);
   }
   return env;

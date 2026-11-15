@@ -45,7 +45,9 @@ Two live quirks the adapter handles:
 
 - Copilot **locks a session while its process runs**. A resume launched before the previous
   turn's process exits fails with `SessionInUseError`, so the adapter waits for that process to
-  exit (up to 10 s, then SIGTERM) before resuming.
+  exit (up to 10 s), then SIGTERMs the group, then SIGKILLs it, waiting a bounded time after each
+  step. If the process still has not closed, the resume is rejected with a retryable error
+  instead of launching a second process.
 - Some startup errors are printed as **plain text** on stdout or stderr (for example
   `Error: Model "auto" does not support reasoning effort configuration`), followed by a `result`
   with `exitCode: 1` and **no `session.start`**. Non-JSON stdout lines and stderr are kept as diagnostics, and a
@@ -80,6 +82,20 @@ Translation from the Claude-style rule syntax:
 | `shell(...)`, `write(...)`, `read(...)`, `url(...)`, `memory` | unchanged |
 | anything else (`WebFetch`, MCP tools) | dropped |
 
+Copilot's `read(path)` and `write(path)` patterns are **literal paths, not globs**. The config
+matcher treats `*` as one path segment and `**` as any depth, so a path rule with a glob cannot be
+expressed exactly. Such rules fail closed rather than widening the grant:
+
+- An `allow` path rule with a glob (`Write(*)`, `Write(src/*)`, `Write(src/**)`, `Read(*)`, ...) is
+  **dropped**. The request then escalates or is denied instead of silently allowing the whole
+  `write`/`read` tool. A warning naming the dropped rule is emitted.
+- A `deny` path rule with a glob is translated to the **whole-tool denial** (`--deny-tool write` or
+  `read`), so everything the configured rule denied stays denied. A warning is emitted for the
+  broader denial.
+
+A bare `Write`/`Read` (no parentheses) still means the whole tool. Exact paths such as
+`Write(path/file.txt)` pass through unchanged.
+
 File access is limited to the working directory and the system temp directory, which covers a
 managed worktree.
 
@@ -92,6 +108,8 @@ your Copilot plan and model settings allow will run; an unavailable model fails 
 
 ## Interruption
 
-`stop_agent` sends SIGTERM to the process group, waits a short grace interval for the process to
-exit, then sends SIGKILL and reports the turn `interrupted`. A turn timeout does the same and
-reports `failed` with a `COPILOT_TURN_TIMEOUT` error.
+`stop_agent` sends SIGTERM to the process group and waits for the **process to close** (not merely
+for the turn's `result`, since Copilot can emit `result` and keep running while it saves). If the
+process is still alive after the grace interval, the adapter sends SIGKILL and waits a bounded time
+for close, then reports the turn `interrupted`. A turn timeout does the same and reports `failed`
+with a `COPILOT_TURN_TIMEOUT` error.

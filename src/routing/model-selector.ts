@@ -102,9 +102,17 @@ export function gatherCandidates(source: CandidateSource, criteria: SelectionCri
     if (criteria.backends !== undefined && !criteria.backends.includes(config.backend)) continue;
     if (criteria.exclude_backends?.includes(config.backend)) continue;
     if (config.blocked === true) { rejected.push({ candidate: `config ${config.name}`, reason: "blocked by model policy" }); continue; }
-    const models = config.model !== undefined
-      ? [{ name: config.model, blocked: source.roster(config.backend).find((entry) => entry.name === config.model)?.blocked }]
-      : source.roster(config.backend);
+    const roster = source.roster(config.backend);
+    let models: readonly { readonly name: string; readonly blocked?: boolean }[] = roster;
+    if (config.model !== undefined) {
+      const pinned = roster.find((entry) => entry.name === config.model);
+      if (pinned === undefined) {
+        // Spawning it would fail with "Unknown model", so never pick it over a candidate that works.
+        rejected.push({ candidate: `config ${config.name}`, reason: `pinned model ${config.model} is not in the ${config.backend} roster` });
+        continue;
+      }
+      models = [pinned];
+    }
     for (const entry of models) {
       const candidate = { config: config.name, backend: config.backend, model: entry.name };
       const id = candidateId(candidate);
