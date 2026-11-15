@@ -1,10 +1,16 @@
 # Google Antigravity CLI adapter protocol
 
 Status: **partially verified against `agy 1.2.7` on Linux**. Live authenticated probes verified
-the NDJSON envelope, two turns on one persistent process, and cold `--conversation` resume with
-preserved context. The adapter's process behavior is also covered by deterministic fixtures.
-Interruption, custom-agent selection, tool records, and native permission soft-denial still need
-a redacted live acceptance transcript before they are promoted to live-verified behavior.
+the NDJSON envelope, two turns on one persistent process, cold `--conversation` resume with
+preserved context, and headless auto-denial (`denied_actions` plus a `state: "ERROR"` tool step).
+The adapter's process behavior is also covered by deterministic fixtures. Interruption,
+custom-agent selection, and tool records still need a redacted live acceptance transcript before
+they are promoted to live-verified behavior.
+
+Open item: `agy 1.5.x` is now current. Its changelog says 1.5.7 makes Auto the default Agent Mode
+for headless `-p` runs, which may change which actions are auto-denied. Re-probe the denial shape
+on 1.5.7 before treating the 1.2.x auto-denial details below as current; this document does not
+claim they are unchanged.
 
 ## Invocation
 
@@ -88,7 +94,9 @@ A headless auto-denial (verified on agy 1.2.x) looks like this:
    `response`, because the model stops there.
 3. stderr explains the fix (`Add an allow-rule under permissions.allow in settings.json`).
 
-The adapter emits a non-fatal `ANTIGRAVITY_PERMISSION_DENIED` error naming the denied actions.
+The adapter emits a non-fatal `ANTIGRAVITY_PERMISSION_DENIED` error naming the denied actions. It
+detects a denial from either `result.denied_actions` or the `state: "ERROR"` tool step, so a result
+that omits or malforms `denied_actions` still fails an empty turn instead of returning nothing.
 When the response is empty it fails the turn and uses that explanation as `finalText`, so the
 parent never receives an empty success. Allow rules go in
 `~/.gemini/antigravity-cli/settings.json`, for example:
@@ -96,6 +104,10 @@ parent never receives an empty success. Allow rules go in
 ```json
 { "permissions": { "allow": ["command(git)", "write_file(/path/to/repo)"], "deny": ["command(sudo)"] } }
 ```
+
+The bridge's own `permission` block in an agent config is not enforced by this backend yet; only
+agy's `permissions.allow`/`permissions.deny` rules determine what runs. Prefer narrow allow rules
+over broad wildcards such as `command(*)`, which grants every command.
 
 For interruption the adapter sends `SIGINT`, waits a short grace interval for a terminal `result`,
 then emits one interrupted terminal event and terminates the owned process if the CLI does not
