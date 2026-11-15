@@ -402,6 +402,28 @@ test("restore past the grace window blocks with MISSED_START; within it starts i
   assert.equal(within.adapter.spawnRequests.length, 1, "a small overshoot starts immediately");
 });
 
+test("a live timer that fires after a suspend applies the scheduled grace window", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout", "Date"] });
+  const settled: Readonly<Record<string, unknown>>[] = [];
+  const { supervisor, adapter } = fixture({ settled });
+  const task = await supervisor.spawnAgent({ ...spawn, delay_seconds: 60 });
+  const taskId = String(task["task_id"]);
+
+  // Jump past the timer's due time without letting it run, as if the laptop was suspended.
+  t.mock.timers.setTime(Date.now() + 2 * 3_600_000);
+  t.mock.timers.tick(1);
+  await flush();
+  assert.equal(adapter.spawnRequests.length, 0, "a stale timer does not launch the task");
+
+  const blocked = supervisor.getAgentResult(taskId) as Record<string, unknown>;
+  assert.equal(blocked["state"], "blocked");
+  const result = blocked["result"] as Record<string, unknown>;
+  assert.equal(result["missed_start"], true);
+  assert.equal((result["error"] as { code: string }).code, "MISSED_START");
+  assert.equal(settled.length, 1);
+  assert.equal(settled[0]?.["status"], "blocked");
+});
+
 test("notify policy matrix for completed/failed, and needs_approval always pings", async () => {
   const expected: Record<NotifyMode, Record<"completed" | "failed", number>> = {
     always: { completed: 1, failed: 1 },
@@ -617,13 +639,14 @@ test("a starting task with no launched agent returns to queued and runs instead 
   supervisor.enablePersistence(path);
   const taskId = "task-starting-lost";
   const task = {
-    ...restoredTask(new Date(Date.now() - 2 * 3_600_000).toISOString(), taskId),
+    // Within the grace window, so a rerun is still allowed.
+    ...restoredTask(new Date(Date.now() - 10 * 60_000).toISOString(), taskId),
     state: "starting",
   };
   supervisor.restorePending([task] as never);
   await waitUntil(() => supervisor.listAgents().some((agent) =>
     agent["queued_from"] === taskId && agent["state"] === "completed"));
-  assert.equal(adapter.spawnRequests.length, 1, "the task ran even though its start time was long past");
+  assert.equal(adapter.spawnRequests.length, 1, "the task ran even though its start time had passed");
   await supervisor.flushSnapshot();
   const saved = JSON.parse(await readFile(path, "utf8")) as {
     pending?: { id: string; state: string; result?: { agent_id?: string } }[];
@@ -631,6 +654,25 @@ test("a starting task with no launched agent returns to queued and runs instead 
   const recovered = saved.pending?.find((pending) => pending.id === taskId);
   assert.equal(recovered?.state, "completed", "the recovered task settled instead of staying interrupted");
   assert.match(String(recovered?.result?.agent_id), /^fake-codex-agent-/);
+});
+
+test("a rerun starting task beyond the grace window blocks with MISSED_START", async () => {
+  const settled: Readonly<Record<string, unknown>>[] = [];
+  const { supervisor, adapter } = fixture({ settled });
+  const taskId = "task-starting-missed";
+  supervisor.restorePending([{
+    ...restoredTask(new Date(Date.now() - 2 * 3_600_000).toISOString(), taskId),
+    state: "starting",
+  }] as never);
+  await flush();
+  const blocked = supervisor.getAgentResult(taskId) as Record<string, unknown>;
+  assert.equal(blocked["state"], "blocked");
+  const result = blocked["result"] as Record<string, unknown>;
+  assert.equal(result["missed_start"], true);
+  assert.equal((result["error"] as { code: string }).code, "MISSED_START");
+  assert.equal(adapter.spawnRequests.length, 0, "a stale rerun must not launch");
+  assert.equal(settled.length, 1);
+  assert.equal(settled[0]?.["status"], "blocked");
 });
 
 test("a starting task whose agent record exists is completed and linked, not interrupted", async () => {

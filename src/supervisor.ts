@@ -743,6 +743,41 @@ export class Supervisor {
     this.#taskTimers.delete(id);
   }
 
+  /**
+   * Why a scheduled task is too late to start, or undefined when it may run now (or was not
+   * scheduled). Shared by restorePending() and live timers, including a timer that fires late
+   * because the host was suspended.
+   */
+  #missedStart(task: PendingTask, now = Date.now()): FailureInfo | undefined {
+    if (task.start_at === undefined) return undefined;
+    const due = Date.parse(task.start_at);
+    if (!Number.isFinite(due)) return undefined;
+    const lateMs = now - due;
+    if (lateMs <= this.#scheduledGraceMs) return undefined;
+    return classifyFailure({
+      code: 'MISSED_START',
+      message: `Scheduled start ${task.start_at} was missed by ${Math.round(lateMs / 1000)}s ` +
+        `(grace ${Math.round(this.#scheduledGraceMs / 1000)}s). The host was probably asleep or stopped.`,
+      ...(task.input.backend === undefined ? {} : { backend: task.input.backend }),
+      source: 'supervisor',
+      details: {
+        start_at: task.start_at,
+        late_by_seconds: Math.round(lateMs / 1000),
+        grace_seconds: Math.round(this.#scheduledGraceMs / 1000),
+      },
+    });
+  }
+
+  /** Block a task whose start is beyond the grace window and emit its settlement ping. */
+  #blockMissedStart(task: PendingTask, now = Date.now()): boolean {
+    const error = this.#missedStart(task, now);
+    if (error === undefined) return false;
+    this.#setTaskState(task, 'blocked');
+    task.result = { error, missed_start: true };
+    this.#emitTaskPing(task);
+    return true;
+  }
+
   async #runTask(task: PendingTask) {
     const run = async () => {
       if (this.#stopping) { this.#changes.delete(check); this.#clearTaskTimer(task.id); return; }
@@ -751,6 +786,9 @@ export class Supervisor {
         const due = Date.parse(task.start_at);
         if (Number.isFinite(due) && Date.now() < due) { this.#armTaskTimer(task, check); return; }
         this.#clearTaskTimer(task.id);
+        // The timer may fire late (for example after the host was suspended): apply the same
+        // grace window restorePending() uses instead of launching a long-stale schedule.
+        if (this.#blockMissedStart(task)) { await this.#writeSnapshot(); this.#changed(); return; }
       }
       const results = task.dependencies.map(dep => {
         const prerequisite = this.#pending.get(dep.agent);
@@ -1783,29 +1821,9 @@ export class Supervisor {
     let changed = rerun.size > 0;
     for (const task of tasks) {
       if (task.state !== 'queued') continue;
-      if (task.start_at !== undefined && !rerun.has(task.id)) {
-        const due = Date.parse(task.start_at);
-        const lateMs = Date.now() - due;
-        if (Number.isFinite(due) && lateMs > this.#scheduledGraceMs) {
-          const error = classifyFailure({
-            code: 'MISSED_START',
-            message: `Scheduled start ${task.start_at} was missed by ${Math.round(lateMs / 1000)}s ` +
-              `(grace ${Math.round(this.#scheduledGraceMs / 1000)}s). The host was probably asleep or stopped.`,
-            ...(task.input.backend === undefined ? {} : { backend: task.input.backend }),
-            source: 'supervisor',
-            details: {
-              start_at: task.start_at,
-              late_by_seconds: Math.round(lateMs / 1000),
-              grace_seconds: Math.round(this.#scheduledGraceMs / 1000),
-            },
-          });
-          this.#setTaskState(task, 'blocked');
-          task.result = { error, missed_start: true };
-          this.#emitTaskPing(task);
-          changed = true;
-          continue;
-        }
-      }
+      // This also applies to a rerun `starting` task: its original start is still the schedule,
+      // so a restart long after that time must not launch it as if nothing happened.
+      if (this.#blockMissedStart(task)) { changed = true; continue; }
       void this.#runTask(task);
     }
     if (changed) void this.#writeSnapshot();
