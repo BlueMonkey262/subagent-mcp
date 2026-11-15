@@ -147,6 +147,25 @@ async function main(): Promise<void> {
   server.registerTool('get_agent_result', { description: 'Retrieve persisted results and paginated turn history after reconnect or resume',
     inputSchema: { agent: z.string(), turn: z.number().int().positive().optional(), offset: z.number().int().min(0).optional(), limit: z.number().int().min(1).max(100).optional() } },
     async input => toContent(await call('get_agent_result', input)));
+  server.registerTool('get_dashboard', {
+    title: 'Dashboard snapshot',
+    description: 'For status UIs such as the /subagent-mcp panel; prefer list_agents and get_ensemble in conversation. ' +
+      'One read of live agents and recent finished ones (list_agents records, with phase and last_tool), pending approvals, ' +
+      'recent ensembles with member states, and concurrency. Pass the previous `revision` as `since` to get only ' +
+      '{ revision, unchanged: true } while nothing has changed.',
+    inputSchema: {
+      since: z.string().optional().describe('revision from the previous call'),
+      recent: z.number().int().min(0).max(50).optional().describe('finished agents to include (default 10)'),
+      ensembles: z.number().int().min(0).max(20).optional().describe('ensembles to include (default 5; open ones first)'),
+    } },
+    async input => toContent(await call('get_dashboard', input)));
+  server.registerTool('get_agent_diff', {
+    title: 'Agent worktree diff',
+    description: "An isolated agent's changes: everything in its managed worktree, committed or not and untracked files " +
+      "included, against the commit it started from (the snapshot for snapshot isolation). Returns per-file line counts " +
+      'and a unified diff capped at max_chars (default 20000, cut at a line end; `truncated` says so).',
+    inputSchema: { agent: z.string(), max_chars: z.number().int().min(500).max(200000).optional() } },
+    async input => toContent(await call('get_agent_diff', input)));
   server.registerTool('cleanup_worktree', { description: 'Remove an inactive, clean managed worktree, retaining its branch for review', inputSchema: { agent: z.string() } },
     async input => toContent(await call('cleanup_worktree', input)));
   server.registerTool('stop_agents', { description: 'Cancel queued tasks and interrupt agents by IDs or group. Supply agents or group_id.',

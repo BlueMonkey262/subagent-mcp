@@ -1,3 +1,4 @@
+import { buildDashboard } from "./dashboard.js";
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { readdirSync, readFileSync, realpathSync, statSync } from "node:fs";
@@ -708,6 +709,14 @@ async function dispatch(supervisor: Supervisor, method: string, params: unknown,
       return supervisor.sendMessage(input as unknown as SendMessageInput);
     case "list_agents":
       return supervisor.sessionView(input as ListAgentsInput);
+    case "get_dashboard":
+      return buildDashboard(supervisor, context.ensembles, {
+        since: typeof input["since"] === "string" ? input["since"] : undefined,
+        recent: typeof input["recent"] === "number" ? input["recent"] : undefined,
+        ensembles: typeof input["ensembles"] === "number" ? input["ensembles"] : undefined,
+      });
+    case "get_agent_diff":
+      return supervisor.agentDiff(requiredString(input, "agent"), typeof input["max_chars"] === "number" ? input["max_chars"] : undefined);
     case "list_agent_configs": return supervisor.listAgentConfigs();
     case "wait_for_agents": return supervisor.waitForAgents(input.agents as string[], input.mode as 'all' | 'any' | undefined,
       input.timeout_seconds as number | undefined, input.since as string | undefined, input.max_result_chars as number | undefined);

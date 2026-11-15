@@ -9,7 +9,11 @@ import type { Backend } from './core/types.js';
 import type { PermissionConfig } from './config/schema.js';
 const exec = promisify(execFile);
 export const validator = new Ajv({ allErrors: true, strict: true });
-export interface Worktree { path: string; branch: string; base_commit: string; repository: string }
+export interface Worktree {
+  path: string; branch: string; base_commit: string; repository: string;
+  /** Snapshot isolation: the commit holding the user's uncommitted changes the worktree started from. */
+  snapshot_commit?: string;
+}
 export async function createWorktree(cwd: string, base?: string): Promise<Worktree> {
   const repository = (await exec('git', ['rev-parse', '--show-toplevel'], { cwd })).stdout.trim();
   const base_commit = base ?? (await exec('git', ['rev-parse', 'HEAD'], { cwd })).stdout.trim();
@@ -111,4 +115,49 @@ export async function applySnapshot(tree: Worktree, snapshot: WorkingTreeSnapsho
     await rm(target, { force: true });
   }
   await exec('git', ['reset', '-q'], { cwd: tree.path });
+}
+
+export interface WorktreeDiff {
+  readonly path: string;
+  readonly branch: string;
+  /** What the diff is taken against: the snapshot commit for snapshot worktrees, else the base commit. */
+  readonly against: string;
+  readonly files: readonly { readonly path: string; readonly added: number | null; readonly deleted: number | null }[];
+  readonly insertions: number;
+  readonly deletions: number;
+  readonly patch: string;
+  readonly truncated: boolean;
+}
+
+/**
+ * Everything the agent changed in its worktree, committed or not, untracked files included, against
+ * the commit it started from. A throwaway index stages the whole tree, so the worktree's own index
+ * and files are never touched.
+ */
+export async function diffWorktree(tree: Worktree, maxChars: number): Promise<WorktreeDiff> {
+  const against = tree.snapshot_commit ?? tree.base_commit;
+  const index = join(tmpdir(), `subagent-diff-${randomUUID()}.index`);
+  const env = { ...process.env, GIT_INDEX_FILE: index };
+  const big = 64 * 1024 * 1024;
+  try {
+    await exec('git', ['read-tree', 'HEAD'], { cwd: tree.path, env });
+    await exec('git', ['add', '-A', '--', '.'], { cwd: tree.path, env, maxBuffer: big });
+    const numstat = (await exec('git', ['diff', '--cached', '--numstat', '-z', '--no-renames', against], { cwd: tree.path, env, maxBuffer: big })).stdout;
+    const files = numstat.split('\0').filter(Boolean).map((line) => {
+      const [added, deleted, ...rest] = line.split('\t');
+      return { path: rest.join('\t'), added: added === '-' ? null : Number(added), deleted: deleted === '-' ? null : Number(deleted) };
+    });
+    const full = (await exec('git', ['diff', '--cached', '--no-color', '--no-renames', against], { cwd: tree.path, env, maxBuffer: big })).stdout;
+    const truncated = full.length > maxChars;
+    // Cut at a line end so the patch stays parseable up to its last whole hunk line.
+    const cut = truncated ? full.slice(0, Math.max(0, full.lastIndexOf('\n', maxChars) + 1)) : full;
+    return {
+      path: tree.path, branch: tree.branch, against, files,
+      insertions: files.reduce((sum, file) => sum + (file.added ?? 0), 0),
+      deletions: files.reduce((sum, file) => sum + (file.deleted ?? 0), 0),
+      patch: cut, truncated,
+    };
+  } finally {
+    await rm(index, { force: true }).catch(() => undefined);
+  }
 }

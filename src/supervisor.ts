@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { AppendOnlyJsonlStore } from './storage/jsonl.js';
-import { applySnapshot, capabilities, discardWorktree, setupWorktree, intersectPermission, createWorktree, removeWorktree, restrictPermission, validator, type WorkingTreeSnapshot, type Worktree } from './execution.js';
+import { applySnapshot, capabilities, diffWorktree, discardWorktree, setupWorktree, intersectPermission, createWorktree, removeWorktree, restrictPermission, validator, type WorkingTreeSnapshot, type Worktree } from './execution.js';
 import type { PermissionConfig } from './config/schema.js';
 
 interface ExecutionMeta {
@@ -9,6 +9,8 @@ interface ExecutionMeta {
   history: Record<string, unknown>[];
   activity?: string;
   activityAt?: string;
+  /** The most recent tool call, kept after it ends so a UI can say what the agent last did. */
+  lastTool?: string;
   checkpointAt?: string;
   worktree?: Worktree;
   permission?: PermissionConfig;
@@ -28,6 +30,16 @@ type Row = Readonly<Record<string, unknown>>;
 /** Position of a listed row. An agent started from a queued task keeps that task's position, so the task turning into an agent never moves it between pages. */
 const listKey = (r: Row) => ({ at: String(r.queued_at ?? r.created_at), id: String(r.queued_from ?? r.agent_id) });
 const newestFirst = (a: Row, b: Row) => listKey(b).at.localeCompare(listKey(a).at) || listKey(b).id.localeCompare(listKey(a).id);
+/**
+ * What a running agent is doing, coarser than its event log: `tool` while a tool call is open,
+ * `thinking` between calls (the model is generating), `approval` while it waits on one. Settled
+ * agents report their state.
+ */
+function agentPhase(record: { readonly state: string; readonly meta: { readonly activity?: string } }): string {
+  if (record.state === 'needs_approval') return 'approval';
+  if (record.state === 'running') return record.meta.activity ? 'tool' : 'thinking';
+  return record.state;
+}
 export interface ListAgentsInput {
   states?: string[] | undefined; backend?: Backend | undefined; updated_since?: string | undefined;
   limit?: number | undefined; cursor?: string | undefined;
@@ -480,6 +492,15 @@ export class Supervisor {
       next_offset: offset + limit < record.meta.history.length ? offset + limit : null };
   }
 
+  /** The agent's worktree changes against the commit it started from (see diffWorktree). */
+  async agentDiff(agent: string, maxChars = 20_000) {
+    const record = this.#requireRecord(agent);
+    if (!record.meta.worktree) throw new SupervisorError('Agent has no managed worktree', { agent: record.name });
+    if (record.meta.cleaned) throw new SupervisorError('Agent worktree was removed; its branch is kept', { agent: record.name, branch: record.meta.worktree.branch });
+    const diff = await diffWorktree(record.meta.worktree, Math.min(200_000, Math.max(500, maxChars)));
+    return { agent_id: record.id, name: record.name, state: record.state, ...diff, patch: scanChildOutput(diff.patch) };
+  }
+
   async cleanupWorktree(agent: string) {
     const record = this.#requireRecord(agent);
     if (['running','starting','needs_approval'].includes(record.state)) throw new SupervisorError('Agent is active');
@@ -646,7 +667,12 @@ export class Supervisor {
     try {
       if (input.isolation === 'worktree') {
         worktree = await createWorktree(this.#cwd, input.worktree_snapshot?.base);
-        if (input.worktree_snapshot) await applySnapshot(worktree, input.worktree_snapshot);
+        if (input.worktree_snapshot) {
+          await applySnapshot(worktree, input.worktree_snapshot);
+          if (input.worktree_snapshot.dirty && input.worktree_snapshot.commit !== worktree.base_commit) {
+            worktree = { ...worktree, snapshot_commit: input.worktree_snapshot.commit };
+          }
+        }
         await setupWorktree(worktree, resolved.worktreeSetup ?? []);
       }
       // Config can hot-reload while worktree setup commands run.
@@ -958,6 +984,8 @@ export class Supervisor {
       tools,
       recent_tools: calls.slice(-recent).map(c => ({ ...c, tool: scanChildOutput(c.tool).slice(0, 80) })),
       current_activity: record.meta.activity ?? null,
+      phase: agentPhase(record),
+      last_tool: record.meta.lastTool ?? null,
       latest_message: scanChildOutput(message.trim()).slice(-300),
     };
   }
@@ -971,7 +999,10 @@ export class Supervisor {
           const previousActivity = record.meta.checkpointAt;
           record.updatedAt = new Date().toISOString();
           record.meta.activityAt = record.updatedAt;
-          if (event.type === 'tool.start') record.meta.activity = scanChildOutput([event.data.toolName, describeToolInput(event.data.input).target].filter(Boolean).join(' ')).slice(0,160);
+          if (event.type === 'tool.start') {
+            record.meta.activity = scanChildOutput([event.data.toolName, describeToolInput(event.data.input).target].filter(Boolean).join(' ')).slice(0,160);
+            record.meta.lastTool = record.meta.activity;
+          }
           if (event.type === 'tool.end' || event.type === 'turn.completed') delete record.meta.activity;
           if (!previousActivity || Date.parse(record.updatedAt) - Date.parse(previousActivity) >= 5000 || event.type === 'tool.start' || event.type === 'tool.end') { record.meta.checkpointAt = record.updatedAt; void this.#writeSnapshot().catch(() => {}); }
           if (event.type === "approval.requested") {
@@ -1006,6 +1037,10 @@ export class Supervisor {
             if (turnUsage !== undefined) record.usage = { ...turnUsage };
             else delete record.usage;
             if (record.meta.history.some(h => h.turn_id === event.data.turnId)) continue;
+            // A fatal error already recorded this turn without its usage or text (#notify). The adapter's
+            // turn.completed carries both, so it replaces that provisional entry instead of adding a second
+            // one, which left the turn counted twice and cumulative usage unknown.
+            const provisional = record.meta.history.findIndex(h => h.turn === record.meta.turn && h.turn_id === undefined);
             if (record.meta.schema && event.data.status === 'completed') {
               try {
                 const value: unknown = JSON.parse(event.data.finalText ?? '');
@@ -1018,8 +1053,11 @@ export class Supervisor {
               status: event.data.status, result: record.result, usage: record.usage, finished_at: record.updatedAt,
               structured_result: record.meta.structured, validation_errors: record.meta.validation_errors };
             if (!record.meta.history.some(h => h.turn_id === event.data.turnId)) {
-              await this.#resultsStore?.append(outcome);
-              record.meta.history.push(outcome);
+              const first = provisional < 0 ? undefined : record.meta.history[provisional];
+              const merged = first?.error === undefined ? outcome : { ...outcome, error: first.error };
+              await this.#resultsStore?.append(merged);
+              if (provisional < 0) record.meta.history.push(merged);
+              else record.meta.history[provisional] = merged;
             }
             const pending = record.pendingMessage;
             if (pending !== undefined) {
@@ -1238,6 +1276,8 @@ export class Supervisor {
       last_activity_at: record.meta.activityAt,
       current_activity: record.meta.activity ?? null,
       activity_source: record.meta.activity ? 'tool_event' : null,
+      phase: agentPhase(record),
+      last_tool: record.meta.lastTool ?? null,
       cumulative_usage: this.#totalUsage(record),
       created_at: record.createdAt,
       ...(record.meta.queued_from === undefined ? {} : { queued_from: record.meta.queued_from, queued_at: record.meta.queued_at }),
@@ -1279,7 +1319,10 @@ export class Supervisor {
     for (const { value } of records) {
       const record = this.#agents.get(String(value.agent_id));
       if (!record) continue;
-      if (!record.meta.history.some(h => h.turn === value.turn)) record.meta.history.push(value);
+      // The last entry for a turn wins: a provisional entry written on a fatal error is followed by the complete one.
+      const seen = record.meta.history.findIndex(h => h.turn === value.turn);
+      if (seen < 0) record.meta.history.push(value);
+      else record.meta.history[seen] = value;
       if (Number(value.turn) >= record.meta.turn) {
         record.meta.turn = Number(value.turn);
         record.state = value.status as ToolAgentState;
