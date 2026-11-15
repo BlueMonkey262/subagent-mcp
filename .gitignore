@@ -1,4 +1,4 @@
-node_modules/
+node_modules
 dist/
 # .subagents/ is each person's own config; only the *.example files that seed it are tracked.
 .subagents/*
