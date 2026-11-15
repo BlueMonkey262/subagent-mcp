@@ -26,7 +26,7 @@ export const register: Register = (on, options) => {
 
   on('session.start', async ($, e, next) => {
     $.ui.status(undefined)
-    await declarePanelCommand($)
+    await declarePanelCommand($, e.cwd)
     // /clear gives the session a new id without a new session.start, so the path is resolved on every write
     // one file per session under <mod>/live, next to the status line script, so sessions never overwrite each other
     const root = $.plugin.root.replace(/\/\.claude-plugin\/?$/, '')

@@ -225,6 +225,36 @@ test('a backend key rewrites only the disabledBackends line and keeps a copy', a
   await ui.unmount()
 })
 
+test('a backend turned off can be turned back on while the server still reports the old list', async ($, on) => {
+  let file = 'disabledBackends: [cursor]\nmodels:\n'
+  const writes: string[] = []
+  on('mcp.call', (_, e) => {
+    // The server has not reloaded models.yaml yet: it still reports cursor as disabled.
+    const body = e.tool === 'list_models' ? { model_policy: { disabled_backends: ['cursor'] } } : e.tool === 'list_agents' ? { agents: [] } : {}
+    return { value: { content: [{ type: 'text', text: JSON.stringify(body) }], structuredContent: body } }
+  })
+  on('command.register', () => ({ value: { command: 'subagent-mcp' } }))
+  on('ui.open', () => ({ value: { isPlaced: true } }))
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+  on('fs.read', (_, e) => ({ value: String((e as { path?: string }).path).endsWith('models.yaml') ? file : '{}' }))
+  on('fs.write', (_, e) => {
+    const { path, text } = e as { path?: string; text?: string }
+    if (String(path).endsWith('models.yaml')) (file = String(text), writes.push(file))
+    return { value: undefined }
+  })
+  await open($)
+
+  const ui = await $.ui.mount(PANE)
+  await ui.press({ key: 'backend-cursor' })
+  expect(writes.at(-1)).toContain('disabledBackends: []')
+  await ui.press({ key: 'backend-cursor' })
+  expect(writes.at(-1)).toContain('disabledBackends: [cursor]')
+  await ui.press({ key: 'backend-cursor' })
+  expect(writes.at(-1)).toContain('disabledBackends: []')
+  expect(writes).toHaveLength(3)
+  await ui.unmount()
+})
+
 test('the line editor handles lists, empty lists and what it will not touch', () => {
   expect(readDisabled(YAML)).toEqual([])
   expect(readDisabled('disabledBackends: [cursor, "codex"] # why\nmodels:\n')).toEqual(['cursor', 'codex'])
@@ -268,8 +298,9 @@ test('with get_dashboard the panel reads agents and ensembles in one call and sa
 
   const ui = await $.ui.mount(PANE)
   expect(await ui.find({ type: 'Text', text: /thinking, last ran shell git diff/ })).toBeTruthy()
-  expect(await ui.find({ type: 'Text', text: /Ensembles/ })).toBeTruthy()
-  expect(await ui.find({ type: 'Text', text: /glm \(Pan\): completed ✓ · deepseek \(Kolmogorov\): running/ })).toBeTruthy()
+  expect(await ui.find({ type: 'Text', text: /ENSEMBLES/ })).toBeTruthy()
+  expect(await ui.find({ type: 'Text', text: /^glm \(Pan\)$/ })).toBeTruthy()
+  expect(await ui.find({ type: 'Text', text: /^deepseek \(Kolmogorov\)$/ })).toBeTruthy()
   expect(calls.some(c => c.tool === 'list_agents')).toBe(false)
   await ui.unmount()
 })
@@ -313,9 +344,11 @@ test('v shows the selected agent\'s worktree diff one file at a time, and b goes
   await ui.press({ key: 'diff' })
   expect(calls.filter(c => c.tool === 'get_agent_diff').map(c => c.args['agent'])).toEqual(['id-Ada'])
   expect(await ui.find({ type: 'Text', text: /2 file\(s\), \+2 -0 on subagent\/x/ })).toBeTruthy()
-  expect(await ui.find({ type: 'Text', text: /a\.txt \(1\/2\)/ })).toBeTruthy()
+  expect(await ui.find({ type: 'Text', text: /^a\.txt$/ })).toBeTruthy()
+  expect(await ui.find({ type: 'Text', text: /^\(1\/2\)/ })).toBeTruthy()
   await ui.press({ key: 'diff-next' })
-  expect(await ui.find({ type: 'Text', text: /new\.txt \(2\/2\)/ })).toBeTruthy()
+  expect(await ui.find({ type: 'Text', text: /^new\.txt$/ })).toBeTruthy()
+  expect(await ui.find({ type: 'Text', text: /^\(2\/2\)/ })).toBeTruthy()
   await ui.press({ key: 'diff-back' })
   expect(await ui.find({ key: 'agent-id-Ada' })).toBeTruthy()
 
@@ -442,4 +475,36 @@ test('the missing-tool check matches both the engine message and an MCP error', 
   expect(MISSING_TOOL.test('subagent-strip: $.mcp.call: no connected MCP tool "get_dashboard" on a server named "subagent-mcp"')).toBe(true)
   expect(MISSING_TOOL.test('MCP error -32602: Tool get_dashboard not found')).toBe(true)
   expect(MISSING_TOOL.test('subagent-mcp host is restarting')).toBe(false)
+})
+
+test('on desktop the pane draws its own layout with the same keys', async ($, on) => {
+  const calls = server(on, [
+    agent({ name: 'Ada', state: 'needs_approval', request_id: 'req-9', tool_name: 'Bash', command: 'rm -rf build' }),
+    agent({ name: 'Bo', state: 'completed' }),
+  ])
+  await open($)
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  expect(await ui.find({ type: 'Text', text: /^Waiting for approval: Bash$/ })).toBeTruthy()
+  expect(await ui.find({ type: 'Text', text: /^Running$/ })).toBeTruthy()
+  expect(await ui.find({ key: 'agent-id-Bo' })).toBeTruthy()
+  expect(await ui.find({ key: 'backend-cursor' })).toBeTruthy()
+  await ui.press({ key: 'allow' })
+  expect(calls.filter(c => c.tool === 'resolve_approval').map(c => c.args)).toEqual([{ request_id: 'req-9', decision: 'allow' }])
+
+  await ui.press({ key: 'stop' })
+  expect(await ui.find({ type: 'Text', text: /Stop Ada\?/ })).toBeTruthy()
+  await ui.press({ key: 'yes' })
+  expect(calls.filter(c => c.tool === 'stop_agent').map(c => c.args)).toEqual([{ agent: 'Ada' }])
+  await ui.unmount()
+})
+
+test('desktop ensembles draw a card with one row per member', async ($, on) => {
+  dashboardServer(on, { agents: [agent({ name: 'Kolmogorov', state: 'running', ensemble_role: 'deepseek' })], ensembles: [ENSEMBLE] })
+  await open($)
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  expect(await ui.find({ type: 'Text', text: /^review$/ })).toBeTruthy()
+  expect(await ui.find({ type: 'Text', text: /^glm \(Pan\)$/ })).toBeTruthy()
+  expect(await ui.find({ type: 'Text', text: /^Ensembles$/ })).toBeTruthy()
+  await ui.unmount()
 })
