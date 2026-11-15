@@ -8,7 +8,7 @@ import type { Usage } from "../../core/types.js";
 import { EventBuffer } from "../../events/buffer.js";
 import type { AgentEvent, NewAgentEvent, NormalizedEventData, NormalizedEventType } from "../../events/schema.js";
 import { scanChildOutput } from "../../safety/output.js";
-import type { AdapterTurn, BackendAdapter, EventOptions, ProviderInfo, ProviderModel, ResumeRequest, SpawnRequest } from "../adapter.js";
+import type { AdapterLiveness, AdapterTurn, BackendAdapter, EventOptions, ProviderInfo, ProviderModel, ResumeRequest, SpawnRequest } from "../adapter.js";
 
 /**
  * Verified live against the installed `codex-cli 0.153.3` app-server (see the probe transcripts
@@ -240,6 +240,18 @@ export class CodexAdapter implements BackendAdapter {
       : "decline";
     this.#send(session, { id: pending.wireId, result: { decision } });
     session.pendingApprovals.delete(resolution.requestId);
+  }
+
+  liveness(agentId: string): AdapterLiveness {
+    const session = this.#sessions.get(agentId);
+    if (session === undefined) return { state: "unknown", reason: "no live Codex session" };
+    if (session.exited || session.child.exitCode !== null || session.child.signalCode !== null) {
+      return { state: "stale", reason: "Codex process exited" };
+    }
+    if (session.child.stdin.destroyed || !session.child.stdin.writable) {
+      return { state: "stale", reason: "Codex stdin is no longer writable" };
+    }
+    return { state: "live" };
   }
 
   async close(agentId: string): Promise<void> {

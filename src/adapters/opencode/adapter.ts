@@ -9,7 +9,7 @@ import { EventBuffer } from "../../events/buffer.js";
 import type { AgentEvent, NewAgentEvent, NormalizedEventData, NormalizedEventType } from "../../events/schema.js";
 import { signalProcessGroup } from "../../process-group.js";
 import { scanChildOutput } from "../../safety/output.js";
-import type { AdapterTurn, BackendAdapter, EventOptions, ProviderInfo, ProviderModel, ResumeRequest, SpawnRequest } from "../adapter.js";
+import type { AdapterLiveness, AdapterTurn, BackendAdapter, EventOptions, ProviderInfo, ProviderModel, ResumeRequest, SpawnRequest } from "../adapter.js";
 
 /**
  * Verified live against the installed `opencode 1.17.6` server (see the probe transcripts this
@@ -277,6 +277,18 @@ export class OpenCodeAdapter implements BackendAdapter {
       await this.#fetchJson(baseUrl, "POST", `/session/${agentId}/permissions/${permissionId}?directory=${encodeURIComponent(session.directory)}`, { response });
     }
     session.seenPermissions.delete(resolution.requestId);
+  }
+
+  liveness(agentId: string): AdapterLiveness {
+    const session = this.#sessions.get(agentId);
+    if (session === undefined) return { state: "unknown", reason: "no live OpenCode session" };
+    const server = this.#server;
+    if (server === undefined) return { state: "stale", reason: "OpenCode server is not running" };
+    if (server.process.exitCode !== null || server.process.signalCode !== null) {
+      return { state: "stale", reason: "OpenCode server process exited" };
+    }
+    if (session.pumpAbort.signal.aborted) return { state: "stale", reason: "OpenCode poll pump stopped" };
+    return { state: "live" };
   }
 
   async close(agentId: string): Promise<void> {
@@ -547,6 +559,9 @@ export class OpenCodeAdapter implements BackendAdapter {
         .join("");
       const usage = extractUsage(info);
       const status = session.timedOut ? "failed" : info.finish === "error" ? "failed" : "completed";
+      if (status === "failed" && !session.timedOut) {
+        this.#emitFailedTurn(sessionId, info);
+      }
       this.#completeTurn(sessionId, session, status, finalText === "" ? undefined : scanChildOutput(finalText), usage);
     }
   }
@@ -667,9 +682,32 @@ export class OpenCodeAdapter implements BackendAdapter {
     if (idle) {
       const outcome = idle.outcome;
       const status = session.timedOut || outcome === "failed" ? "failed" : outcome === "interrupted" ? "interrupted" : "completed";
+      if (status === "failed" && !session.timedOut) {
+        this.#emitFailedTurn(sessionId, idle);
+      }
       const usage: Usage | undefined = sawUsage ? { inputTokens, outputTokens, cachedInputTokens, uncachedInputTokens, costUsd } : undefined;
       this.#completeTurn(sessionId, session, status, lastText === "" ? undefined : scanChildOutput(lastText), usage);
     }
+  }
+
+  /** Emit a normalized error for a failed finish/idle record that carries no error event of its own. */
+  #emitFailedTurn(sessionId: string, record: Readonly<Record<string, unknown>>): void {
+    const error = isRecord(record.error) ? record.error : undefined;
+    const text = typeof error?.message === "string" && error.message !== ""
+      ? error.message
+      : typeof record.outcome === "string" ? `OpenCode turn ended with ${record.outcome}`
+      : typeof record.finish === "string" ? `OpenCode turn ended with finish=${record.finish}`
+      : "OpenCode turn failed without an error message";
+    this.#emit(sessionId, "error", {
+      code: "OPENCODE_TURN_FAILED",
+      message: scanChildOutput(text),
+      fatal: false,
+      details: {
+        ...(typeof record.finish === "string" ? { finish: record.finish } : {}),
+        ...(typeof record.outcome === "string" ? { outcome: record.outcome } : {}),
+        ...(error === undefined ? {} : { error }),
+      },
+    });
   }
 
   #completeTurn(sessionId: string, session: OpenCodeSession, status: NormalizedEventData["turn.completed"]["status"], finalText?: string, usage?: Usage): void {

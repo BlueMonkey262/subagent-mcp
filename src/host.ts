@@ -83,8 +83,12 @@ export interface HostHello {
   readonly builtAt?: number;
   /** Connected clients, including the one asking. */
   readonly clients?: number;
+  /** Connected clients that completed the explicit attach_session handshake. */
+  readonly attached?: number;
   readonly active?: number;
   readonly waiting?: number;
+  /** Queued tasks with a future start_at; they are preserved across a replacement host. */
+  readonly scheduled?: number;
 }
 
 export type HostDisposition = "keep" | "newer" | "stale" | "replace" | "refuse";
@@ -98,6 +102,7 @@ export type HostDisposition = "keep" | "newer" | "stale" | "replace" | "refuse";
  * - `refuse`/`replace` on a protocol mismatch, by whether agents are running.
  */
 export function hostDisposition(hello: HostHello, local: BuildInfo): HostDisposition {
+  // Scheduled/queued tasks are persisted and re-armed by the replacement, so they do not count as busy.
   const busy = (hello.active ?? 0) > 0 || (hello.waiting ?? 0) > 0;
   if (hello.protocol !== HOST_PROTOCOL) return busy ? "refuse" : "replace";
   if (hello.build === local.build) return "keep";
@@ -109,6 +114,71 @@ export function hostDisposition(hello: HostHello, local: BuildInfo): HostDisposi
 const IDLE_EXIT_MS = 60_000;
 const CONNECT_WAIT_MS = 8_000;
 const RECORDED_HOST_WAIT_MS = 2_000;
+/** Bound on re-flushing pings that were enqueued while an attach_session was already flushing. */
+const ATTACH_FLUSH_ROUNDS = 5;
+/** Bound on one socket write to a ping consumer; a peer that stops reading is dropped. */
+export const SEND_TIMEOUT_MS = 5_000;
+/** Bound on waiting for in-flight completion notifiers before the host exits. */
+export const NOTIFIER_DRAIN_TIMEOUT_MS = 3_000;
+/** Delay before retrying pings still queued when a bounded attach flush ends. */
+export const ATTACH_REDELIVER_DELAY_MS = 1_000;
+/** How long the notifier set must stay empty before shutdown trusts it is drained. */
+export const NOTIFIER_SETTLE_MS = 50;
+
+/** The part of a net.Socket this module needs, so a stalled peer can be tested without a real socket. */
+export interface WritablePeer {
+  readonly destroyed: boolean;
+  readonly writable: boolean;
+  write(data: string, callback?: (error?: Error | null) => void): boolean;
+  destroy(): unknown;
+}
+
+/**
+ * Write one newline-delimited message, resolving false if the peer stalls past the timeout (then
+ * destroying it). A peer that stops reading would otherwise never complete the write callback.
+ */
+export function sendSocketMessage(
+  socket: WritablePeer,
+  message: Readonly<Record<string, unknown>>,
+  timeoutMs = SEND_TIMEOUT_MS,
+): Promise<boolean> {
+  return new Promise((resolve) => {
+    if (socket.destroyed || !socket.writable) {
+      resolve(false);
+      return;
+    }
+    let timer: NodeJS.Timeout | undefined;
+    let settled = false;
+    const finish = (delivered: boolean): void => {
+      if (settled) return;
+      settled = true;
+      if (timer !== undefined) clearTimeout(timer);
+      resolve(delivered);
+    };
+    timer = setTimeout(() => {
+      finish(false);
+      socket.destroy();
+    }, timeoutMs);
+    timer.unref();
+    try {
+      socket.write(`${JSON.stringify(message)}\n`, (error?: Error | null) => finish(error === undefined || error === null));
+    } catch {
+      finish(false);
+    }
+  });
+}
+
+/** True while the host must stay up: live agents, capacity waiters, or queued/scheduled tasks. */
+export function hasLiveWork(
+  supervisor: Pick<Supervisor, "concurrency" | "listAgents" | "hasPendingWork">,
+): boolean {
+  const { active, waiting } = supervisor.concurrency();
+  if (active > 0 || waiting > 0 || supervisor.hasPendingWork()) return true;
+  return supervisor.listAgents().some((agent) => {
+    const state = agent["state"];
+    return state === "running" || state === "starting" || state === "needs_approval";
+  });
+}
 
 export interface HostPaths {
   readonly socketPath: string;
@@ -145,9 +215,15 @@ function canonicalPath(path: string): string {
 }
 
 export interface RunningHost {
-  notify(message: Readonly<Record<string, unknown>>): void;
+  /** Broadcast a ping to attached sessions; resolves with how many sockets the write completed on. */
+  notify(message: Readonly<Record<string, unknown>>): Promise<number>;
+  /** Retry pings still queued (for example after a bounded attach flush) to attached sessions. */
+  redeliverQueued(): Promise<void>;
   close(): Promise<void>;
+  /** Raw socket count, including probes and CLI clients that never attached. */
   readonly clients: number;
+  /** Sockets that completed the explicit `attach_session` handshake. */
+  readonly attached: number;
 }
 
 export async function serveHost(options: {
@@ -155,9 +231,86 @@ export async function serveHost(options: {
   readonly supervisor: Supervisor;
   readonly onClients?: (count: number) => void;
   readonly onShutdown?: () => void;
+  /** Set once the host begins shutting down; no further mutating RPCs are accepted. */
+  readonly shuttingDown?: () => boolean;
+  /** Bound on one ping write, exposed so tests can exercise a stalled peer quickly. */
+  readonly sendTimeoutMs?: number;
 }): Promise<RunningHost> {
   const sockets = new Set<Socket>();
+  const attached = new Set<Socket>();
   let shuttingDown = false;
+  const send = (socket: WritablePeer, message: Readonly<Record<string, unknown>>) =>
+    sendSocketMessage(socket, message, options.sendTimeoutMs);
+  const broadcast = async (message: Readonly<Record<string, unknown>>): Promise<number> => {
+    const targets = [...attached].filter((socket) => !socket.destroyed && socket.writable);
+    let timedOut = false;
+    const results = await Promise.all(targets.map(async (socket) => {
+      const delivered = await send(socket, message);
+      if (!delivered && socket.destroyed) {
+        // The peer stopped reading and sendSocketMessage destroyed it. Do not keep counting it as
+        // an attached consumer; the ping must be delivered to it later instead of being lost.
+        attached.delete(socket);
+        timedOut = true;
+      }
+      return delivered;
+    }));
+    const delivered = results.filter((result) => result).length;
+    if (timedOut && delivered > 0 && message["event"] === "detached" && isRecord(message["data"])) {
+      // At least one other session received it, so the caller would otherwise treat it as fully
+      // delivered. Requeue it for the dropped session's next attach. When nobody received it,
+      // runHost's `delivered === 0` path enqueues it once instead.
+      await options.supervisor.enqueueUndeliveredPing(message["data"]).catch(() => undefined);
+    }
+    return delivered;
+  };
+  let redeliverTimer: NodeJS.Timeout | undefined;
+  const redeliverQueued = async (): Promise<void> => {
+    if (options.supervisor.undeliveredPingCount() === 0) return;
+    for (const socket of [...attached]) {
+      if (socket.destroyed || !socket.writable) {
+        attached.delete(socket);
+        continue;
+      }
+      try {
+        await options.supervisor.flushUndeliveredPings((result) => send(socket, { event: "detached", data: result }));
+      } catch {
+        continue;
+      }
+      if (options.supervisor.undeliveredPingCount() === 0) return;
+    }
+  };
+  const scheduleRedeliver = (): void => {
+    if (redeliverTimer !== undefined) return;
+    redeliverTimer = setTimeout(() => {
+      redeliverTimer = undefined;
+      void redeliverQueued().catch(() => undefined);
+    }, ATTACH_REDELIVER_DELAY_MS);
+    redeliverTimer.unref();
+  };
+  const attach = async (socket: Socket): Promise<Readonly<Record<string, unknown>>> => {
+    // Register before flushing so a ping that settles during the flush broadcasts to this socket
+    // instead of finding no consumer and being queued behind the copy that flush already took.
+    attached.add(socket);
+    let delivered = 0;
+    try {
+      for (let attempt = 0; attempt < ATTACH_FLUSH_ROUNDS; attempt += 1) {
+        delivered += await options.supervisor.flushUndeliveredPings((result) => send(socket, { event: "detached", data: result }));
+        if (socket.destroyed || !socket.writable) {
+          attached.delete(socket);
+          return { attached: false, delivered, attached_sessions: attached.size };
+        }
+        // A settle may have enqueued a ping after this flush copied the queue; drain that too.
+        if (options.supervisor.undeliveredPingCount() === 0) break;
+      }
+    } catch (error) {
+      attached.delete(socket);
+      throw error;
+    }
+    // The bounded rounds can end with the queue still non-empty (writes failing while the socket
+    // stays writable, or notifiers adding pings across rounds). Retry once shortly after attach.
+    if (options.supervisor.undeliveredPingCount() > 0 && attached.has(socket)) scheduleRedeliver();
+    return { attached: true, delivered, attached_sessions: attached.size };
+  };
   const server: Server = createServer((socket) => {
     sockets.add(socket);
     options.onClients?.(sockets.size);
@@ -175,11 +328,13 @@ export async function serveHost(options: {
           if (shuttingDown) return;
           shuttingDown = true;
           options.onShutdown?.();
-        }, { clients: () => sockets.size });
+        }, { clients: () => sockets.size, attached: () => attached.size, attach: () => attach(socket),
+          shuttingDown: () => shuttingDown || options.shuttingDown?.() === true });
       }
     });
     const drop = (): void => {
       sockets.delete(socket);
+      attached.delete(socket);
       options.onClients?.(sockets.size);
     };
     socket.on("close", drop);
@@ -196,13 +351,21 @@ export async function serveHost(options: {
     get clients() {
       return sockets.size;
     },
-    notify(message) {
-      const line = `${JSON.stringify(message)}\n`;
-      for (const socket of sockets) socket.write(line);
+    get attached() {
+      return attached.size;
     },
+    notify(message) {
+      return broadcast(message);
+    },
+    redeliverQueued,
     close() {
+      if (redeliverTimer !== undefined) {
+        clearTimeout(redeliverTimer);
+        redeliverTimer = undefined;
+      }
       for (const socket of sockets) socket.destroy();
       sockets.clear();
+      attached.clear();
       return new Promise((resolve) => server.close(() => resolve()));
     },
   };
@@ -254,6 +417,8 @@ export async function connectHost(options: {
 }
 
 const RESTART_EXIT_WAIT_MS = 10_000;
+/** Bounded retry backoff for the attach_session handshake. */
+const ATTACH_RETRY_DELAYS_MS = [250, 500, 1_000, 2_000] as const;
 
 /**
  * The proxy's connection to its project host, and the one place that replaces it. Owns the client
@@ -262,6 +427,10 @@ const RESTART_EXIT_WAIT_MS = 10_000;
 export class HostSession {
   #client: HostClient | undefined;
   #error: Error | undefined;
+  #wantsAttach = false;
+  #attached = false;
+  #attachInFlight: Promise<unknown> | undefined;
+  #attachFailureLogged = false;
   readonly #detached: ((data: Readonly<Record<string, unknown>>) => void)[] = [];
 
   constructor(readonly options: Parameters<typeof connectHost>[0]) {}
@@ -276,16 +445,36 @@ export class HostSession {
     }
   }
 
+  /**
+   * Register this proxy as a ping consumer. Called only after the MCP initialize handshake, and
+   * only for Claude Code; a later reconnect/restart re-attaches automatically.
+   */
+  async attachSession(): Promise<unknown> {
+    this.#wantsAttach = true;
+    const client = this.#client;
+    if (client === undefined) {
+      throw this.#error ?? new Error("subagent-mcp host is not connected. Ask the user to run `/mcp` and then reconnect subagent-mcp.");
+    }
+    return this.#startAttach(client);
+  }
+
   onDetached(listener: (data: Readonly<Record<string, unknown>>) => void): void {
     this.#detached.push(listener);
     this.#client?.onDetached(listener);
   }
 
-  async call(method: string, params?: unknown): Promise<unknown> {
-    if (this.#client === undefined) {
+  async call(method: string, params?: unknown, timeoutMs = 0): Promise<unknown> {
+    const client = this.#client;
+    if (client === undefined) {
       throw this.#error ?? new Error("subagent-mcp host is not connected. Ask the user to run `/mcp` and then reconnect subagent-mcp.");
     }
-    return this.#client.call(method, params);
+    const result = await client.call(method, params, timeoutMs);
+    if (method === "hello" && isRecord(result) && result["attached"] === 0) this.#attached = false;
+    // A failed attach must not strand this connection for good: retry after the next successful call.
+    if (this.#wantsAttach && !this.#attached && this.#attachInFlight === undefined) {
+      void this.#startAttach(client).catch(() => undefined);
+    }
+    return result;
   }
 
   /** Why the connected host's code differs from this proxy's, if it does. */
@@ -337,12 +526,17 @@ export class HostSession {
       throw this.#error;
     }
     const next = this.#client!.host;
+    const scheduled = hello?.scheduled ?? 0;
     return {
       restarted: true,
       ...(hello?.pid === undefined ? {} : { previous_pid: hello.pid }),
       pid: next?.pid,
       build: next?.build,
       build_changed: hello?.build !== next?.build,
+      scheduled_tasks_preserved: scheduled,
+      ...(scheduled === 0 ? {} : {
+        note: `${scheduled} scheduled task(s) were preserved; the replacement host re-armed their timers.`,
+      }),
       ...(this.warning() === undefined ? {} : { host_warning: this.warning() }),
     };
   }
@@ -354,13 +548,98 @@ export class HostSession {
   #attach(client: HostClient): void {
     this.#client = client;
     this.#error = undefined;
+    this.#attached = false;
+    this.#attachInFlight = undefined;
     for (const listener of this.#detached) client.onDetached(listener);
+    if (this.#wantsAttach) {
+      // The replacement host restored queued pings; consume them on this connection too.
+      void this.#startAttach(client).catch(() => undefined);
+    }
+  }
+
+  #startAttach(client: HostClient): Promise<unknown> {
+    if (this.#attachInFlight !== undefined) return this.#attachInFlight;
+    const run = this.#attachWithRetry(client);
+    const tracked = run.then(
+      (result) => {
+        if (this.#attachInFlight === tracked) this.#attachInFlight = undefined;
+        return result;
+      },
+      (error: unknown) => {
+        if (this.#attachInFlight === tracked) this.#attachInFlight = undefined;
+        throw error;
+      },
+    );
+    this.#attachInFlight = tracked;
+    return tracked;
+  }
+
+  async #attachWithRetry(client: HostClient): Promise<unknown> {
+    let lastError: unknown;
+    for (let attempt = 0; attempt <= ATTACH_RETRY_DELAYS_MS.length; attempt += 1) {
+      if (this.#client !== client) throw new Error("subagent-mcp host connection changed before attach");
+      try {
+        const result = await client.call("attach_session", undefined, 5_000);
+        if (this.#client !== client) throw new Error("subagent-mcp host connection changed before attach");
+        this.#attached = true;
+        this.#attachFailureLogged = false;
+        return result;
+      } catch (error) {
+        lastError = error;
+        const wait = ATTACH_RETRY_DELAYS_MS[attempt];
+        if (wait === undefined) break;
+        await delay(wait);
+      }
+    }
+    this.#attached = false;
+    if (!this.#attachFailureLogged) {
+      this.#attachFailureLogged = true;
+      process.stderr.write(
+        `subagent-mcp: attach_session failed after ${ATTACH_RETRY_DELAYS_MS.length + 1} attempts: ` +
+          `${lastError instanceof Error ? lastError.message : String(lastError)}\n`,
+      );
+    }
+    throw lastError;
   }
 
   #fail(error: unknown): void {
     this.#client = undefined;
+    this.#attached = false;
+    this.#attachInFlight = undefined;
     const message = error instanceof Error ? error.message : String(error);
     this.#error = new Error(message.includes("/mcp") ? message : `${message} Ask the user to run \`/mcp\` and then reconnect subagent-mcp.`);
+  }
+}
+
+/**
+ * Wait for in-flight completion notifiers, bounded so a stuck notifier cannot hold shutdown open.
+ * A settle can start a notifier asynchronously after closeAll() (real adapters emit their
+ * interrupted turn.completed later), so an empty set must stay empty for a short settle period
+ * before shutdown takes its final snapshot.
+ */
+export async function drainNotifierTasks(
+  tasks: ReadonlySet<Promise<unknown>>,
+  timeoutMs = NOTIFIER_DRAIN_TIMEOUT_MS,
+  settleMs = NOTIFIER_SETTLE_MS,
+  lastActivity?: () => number,
+): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  const started = Date.now();
+  const wait = (ms: number): Promise<void> => new Promise<void>((resolve) => {
+    const timer = setTimeout(resolve, Math.max(0, ms));
+    timer.unref();
+  });
+  for (;;) {
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) return;
+    if (tasks.size === 0) {
+      const quietSince = Math.max(started, lastActivity?.() ?? started);
+      const quietFor = Date.now() - quietSince;
+      if (quietFor >= settleMs) return;
+      await wait(Math.min(settleMs - quietFor, remaining));
+      continue;
+    }
+    await Promise.race([Promise.allSettled([...tasks]), wait(remaining)]);
   }
 }
 
@@ -405,6 +684,9 @@ export async function runHost(): Promise<void> {
   const cursor = new CursorAdapter();
   const copilot = new CopilotAdapter();
   let endpoint: RunningHost | undefined;
+  const notifierTasks = new Set<Promise<unknown>>();
+  /** Last time a completion notifier was added or settled; shutdown's drain waits for it to go quiet. */
+  let notifierActivity = Date.now();
   const supervisor = new SupervisorClass({
     registry: live,
     adapters: new AdapterRegistry([claude, codex, opencode, antigravity, cursor, copilot]),
@@ -412,16 +694,51 @@ export async function runHost(): Promise<void> {
     usage,
     updateCachePath: join(paths.directory, "update.json"),
     maxConcurrent: live.maxConcurrent(),
-    onDetachedSettled: (result) => endpoint?.notify({ event: "detached", data: result }),
+    staleAgentMs: live.staleAgentMs(),
+    scheduledGraceMs: live.scheduledGraceMs(),
+    onDetachedSettled: (result) => {
+      // A probe/CLI socket is not a consumer; only an attached session counts. If none are
+      // attached (or the writes failed), persist the ping for the next attach_session instead.
+      const task = (async () => {
+        const delivered = endpoint === undefined
+          ? 0
+          : await endpoint.notify({ event: "detached", data: result }).catch(() => 0);
+        if (delivered === 0) {
+          await supervisor.enqueueUndeliveredPing(result).catch(() => undefined);
+          // The session is attached but the broadcast write failed; retry from the persisted queue.
+          if (endpoint !== undefined && endpoint.attached > 0) {
+            await endpoint.redeliverQueued().catch(() => undefined);
+          }
+        }
+      })();
+      notifierTasks.add(task);
+      notifierActivity = Date.now();
+      void task.finally(() => { notifierTasks.delete(task); notifierActivity = Date.now(); });
+    },
   });
-  live.watch(() => supervisor.setMaxConcurrent(live.maxConcurrent()));
+  live.watch(() => {
+    supervisor.setMaxConcurrent(live.maxConcurrent());
+    supervisor.setStaleAgentMs(live.staleAgentMs());
+    supervisor.setSendMessageWaitMs(live.sendMessageWaitMs());
+    supervisor.setScheduledGraceMs(live.scheduledGraceMs());
+    supervisor.setCapacityConfig(live.perBackendConcurrency(), live.perModelConcurrency());
+    supervisor.checkLiveness();
+  });
   supervisor.restore(await readSnapshot(paths.snapshotPath));
-  let pending = [];
-  try { pending = JSON.parse(await readFile(paths.snapshotPath, 'utf8')).pending ?? []; }
-  catch(error) { if (!isErrno(error, 'ENOENT')) throw error; }
+  let pending: any[] = [];
+  let undeliveredPings: unknown = [];
+  try {
+    const snapshot: any = JSON.parse(await readFile(paths.snapshotPath, 'utf8'));
+    pending = snapshot.pending ?? [];
+    undeliveredPings = snapshot.undeliveredPings ?? [];
+  } catch(error) { if (!isErrno(error, 'ENOENT')) throw error; }
+  // Load queued state into memory before persistence is enabled: an interrupted startup must not
+  // write an empty snapshot over the pending tasks and pings still on disk.
+  supervisor.restoreUndeliveredPings(undeliveredPings);
+  supervisor.restorePending(pending);
   supervisor.enablePersistence(paths.snapshotPath);
   await supervisor.recoverResults();
-  supervisor.restorePending(pending);
+  await supervisor.flushSnapshot();
 
   const runUpdateCheck = (): void => {
     void checkForUpdate({ memoryDirectory: paths.directory }).catch(() => undefined);
@@ -429,6 +746,8 @@ export async function runHost(): Promise<void> {
   runUpdateCheck();
   const updateTimer = setInterval(runUpdateCheck, 24 * 60 * 60 * 1_000);
   updateTimer.unref();
+  const livenessTimer = setInterval(() => supervisor.checkLiveness(), 5_000);
+  livenessTimer.unref();
 
   let shuttingDown = false;
   let idleTimer: NodeJS.Timeout | undefined;
@@ -437,7 +756,11 @@ export async function runHost(): Promise<void> {
     shuttingDown = true;
     if (idleTimer !== undefined) clearTimeout(idleTimer);
     clearInterval(updateTimer);
+    clearInterval(livenessTimer);
     live.close();
+    // Stop scheduled work first, then interrupt live agents. Their settle pings fire after
+    // closeAll(), so drain notifiers after it and before the final snapshot.
+    await supervisor.quiesce();
     await Promise.all([
       claude.closeAll(),
       codex.closeAll(),
@@ -446,7 +769,14 @@ export async function runHost(): Promise<void> {
       cursor.closeAll(),
       copilot.closeAll(),
     ]).catch(() => undefined);
+    await drainNotifierTasks(notifierTasks, NOTIFIER_DRAIN_TIMEOUT_MS, NOTIFIER_SETTLE_MS, () => notifierActivity);
     const ownsPaths = await ownsHostPaths(paths, process.pid);
+    // Persist the final snapshot before closing the endpoint or removing the socket/pid/lock. Once
+    // those are gone a replacement host can start, and it must not later be overwritten by ours.
+    await supervisor.flushSnapshot().catch(() => undefined);
+    // Nothing may write after this point: a task that outlived quiesce must not race a replacement
+    // host with a stale snapshot.
+    supervisor.closePersistence();
     // net.Server.close() unlinks Unix sockets, so an orphan must exit without closing a replacement's path.
     if (ownsPaths) await endpoint?.close();
     if (ownsPaths && await ownsHostPaths(paths, process.pid)) {
@@ -463,12 +793,8 @@ export async function runHost(): Promise<void> {
     idleTimer = undefined;
     if (clients > 0 || shuttingDown) return;
     idleTimer = setTimeout(() => {
-      const { active, waiting } = supervisor.concurrency();
-      const liveAgent = supervisor.listAgents().some((agent) => {
-        const state = agent["state"];
-        return state === "running" || state === "starting" || state === "needs_approval";
-      });
-      if (active > 0 || waiting > 0 || liveAgent) return;
+      supervisor.checkLiveness();
+      if (hasLiveWork(supervisor)) return;
       void shutdown();
     }, IDLE_EXIT_MS);
   };
@@ -478,6 +804,7 @@ export async function runHost(): Promise<void> {
     supervisor,
     onClients: scheduleIdle,
     onShutdown: () => void shutdown(),
+    shuttingDown: () => shuttingDown,
   });
   await writeFile(paths.pidPath, `${JSON.stringify({ pid: process.pid, protocol: HOST_PROTOCOL, socketPath: paths.socketPath })}\n`);
   await refreshLockForOwner(paths.lockPath, process.pid);
@@ -615,6 +942,10 @@ async function handleLine(
   }
   const id = request["id"];
   const method = request["method"];
+  if (method !== "hello" && method !== "shutdown" && context.shuttingDown()) {
+    socket.write(`${JSON.stringify({ id, error: { message: "subagent-mcp host is shutting down", code: "HOST_SHUTTING_DOWN" } })}\n`);
+    return;
+  }
   try {
     const result = await dispatch(supervisor, method, request["params"], context);
     socket.write(`${JSON.stringify({ id, result })}\n`);
@@ -631,12 +962,20 @@ async function handleLine(
 const HOST_BUILD = buildInfo();
 
 interface DispatchContext {
-  /** Clients currently connected to this host. */
+  /** Raw clients currently connected to this host, including probes. */
   readonly clients: () => number;
+  /** Clients that completed the explicit attach_session handshake. */
+  readonly attached: () => number;
+  /** Mark the calling socket as a ping consumer and flush the persisted queue to it. */
+  readonly attach: () => Promise<Readonly<Record<string, unknown>>>;
+  /** True once the host is shutting down and must not accept more state changes. */
+  readonly shuttingDown: () => boolean;
 }
 
 async function dispatch(supervisor: Supervisor, method: string, params: unknown, context: DispatchContext): Promise<unknown> {
   const input = isRecord(params) ? params : {};
+  // A stale backend process must not keep the host "busy" for restart/idle decisions.
+  supervisor.checkLiveness();
   switch (method) {
     case "hello":
       return {
@@ -645,8 +984,11 @@ async function dispatch(supervisor: Supervisor, method: string, params: unknown,
         build: HOST_BUILD.build,
         builtAt: HOST_BUILD.builtAt,
         clients: context.clients(),
+        attached: context.attached(),
         ...supervisor.concurrency(),
       };
+    case "attach_session":
+      return context.attach();
     case "spawn_agent":
       return supervisor.spawnAgent(input as unknown as SpawnAgentInput);
     case "send_message":

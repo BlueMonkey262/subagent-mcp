@@ -19,7 +19,7 @@ That installs: the server (user-scoped MCP), the `subagent-mcp` launcher, and th
 | OpenCode | model IDs are `provider/model` (`opencode models`) |
 | Cursor | needs the `agent` CLI; model IDs from `agent --list-models` |
 | GitHub Copilot | needs the `copilot` CLI, signed in; model IDs as `copilot --model` accepts them (`auto` routes within your plan) |
-| Antigravity (AGY) | needs `agy`; agent config also sets `antigravityAgent` |
+| Antigravity (AGY) | needs `agy`; agent config sets `antigravityAgent` (and optionally `antigravityAgentFile`) |
 | NVIDIA NIM | free-tier models via an API key; usable from Claude, Codex and OpenCode agents |
 | Generic OpenAI-compatible API | any `/v1` endpoint, optional key, add as many as you like; same harnesses as NIM |
 
@@ -47,6 +47,31 @@ coverage only.
 Agents live in `.subagents/<name>.md` (frontmatter + system prompt) and the model roster in
 `.subagents/models.yaml`, in the project you run Claude Code from. If a project has none, the server
 uses the examples bundled in this repo's `.subagents/`.
+
+Useful `models.yaml` limits (all optional):
+
+```yaml
+maxConcurrent: 12
+staleAgentSeconds: 300          # heartbeat threshold when a backend cannot be probed
+sendMessageWaitSeconds: 30      # bounded send_message wait
+scheduledGraceSeconds: 3600     # how late a restored scheduled task may start
+perBackendConcurrency:
+  opencode: 2
+perModelConcurrency:
+  "opencode:strata-coder/strata/gyro-s": 1
+  "antigravity:gemini-3.8-flash-*": 1
+```
+
+For an Antigravity agent, pin its real definition into the project:
+
+```yaml
+antigravityAgent: gemini-review
+antigravityAgentFile: .agents/agents/gemini-review.md
+```
+
+`subagent-mcp antigravity doctor` audits every resolved definition; `subagent-mcp antigravity
+vendor <agent-config>` copies a global definition into the project. Antigravity tools and
+permissions are always enforced by `agy`, not by the bridge (`bridge_enforced: false`).
 
 ## Tools
 
@@ -111,9 +136,16 @@ against the repository, tests, and the operator's actual request.
   `permissions.allow` rule covers is auto-denied: the tool ends `denied`, the turn reports the
   denied actions (and fails if the agent produced no text), and nothing enters this server's
   `resolve_approval` loop. The custom agent must list `tools`, or agy gives it only a read-only set.
-  `reasoningEffort` accepts only `low`, `medium`, or `high` for this backend. See
-  [`docs/protocol/antigravity.md`](docs/protocol/antigravity.md) for the verified protocol and
-  outstanding live-acceptance probes.
+  `reasoningEffort` accepts only `low`, `medium`, or `high` for this backend.
+  The real system prompt and tool list live in the `agy` custom agent, not in `.subagents/`.
+  Before launch the bridge resolves the definition project-first
+  (`.agents/agents/<name>.md`), then the global `~/.gemini/agents/<name>.md`, or an explicit
+  `antigravityAgentFile` in the config. It validates the frontmatter name, records the SHA-256,
+  source path, tools and portability in the agent result/listing, and writes an exact copy to
+  `.subagents/memory/antigravity-agents/<sha256>.md`. A definition that changes between turns
+  refuses resume with `ANTIGRAVITY_AGENT_CHANGED` unless `allow_agent_definition_change: true`
+  is passed. See [`docs/protocol/antigravity.md`](docs/protocol/antigravity.md) for the verified
+  protocol and outstanding live-acceptance probes.
 - **Cursor**: drives the Cursor Agent CLI in print mode, `agent -p --output-format stream-json
   --trust --sandbox enabled --workspace <cwd> --model <explicit> <prompt>` (verified against
   `agent 2026.10.16-e3cb207`). This backend is **one process per turn**: the only durable state is
@@ -142,16 +174,38 @@ against the repository, tests, and the operator's actual request.
 
 ## Operational limits
 
-- **Turn cap.** Whatever `timeout` the agent config or the tool call sets is returned as
+- **Turn cap and bounded resume wait.** Whatever `timeout` the agent config or the tool call sets is returned as
   `timeout_seconds` on spawn, resume, and `list_agents`. The sample agents set `timeout: 1200`
   (20 minutes). `send_message` accepts `timeout` to raise or lower the cap for that turn.
+  It also accepts `wait_seconds` (default 30, or `sendMessageWaitSeconds` in `models.yaml`, `0`
+  returns immediately). When the wait expires the call returns `status: "running"` with
+  `wait_expired: true` and leaves the turn running; it never cancels work. Use
+  `wait_for_agents` or `get_agent_events` to follow it.
   A timeout also kills the child's process group.
 - **Codex resume cost.** Resuming a Codex agent replays the whole thread with no prompt cache.
   The result includes a `warning`. After `codexResumeIdleSeconds` (default 30 minutes) the resume
   is refused unless `allow_expensive_resume` is true.
 - **Concurrency.** At most `maxConcurrent` agents run at once (default 12, or
   `SUBAGENT_MCP_MAX_CONCURRENT`). Further `spawn_agent` calls wait for a free slot.
-  `list_models` and `list_agents` report `concurrency.active` and `concurrency.waiting`.
+  `perBackendConcurrency` and `perModelConcurrency` add narrower pools, so a one-slot local model
+  cannot be oversubscribed by the global cap and does not block spawns on other models.
+  `list_models` and `list_agents` report `concurrency.active`, `concurrency.waiting`, and the
+  `per_backend`/`per_model` pools. Model patterns use the same case-insensitive globs as
+  `blockModels`; every matching rule applies.
+- **Failure reporting.** Every failed turn carries `error.code`, `error.message`,
+  `error.category`, `error.retryable`, and `error.recommended_action`. Categories distinguish
+  `quota`, `auth`, `rate_limit`, `timeout`, `process`, `protocol`, `transport`, `task`, `config`,
+  `capacity`, `host`, `internal`, `cancelled`, and `unknown`. A failed turn with no backend error
+  is synthesized as `TURN_FAILED` (`task`), and a lost backend process becomes
+  `AGENT_UNRESPONSIVE` (`process`). A failed turn can never be labelled `*_SUCCESS`.
+  `CLAUDE_*` codes remain backend-specific for diagnostics; use `category` for automation.
+- **Liveness.** Active agents report `liveness: live | stale | unknown | settled`,
+  `liveness_reason`, `last_heartbeat_at`, and `heartbeat_age_seconds`. A backend process that has
+  exited is marked `stale` immediately and, after a second probe, failed with
+  `AGENT_UNRESPONSIVE`; its capacity slot is released and `wait_for_agents` wakes. An adapter
+  that cannot probe is marked stale only after `staleAgentSeconds` (default 300) without a
+  heartbeat, and is not killed automatically, because a long tool call may legitimately be silent.
+  The host also bounds `list_agents` so an unresponsive host returns an error instead of hanging.
 - **Blocking backends and models.** Three `models.yaml` settings refuse agents before they start:
 
   | Setting | Refuses | Environment variable |
@@ -215,7 +269,8 @@ against the repository, tests, and the operator's actual request.
 - **Picking up code changes.** After rebuilding subagent-mcp (`npm run build`), run `/mcp` and
   reconnect. The host reports a fingerprint of the compiled code it loaded and when it was built;
   the reconnecting proxy replaces the host only when it runs *older* code, is idle, and no other
-  Claude Code session is attached. Agent records, results and usage carry over. A host running
+  Claude Code session is attached. Agent records, results and usage carry over, and queued or
+  scheduled tasks plus undelivered pings are preserved and re-armed. A host running
   newer code than the proxy is never downgraded; tool responses then carry a `host_warning` to
   reconnect. When agents are running or another session is attached, the old host is kept and the
   `host_warning` says so; `restart_host` then reloads it once agents finish. `restart_host` is
@@ -261,6 +316,16 @@ the outcome. See `src/channel.ts`.
 
 - **Claude Code only.** The capability key is sent to every client (it has to be declared before
   the client is known), but events are emitted only when `clientInfo.name` is `claude-code`.
+- **Ping policy.** `spawn_agent` and `send_message` accept `notify: "always" | "on_failure" |
+  "never"` (default `always`). `never` suppresses completed, failed, and interrupted pings;
+  `on_failure` suppresses only completed. `needs_approval` always pings because the agent is
+  blocked. Results stay retrievable through `list_agents`, `get_agent_result`, and
+  `get_agent_events` regardless.
+- **Offline queue.** If no attached Claude Code session is available when a background agent
+  settles, the ping is persisted (up to 100, oldest dropped) and delivered after the next session
+  completes the MCP initialize handshake and explicitly attaches. Probes and other MCP clients do
+  not drain it. A ping is removed from the queue only after its socket write succeeds; a crash
+  between the write and the removal can redeliver it.
 - **Opt-in per session.** Channels are a research preview; a custom server is not on the
   allowlist, so start Claude Code with
   `claude --dangerously-load-development-channels server:subagent-mcp`. Without it Claude Code
@@ -271,6 +336,50 @@ the outcome. See `src/channel.ts`.
   straight decision-string mapping (no persistence across a resumed process). It does now
   generalize by program+subcommand (`sessionRuleForRequest()` in `src/approval/policy.ts`), not
   just an exact repeat of the same command.
+
+### Delayed agents
+
+`spawn_agent` can schedule work for later instead of starting it now. Pass exactly one of:
+
+- `start_at`: an ISO datetime in the future (at most 7 days ahead).
+- `delay_seconds`: a positive number of seconds (at most 604800).
+
+The call returns immediately with a queued receipt:
+
+```json
+{"task_id":"task-…","agent_id":"task-…","status":"queued","start_at":"2026-11-13T06:00:00.000Z"}
+```
+
+For example, to run a migration review overnight:
+
+```json
+{
+  "agent": "reviewer",
+  "prompt": "Review the migration in migrations/0042 and report risks.",
+  "description": "overnight migration review",
+  "start_at": "2026-11-13T02:00:00Z",
+  "notify": "on_failure"
+}
+```
+
+Choose `notify` per job: `always` (default) pings when the agent completes, fails, or is
+interrupted; `on_failure` only pings for failures and interruptions; `never` suppresses all
+completion pings. A `needs_approval` ping is always sent, because the agent is blocked.
+Scheduled tasks and dependency queues are persisted in `.subagents/memory/sessions.json`, so
+they survive a host restart. The host writes a final snapshot on shutdown, and the replacement
+host restores the queue and re-arms each timer. `list_agents` shows their `start_at` and
+`notify`; `restart_host` reports `scheduled_tasks_preserved`. Queued completion pings persist
+the same way and are delivered after the next session attaches. Concurrent attaches are
+serialized, so each queued ping is delivered to exactly one session. Shutdown waits for
+in-flight completion pings and stops scheduled tasks before writing the final snapshot, so a
+task that comes due during shutdown stays queued for the replacement host. Delivered pings are
+removed after a successful socket write; a crash between the write and the removal can
+redeliver one.
+
+Limits: the host must be running (or restarted) to launch the job, and the machine must be awake.
+A sleeping machine starts the job when it wakes, subject to `scheduledGraceSeconds` (default
+3600). A task restored later than that grace window is marked `blocked` with a structured
+`MISSED_START` error instead of running late; reschedule it with a new `spawn_agent` call.
 
 ### Long-running agents and workflows
 
@@ -327,8 +436,13 @@ Spawn options:
   also be dependencies for further chaining. Only successful, schema-valid
   results launch dependents. Failed prerequisites block them. Dependency results
   are passed as delimited input data. Cycles cannot be created because only
-  existing prerequisites may be referenced. Queues survive restart; tasks caught
-  during launch become interrupted to avoid duplicate execution.
+  existing prerequisites may be referenced. Queues survive restart. A task
+  caught during launch is re-run only when no agent record was persisted; spawn
+  is at-least-once, so a crash between `adapter.spawn` and the snapshot can run
+  the task again.
+- `start_at` / `delay_seconds` schedule a spawn for later (see "Delayed agents"). They can be
+  combined with `depends_on`: the task waits for both the clock and its prerequisites.
+  `stop_agents` cancels a scheduled task before it starts.
 - `group_id` labels related agents/tasks. `stop_agents` accepts `agents` or
   `group_id`, cancels queued tasks, and interrupts running members. It returns
   individual outcomes and is safe to repeat. Task IDs can be used for waiting,

@@ -11,7 +11,7 @@ import type { Usage } from "../../core/types.js";
 import { EventBuffer } from "../../events/buffer.js";
 import type { AgentEvent, NewAgentEvent, NormalizedEventData, NormalizedEventType } from "../../events/schema.js";
 import { scanChildOutput } from "../../safety/output.js";
-import type { AdapterTurn, BackendAdapter, EventOptions, ResumeRequest, SpawnRequest } from "../adapter.js";
+import type { AdapterLiveness, AdapterTurn, BackendAdapter, EventOptions, ResumeRequest, SpawnRequest } from "../adapter.js";
 
 const DEFAULT_INIT_TIMEOUT_MS = 15_000;
 const DEFAULT_INTERRUPT_GRACE_MS = 2_000;
@@ -284,6 +284,18 @@ export class ClaudeAdapter implements BackendAdapter {
       unknownMessages: session.unknownMessages.map((message) => sanitizeUnknown(message) as Readonly<Record<string, unknown>>),
       processExited: session.exited,
     };
+  }
+
+  liveness(agentId: string): AdapterLiveness {
+    const session = this.#sessions.get(agentId);
+    if (session === undefined) return { state: "unknown", reason: "no live Claude session" };
+    if (session.exited || session.child.exitCode !== null || session.child.signalCode !== null) {
+      return { state: "stale", reason: "Claude process exited" };
+    }
+    if (session.child.stdin.destroyed || !session.child.stdin.writable) {
+      return { state: "stale", reason: "Claude stdin is no longer writable" };
+    }
+    return { state: "live" };
   }
 
   async close(agentId: string): Promise<void> {
@@ -610,11 +622,25 @@ export class ClaudeAdapter implements BackendAdapter {
       && (session.currentTurn.interruptRequested || message.subtype === "interrupted");
     if (failed && !interrupted) {
       const errorText = extractErrorText(message);
+      const subtype = typeof message.subtype === "string" ? message.subtype : undefined;
+      // subtype describes the result envelope, not whether the turn succeeded: a quota or auth
+      // failure can arrive as {is_error: true, subtype: "success"}. Never translate that to
+      // CLAUDE_SUCCESS, which would tell an automated caller the turn succeeded.
+      const code = message.is_error === true
+        ? "CLAUDE_RESULT_ERROR"
+        : subtype === undefined ? "CLAUDE_RESULT_ERROR" : `CLAUDE_${subtype.toUpperCase()}`;
       this.#emit(session, "error", {
-        code: typeof message.subtype === "string" ? `CLAUDE_${message.subtype.toUpperCase()}` : "CLAUDE_RESULT_ERROR",
+        code,
         message: scanChildOutput(errorText),
         fatal: false,
-        details: { cliVersion: session.cliVersion ?? "unknown" },
+        ...(subtype === undefined ? {} : { subtype }),
+        details: {
+          cliVersion: session.cliVersion ?? "unknown",
+          is_error: message.is_error === true,
+          ...(subtype === undefined ? {} : { subtype }),
+          ...(typeof message.stop_reason === "string" ? { stop_reason: message.stop_reason } : {}),
+          ...(typeof message.terminal_reason === "string" ? { terminal_reason: message.terminal_reason } : {}),
+        },
       });
     }
     const finalText = typeof message.result === "string" ? scanChildOutput(message.result) : undefined;
@@ -950,7 +976,10 @@ function extractErrorText(message: Readonly<Record<string, unknown>>): string {
     if (errors.length > 0) return errors.join("; ");
   }
   if (typeof message.result === "string" && message.result !== "") return message.result;
-  return `Claude turn failed with ${String(message.subtype ?? "unknown result subtype")}`;
+  const subtype = typeof message.subtype === "string" ? message.subtype : undefined;
+  return subtype === undefined || subtype === "success"
+    ? "Claude reported an error result without a message"
+    : `Claude turn failed with ${subtype}`;
 }
 
 function boundedAppend(current: string, chunk: string, limit: number): string {

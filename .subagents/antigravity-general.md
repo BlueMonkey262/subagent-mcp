@@ -2,6 +2,7 @@
 name: antigravity-general
 backend: antigravity
 antigravityAgent: subagent-general
+antigravityAgentFile: .agents/agents/subagent-general.md
 description: General-purpose Antigravity (agy) subagent. The system prompt lives in the agy custom agent .agents/agents/subagent-general.md; tool permissions are agy's own (headless runs have no approval protocol).
 maxTurns: 40
 timeout: 1200

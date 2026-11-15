@@ -3,6 +3,7 @@ import type { Backend } from "../core/types.js";
 import { EventBuffer } from "../events/buffer.js";
 import type { AgentEvent, NewAgentEvent, NormalizedEventData, NormalizedEventType } from "../events/schema.js";
 import type { AdapterTurn, BackendAdapter, EventOptions, ResumeRequest, SpawnRequest } from "./adapter.js";
+import type { AdapterLiveness } from "./adapter.js";
 
 export interface FakeContext {
   readonly agentId: string;
@@ -28,6 +29,7 @@ export class FakeAdapter implements BackendAdapter {
   readonly approvals: { readonly agentId: string; readonly resolution: ApprovalResolution }[] = [];
   readonly spawnRequests: SpawnRequest[] = [];
   readonly resumeRequests: ResumeRequest[] = [];
+  readonly #liveness = new Map<string, AdapterLiveness>();
   #agentNumber = 0;
 
   constructor(
@@ -43,6 +45,15 @@ export class FakeAdapter implements BackendAdapter {
   /** Pretend a backend session already exists so a restored agent can be resumed. */
   seed(agentId: string): void {
     this.#sessions.set(agentId, { turnNumber: 1, interrupted: false });
+  }
+
+  /** Control what the supervisor's liveness probe sees for one agent. */
+  setLiveness(agentId: string, liveness: AdapterLiveness): void {
+    this.#liveness.set(agentId, liveness);
+  }
+
+  liveness(agentId: string): AdapterLiveness {
+    return this.#liveness.get(agentId) ?? { state: "live" };
   }
 
   async spawn(request: SpawnRequest): Promise<AdapterTurn> {
