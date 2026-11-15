@@ -4,6 +4,7 @@
 #
 #   subagent-mcp [any claude arguments]      e.g. subagent-mcp --resume
 #   subagent-mcp --codex [codex arguments]  launch Codex with the MCP server registered
+#   subagent-mcp bar [--once]               live agent bar (or one snapshot)
 #   subagent-mcp nim set-key [KEY]           add the NVIDIA NIM endpoint with your API key
 #   subagent-mcp endpoint add NAME URL --model ID[=alias] [--key KEY]   add any OpenAI-compatible endpoint
 #   subagent-mcp endpoint list|remove NAME
@@ -16,6 +17,14 @@ ROOT="$(cd "$(dirname "$SELF")/.." && pwd)"
 PORT="${SUBAGENT_MCP_NIM_PORT:-4131}"
 
 case "${1:-}" in
+bar)
+    shift
+    exec node "$ROOT/bin/agent-bar.mjs" "$@"
+    ;;
+companion)
+    shift
+    exec node "$ROOT/bin/companion.mjs" "$@"
+    ;;
 --codex)
     shift
     command -v codex >/dev/null || { echo "subagent-mcp: 'codex' not found on PATH" >&2; exit 1; }

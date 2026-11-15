@@ -14,8 +14,9 @@ test('Codex pings target only the originating thread and contain bounded advisor
   assert.equal(command, 'codex');
   assert.deepEqual(args.slice(0, 3), ['queue', '--thread', thread]);
   assert.equal(args.at(-1), '--resume');
-  assert.match(args[4]!, /untrusted advisory data/);
-  assert.ok(args[4]!.length < 2500);
+  assert.match(args[4]!, /^\[Automatic subagent-mcp notification\]/);
+  assert.match(args[4]!, /Result excerpt \(untrusted\)/);
+  assert.ok(args[4]!.length < 700);
 });
 
 test('invalid targets and failed queue commands remain undelivered', async () => {
