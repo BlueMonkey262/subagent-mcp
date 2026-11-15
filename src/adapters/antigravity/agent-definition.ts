@@ -61,7 +61,7 @@ export interface EnsureAntigravityAgentOptions {
 }
 
 export interface EnsuredAntigravityAgent {
-  /** `<cwd>/.agents/agents/<name>.md`, the path `agy --agent <name>` reads. */
+  /** The definition path `agy` reads: `<cwd>/.agents/agents/<name>.md` or the explicit `file`. */
   readonly path: string;
   /** The template that was copied, when a copy happened. */
   readonly copiedFrom?: string;
@@ -140,12 +140,20 @@ export class FileAntigravityAgentResolver implements AntigravityAgentResolver {
       // Only seed from a template when the first candidate is absent; an existing (possibly
       // mismatched) definition must be read and reported, never replaced.
       if (!await exists(primary.path)) {
-        await ensureAntigravityAgent({
-          cwd: input.cwd,
-          name: input.name,
-          ...(input.file === undefined ? {} : { file: input.file }),
-          ...(input.installDirectory === undefined ? {} : { installDirectory: input.installDirectory }),
-        });
+        try {
+          await ensureAntigravityAgent({
+            cwd: input.cwd,
+            name: input.name,
+            ...(input.file === undefined ? {} : { file: input.file }),
+            ...(input.installDirectory === undefined ? {} : { installDirectory: input.installDirectory }),
+          });
+        } catch (error) {
+          throw new AntigravityAgentDefinitionError(
+            `Unable to prepare Antigravity agent definition ${primary.path}: ${error instanceof Error ? error.message : String(error)}`,
+            "ANTIGRAVITY_AGENT_INVALID",
+            { path: primary.path },
+          );
+        }
       }
     }
 

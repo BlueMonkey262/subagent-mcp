@@ -36,7 +36,7 @@ try {
 
 const configs = registry.listAgents().filter(config => config.backend === "antigravity");
 
-async function resolveConfig(config) {
+async function resolveConfig(config, prepare = true) {
   if (typeof config.antigravityAgent !== "string" || config.antigravityAgent.trim() === "") {
     throw new Error(`config "${config.name}" does not set antigravityAgent`);
   }
@@ -44,6 +44,7 @@ async function resolveConfig(config) {
     name: config.antigravityAgent,
     cwd,
     ...(config.antigravityAgentFile === undefined ? {} : { file: config.antigravityAgentFile }),
+    ...(prepare ? {} : { prepare: false }),
   });
 }
 
@@ -55,7 +56,7 @@ if (command === "doctor") {
   let failed = false;
   for (const config of configs) {
     try {
-      const definition = await resolveConfig(config);
+      const definition = await resolveConfig(config, false);
       console.log(JSON.stringify({
         config: config.name,
         source_path: config.sourcePath,
