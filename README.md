@@ -103,8 +103,9 @@ until the child completes or needs your approval; when it needs approval, call
   committed or not and untracked files included, against the commit it started from (for snapshot
   isolation, the snapshot, so your own uncommitted edits are not shown as the agent's). Per-file
   line counts plus a unified diff capped at `max_chars`.
-- `get_dashboard` is for status UIs (the `/subagent-mcp` panel and its poller hide it from the
-  model): live agents, the most recent finished ones (`recent`, default 10) and any that settled in
+- `get_dashboard` is for status UIs such as the `/subagent-mcp` panel and its poller (its
+  description steers the model to `list_agents`; hiding it with a `tool.list` hook would also take
+  it from the mod's own `$.mcp.call`): live agents, the most recent finished ones (`recent`, default 10) and any that settled in
   the last 15 minutes, pending approvals, recent ensembles with member states and the concurrency
   counters in one read. Pass the previous `revision` as `since` and an unchanged
   snapshot answers `{ revision, unchanged: true }`.

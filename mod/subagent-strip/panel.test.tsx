@@ -1,6 +1,7 @@
 import { expect, mock, test } from 'claude-code/testing'
 
 import { snapshotOf, transitions } from './hooks/notes'
+import { MISSING_TOOL } from './hooks/register'
 import { activityOf, splitDiff } from './hooks/panel'
 import { readDisabled, writeDisabled } from './hooks/policy'
 
@@ -277,7 +278,8 @@ test('a server without get_dashboard falls back to list_agents', async ($, on) =
   const calls: string[] = []
   on('mcp.call', (_, e) => {
     calls.push(e.tool)
-    if (e.tool === 'get_dashboard') return { value: { isError: true, content: [{ type: 'text', text: 'MCP error -32602: Tool get_dashboard not found' }] } }
+    // Claude Code's words when the connected server has no such tool (it throws them; the kit's mock answers them).
+    if (e.tool === 'get_dashboard') return { value: { isError: true, content: [{ type: 'text', text: 'subagent-strip: $.mcp.call: no connected MCP tool "get_dashboard" on a server named "subagent-mcp"' }] } }
     const body = e.tool === 'list_agents' ? { agents: [agent({ name: 'Ada', state: 'completed' })] } : {}
     return { value: { content: [{ type: 'text', text: JSON.stringify(body) }], structuredContent: body } }
   })
@@ -434,4 +436,10 @@ test('the digest is fetched again when the selected agent settles, then left alo
   await clock.advance(2000)
   expect(digests.filter(d => d === 'completed').length).toBe(settled)
   await ui.unmount()
+})
+
+test('the missing-tool check matches both the engine message and an MCP error', () => {
+  expect(MISSING_TOOL.test('subagent-strip: $.mcp.call: no connected MCP tool "get_dashboard" on a server named "subagent-mcp"')).toBe(true)
+  expect(MISSING_TOOL.test('MCP error -32602: Tool get_dashboard not found')).toBe(true)
+  expect(MISSING_TOOL.test('subagent-mcp host is restarting')).toBe(false)
 })

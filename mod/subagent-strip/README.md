@@ -19,7 +19,7 @@ Shows the active subagent-mcp agents in the status line under the prompt, one co
 - Dormant when no subagent-mcp server answers three polls in a row; it then probes once a minute.
 - The poller reads `get_dashboard` (one call, and only a revision while nothing changed), falling back to
   `list_agents` on a server that predates it (and tries `get_dashboard` again every 5 minutes, since a `/mcp`
-  reconnect can bring a newer server). A `tool.list` hook keeps `get_dashboard` from the model.
+  reconnect can bring a newer server).
 - Toasts (the `toasts` option, on by default): an agent finished or failed, an agent needs approval, an
   ensemble completed. Ensemble members are reported once, with their ensemble. These matter most in the
   desktop app, which gets no channel events (SETUP.md step 4b).
@@ -42,7 +42,7 @@ has focus:
 | `m` | message or resume the selected agent (an input row; Enter sends) |
 | `w` | remove the selected agent's managed worktree (asks first; the branch is kept) |
 | `i` | close the pane and ask Claude to run the setup interview for `.subagents/` |
-| `1`-`5` | turn a backend off or on (edits only the `disabledBackends` line of `.subagents/models.yaml`; a copy goes to `models.yaml.bak`) |
+| `1`-`7` | turn a backend off or on (edits only the `disabledBackends` line of `.subagents/models.yaml`; a copy goes to `models.yaml.bak`) |
 | `l` | show or hide older finished agents (the list keeps running agents and the 5 most recent) |
 | `v` | show the selected agent's worktree diff (`get_agent_diff`), one file at a time: `j` / `k` next / previous file, `b` back |
 | `u` | when an update is available, close the pane and ask Claude to follow `UPDATING.md` (asks first) |

@@ -56,7 +56,7 @@ const isRunning = (a: PanelAgent) => RUNNING.includes(a.state)
 const OPEN_ENSEMBLE = ['launching', 'running', 'synthesizing']
 // A server that predates get_dashboard answers with a protocol error naming the tool.
 const DASHBOARD_RETRY_MS = 5 * 60_000
-const MISSING_TOOL = /get_dashboard.*(not found|unknown)|(not found|unknown).*get_dashboard/i
+const MISSING_TOOL = /no connected MCP tool "get_dashboard"|get_dashboard.*(not found|unknown)|(not found|unknown).*get_dashboard/i
 
 /** What a running agent is doing, in a few words: its open tool call, else what it last ran. */
 export function activityOf(a: PanelAgent): string {

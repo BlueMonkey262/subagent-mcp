@@ -8,11 +8,10 @@ const ACTIVE_MS = 2000
 const DORMANT_MS = 60000
 const FAILURES_BEFORE_DORMANT = 3
 const SERVER = 'subagent-mcp'
-// get_dashboard is for this poller and the panel; the model keeps list_agents and get_ensemble.
-const HIDDEN_TOOLS = [`mcp__${SERVER}__get_dashboard`]
 // After falling back, try get_dashboard again this often: a /mcp reconnect can bring a newer server.
 const DASHBOARD_RETRY_MS = 5 * 60_000
-const MISSING_TOOL = /get_dashboard.*(not found|unknown)|(not found|unknown).*get_dashboard/i
+// Claude Code says `no connected MCP tool "get_dashboard"` for a server that predates it; an MCP error says "not found".
+export const MISSING_TOOL = /no connected MCP tool "get_dashboard"|get_dashboard.*(not found|unknown)|(not found|unknown).*get_dashboard/i
 
 type Call = { isError?: boolean; structuredContent?: unknown; content: { type: string; text?: string }[] }
 
@@ -24,11 +23,6 @@ const parse = (result: Call): Row => {
 export const register: Register = (on, options) => {
   const toasts = (options as { toasts?: unknown }).toasts !== false
   registerPanel(on)
-
-  on('tool.list', async ($, e, next) => {
-    const listed = await next(e)
-    return listed.value === undefined ? listed : { value: listed.value.filter(t => !HIDDEN_TOOLS.includes(t.name)) }
-  })
 
   on('session.start', async ($, e, next) => {
     $.ui.status(undefined)
