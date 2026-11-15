@@ -67,7 +67,8 @@ function compilePattern(raw: string): CompiledPattern {
 }
 
 /** Iterative wildcard matching, backtracking only to the most recent `*`. */
-function matchesGlob(value: string, glob: string): boolean {  const input = value.toLowerCase();
+function matchesGlob(value: string, glob: string): boolean {
+  const input = value.toLowerCase();
   let inputIndex = 0;
   let globIndex = 0;
   let starIndex = -1;

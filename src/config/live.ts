@@ -107,7 +107,9 @@ export class LiveConfig implements AgentConfigSource {
     return this.#registry !== undefined;
   }
 
-  listAgents() { return this.#require().listAgents(); }
+  listAgents() {
+    return this.#require().listAgents();
+  }
 
   resolveAgent(options: ResolveAgentOptions): ResolvedAgentConfig {
     return this.#require().resolveAgent(options);

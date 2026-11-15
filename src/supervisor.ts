@@ -79,7 +79,8 @@ import {
   FileAntigravityAgentResolver,
   type AntigravityAgentDefinition,
   type AntigravityAgentResolver,
-} from "./adapters/antigravity/agent-definition.js";import { ApprovalCoordinator } from "./approval/coordinator.js";
+} from "./adapters/antigravity/agent-definition.js";
+import { ApprovalCoordinator } from "./approval/coordinator.js";
 import type { ApprovalDecision } from "./approval/types.js";
 import { AGENT_NAMES } from "./agent-names.js";
 import type { AgentConfigSource } from "./config/registry.js";
