@@ -35,7 +35,9 @@ import type { AdapterTurn, BackendAdapter, EventOptions, ResumeRequest, SpawnReq
  * - `deny` rules always pass through as `--deny-tool`, which Copilot enforces over any allow.
  * Rules translate from the Claude-style config syntax (`Bash(git:*)`, `Read`, `Write(src/**)`) to
  * Copilot's (`shell(git:*)`, `read`, `write(src/**)`); native Copilot rules pass through unchanged
- * and untranslatable rules are dropped.
+ * and untranslatable rules are dropped. Copilot path patterns are literal paths, not globs, so a
+ * path allow rule with a glob is dropped (never widened to the whole tool) and a path deny rule
+ * with a glob denies the whole tool (fail closed).
  *
  * Copilot has no system-prompt flag, so the agent config body is prepended to the first prompt.
  */
@@ -625,6 +627,7 @@ export class CopilotAdapter implements BackendAdapter {
 export function buildCopilotArguments(
   request: Pick<SpawnRequest, "prompt" | "model" | "cwd" | "permission" | "reasoningEffort">,
   resumeId?: string,
+  warn: (message: string) => void = emitPermissionWarning,
 ): string[] {
   if (typeof request.model !== "string" || request.model.trim() === "") {
     throw new CopilotAdapterError("Copilot requires an explicit model");
@@ -644,44 +647,99 @@ export function buildCopilotArguments(
   if (request.permission.default === "allow") {
     args.push("--allow-all-tools");
   } else {
-    for (const rule of translateRules(request.permission.allow)) args.push("--allow-tool", rule);
+    for (const rule of translateRules(request.permission.allow, "allow", warn)) args.push("--allow-tool", rule);
   }
-  for (const rule of translateRules(request.permission.deny)) args.push("--deny-tool", rule);
+  for (const rule of translateRules(request.permission.deny, "deny", warn)) args.push("--deny-tool", rule);
   // `=` form so a prompt that starts with `-` is never parsed as a flag.
   args.push(`--prompt=${request.prompt}`);
   return args;
 }
 
-const NATIVE_RULE = /^(shell|write|read|url|memory)(\(.*\))?$/;
+const NATIVE_RULE = /^(shell|write|read|url|memory)(?:\((.*)\))?$/;
 const CLAUDE_RULE = /^(Bash|Read|Grep|Glob|Write|Edit|MultiEdit|NotebookEdit)(?:\((.*)\))?$/;
 
-/** Translate config permission rules to Copilot `kind(argument)` patterns; drop what has no equivalent. */
-export function translateRules(rules: readonly string[]): string[] {
+type CopilotRuleMode = "allow" | "deny";
+
+interface RuleTranslation {
+  readonly rule?: string;
+  readonly warning?: string;
+}
+
+function emitPermissionWarning(message: string): void {
+  process.emitWarning(message, { type: "CopilotPermissionWarning" });
+}
+
+/**
+ * Translate config permission rules to Copilot `kind(argument)` patterns; drop what has no
+ * equivalent. `mode` decides how an inexact path glob fails closed: an allow is dropped so the
+ * request escalates or is denied instead of being silently widened, while a deny becomes the
+ * whole-tool denial so no operation the configured deny covered can slip through.
+ */
+export function translateRules(
+  rules: readonly string[],
+  mode: CopilotRuleMode = "allow",
+  warn: (message: string) => void = emitPermissionWarning,
+): string[] {
   const translated: string[] = [];
   for (const rule of rules) {
-    const result = translateRule(rule.trim());
-    if (result !== undefined && !translated.includes(result)) translated.push(result);
+    const result = translateRule(rule.trim(), mode);
+    if (result.warning !== undefined) warn(result.warning);
+    if (result.rule !== undefined && !translated.includes(result.rule)) translated.push(result.rule);
   }
   return translated;
 }
 
-function translateRule(rule: string): string | undefined {
-  if (NATIVE_RULE.test(rule)) return rule;
+function translateRule(rule: string, mode: CopilotRuleMode): RuleTranslation {
+  const native = NATIVE_RULE.exec(rule);
+  if (native) {
+    const [, kind = "", argument] = native;
+    if ((kind === "read" || kind === "write") && argument !== undefined) {
+      return translatePathRule(kind, argument, mode, rule);
+    }
+    return { rule };
+  }
   const match = CLAUDE_RULE.exec(rule);
-  if (!match) return undefined;
+  if (!match) return {};
   const [, tool, argument] = match;
-  const arg = argument === undefined || argument === "" || argument === "*" ? undefined : argument;
   switch (tool) {
-    case "Bash":
+    case "Bash": {
       // Claude's `git *:*` and `git:*` both mean "git and anything after it"; Copilot spells it `git:*`.
-      return arg === undefined ? "shell" : `shell(${arg.replace(/\s+\*:\*$/, ":*")})`;
+      const arg = argument === undefined || argument === "" || argument === "*" ? undefined : argument;
+      return { rule: arg === undefined ? "shell" : `shell(${arg.replace(/\s+\*:\*$/, ":*")})` };
+    }
     case "Read":
     case "Grep":
     case "Glob":
-      return arg === undefined ? "read" : `read(${arg})`;
+      return translatePathRule("read", argument, mode, rule);
     default:
-      return arg === undefined ? "write" : `write(${arg})`;
+      return translatePathRule("write", argument, mode, rule);
   }
+}
+
+/**
+ * Copilot's `read(path)` / `write(path)` patterns are literal paths, not globs. The host matcher
+ * treats `*` as one path segment and `**` as any depth, so translating a glob to a bare `read` or
+ * `write` would grant more than the config allows. Fail closed instead: drop an inexact allow
+ * (the request then escalates or is denied) and widen an inexact deny to the whole tool.
+ */
+function translatePathRule(
+  kind: "read" | "write",
+  argument: string | undefined,
+  mode: CopilotRuleMode,
+  original: string,
+): RuleTranslation {
+  if (argument === undefined) return { rule: kind };
+  const inexact = argument === "" || argument === "*" || /[*?]/.test(argument) || argument.endsWith(":*");
+  if (!inexact) return { rule: `${kind}(${argument})` };
+  if (mode === "deny") {
+    return {
+      rule: kind,
+      warning: `Copilot deny rule "${original}" uses a path glob that --deny-tool cannot express; denying the whole "${kind}" tool instead (fail closed).`,
+    };
+  }
+  return {
+    warning: `Copilot allow rule "${original}" uses a path glob that --allow-tool cannot express; dropping the allow instead of widening it to the whole "${kind}" tool (fail closed).`,
+  };
 }
 
 function toolCallId(session: CopilotSession, data: Readonly<Record<string, unknown>>): string {
@@ -691,7 +749,8 @@ function toolCallId(session: CopilotSession, data: Readonly<Record<string, unkno
 }
 
 function validateRequest(request: Pick<SpawnRequest, "prompt" | "model" | "cwd" | "permission" | "reasoningEffort">): void {
-  buildCopilotArguments(request);
+  // Argument construction is the validation; warnings belong to the real launch, not the dry run.
+  buildCopilotArguments(request, undefined, () => undefined);
   if (typeof request.prompt !== "string" || request.prompt.trim() === "") {
     throw new CopilotAdapterError("Copilot requires a non-empty prompt");
   }

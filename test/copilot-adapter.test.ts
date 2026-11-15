@@ -105,12 +105,48 @@ test("buildCopilotArguments maps permission, effort and resume, and passes the p
 
 test("translateRules maps Claude-style rules, keeps native ones, and drops the rest", () => {
   assert.deepEqual(translateRules([
-    "Bash", "Bash(git:*)", "Bash(npm run *:*)", "Read", "Grep(src/**)", "Write(.env)", "Edit",
+    "Bash", "Bash(git:*)", "Bash(npm run *:*)", "Read", "Grep(src/file.txt)", "Write(.env)", "Edit",
     "shell(gh pr create)", "url(https://github.com)", "memory", "WebFetch", "mcp__x__y", "Read",
   ]), [
-    "shell", "shell(git:*)", "shell(npm run:*)", "read", "read(src/**)", "write(.env)", "write",
+    "shell", "shell(git:*)", "shell(npm run:*)", "read", "read(src/file.txt)", "write(.env)", "write",
     "shell(gh pr create)", "url(https://github.com)", "memory",
   ]);
+});
+
+test("inexact path globs are dropped from allows and deny the whole tool, never widened", () => {
+  const rules = [
+    "Write(*)", "Read(*)", "Grep(*)", "Glob(*)",
+    "Write(src/*)", "Write(src/**)", "Write(src:*)",
+    "Write(path/file.txt)", "Write", "Read",
+  ];
+  const allowWarnings: string[] = [];
+  const denyWarnings: string[] = [];
+  assert.deepEqual(translateRules(rules, "allow", (warning) => allowWarnings.push(warning)), [
+    "write(path/file.txt)", "write", "read",
+  ]);
+  assert.deepEqual(translateRules(rules, "deny", (warning) => denyWarnings.push(warning)), [
+    "write", "read", "write(path/file.txt)",
+  ]);
+  assert.equal(allowWarnings.length, 7, "every inexact allow is reported");
+  assert.equal(denyWarnings.length, 7, "every broadened deny is reported");
+  assert.ok(allowWarnings.every((warning) => /dropping the allow/.test(warning)));
+  assert.ok(denyWarnings.every((warning) => /denying the whole/.test(warning)));
+
+  assert.deepEqual(translateRules(["write(*)", "read(src/*)", "write(src/file.txt)"], "allow", () => undefined), ["write(src/file.txt)"]);
+  assert.deepEqual(translateRules(["write(*)", "read(src/*)", "write(src/file.txt)"], "deny", () => undefined), ["write", "read", "write(src/file.txt)"]);
+
+  const args = buildCopilotArguments({
+    prompt: "x",
+    model: "auto",
+    cwd: "/work",
+    permission: {
+      allow: ["Write(*)", "Write(path/file.txt)", "Write"],
+      deny: ["Write(src/*)", "Read(*)"],
+      default: "escalate",
+    },
+  }, undefined, () => undefined);
+  assert.deepEqual(args.filter((_, index) => args[index - 1] === "--allow-tool"), ["write(path/file.txt)", "write"]);
+  assert.deepEqual(args.filter((_, index) => args[index - 1] === "--deny-tool"), ["write", "read"]);
 });
 
 test("a turn stores the sessionId and maps text, tools, denials and the final message", async () => {

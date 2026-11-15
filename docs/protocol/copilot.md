@@ -80,6 +80,20 @@ Translation from the Claude-style rule syntax:
 | `shell(...)`, `write(...)`, `read(...)`, `url(...)`, `memory` | unchanged |
 | anything else (`WebFetch`, MCP tools) | dropped |
 
+Copilot's `read(path)` and `write(path)` patterns are **literal paths, not globs**. The config
+matcher treats `*` as one path segment and `**` as any depth, so a path rule with a glob cannot be
+expressed exactly. Such rules fail closed rather than widening the grant:
+
+- An `allow` path rule with a glob (`Write(*)`, `Write(src/*)`, `Write(src/**)`, `Read(*)`, ...) is
+  **dropped**. The request then escalates or is denied instead of silently allowing the whole
+  `write`/`read` tool. A warning naming the dropped rule is emitted.
+- A `deny` path rule with a glob is translated to the **whole-tool denial** (`--deny-tool write` or
+  `read`), so everything the configured rule denied stays denied. A warning is emitted for the
+  broader denial.
+
+A bare `Write`/`Read` (no parentheses) still means the whole tool. Exact paths such as
+`Write(path/file.txt)` pass through unchanged.
+
 File access is limited to the working directory and the system temp directory, which covers a
 managed worktree.
 
