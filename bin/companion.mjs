@@ -17,10 +17,12 @@ const host = new HostSession({ cwd, agentsDirectory: process.env.SUBAGENT_MCP_AG
 const rl = createInterface({ input: stdin, output: stdout });
 await host.connect();
 let dashboardUnavailable = false;
+let showOlder = false;
+let selected;
 async function dashboard(since) {
   try {
     if (dashboardUnavailable) return await host.call('list_agents', {}, 10000);
-    return await host.call('get_dashboard', since ? { since } : {}, 10000);
+    return await host.call('get_dashboard', { ...(since ? { since } : {}), recent: showOlder ? 50 : 10 }, 10000);
   }
   catch (error) {
     if (!/unknown|not found/i.test(error.message)) throw error;
@@ -34,8 +36,12 @@ function display(result) {
   console.log(`Agents (${result.agents.length}):`);
   for (const agent of result.agents) {
     const usage = agent.cumulative_usage ?? {};
-    const tokens = typeof usage.inputTokens === 'number' ? ` | ${usage.inputTokens} in / ${usage.outputTokens ?? '?'} out` : '';
-    console.log(`  ${agent.name ?? agent.agent_id} | ${agent.state ?? agent.status} | ${agent.backend ?? ''} ${agent.model ?? ''} | ${agent.current_activity ?? ''}${tokens}`);
+    const tokens = typeof usage.inputTokens === 'number' ? ` | ${usage.uncachedInputTokens ?? '?'} new / ${usage.cachedInputTokens ?? '?'} cached / ${usage.outputTokens ?? '?'} out` : '';
+    const end = ['starting', 'running', 'queued', 'needs_approval'].includes(String(agent.state ?? agent.status)) ? Date.now() : Date.parse(agent.updated_at ?? '');
+    const seconds = agent.created_at ? Math.floor((end - Date.parse(agent.created_at)) / 1000) : NaN;
+    const elapsed = Number.isFinite(seconds) ? ` | ${Math.max(0, seconds)}s` : '';
+    const mark = selected && (selected === agent.agent_id || selected === agent.name) ? '>' : ' ';
+    console.log(`${mark} ${agent.name ?? agent.agent_id} | ${agent.state ?? agent.status} | ${agent.backend ?? ''} ${agent.model ?? ''} | ${agent.current_activity ?? agent.phase ?? ''}${elapsed}${tokens}`);
   }
   if (Array.isArray(result.ensembles) && result.ensembles.length) {
     console.log('Ensembles:');
@@ -44,7 +50,7 @@ function display(result) {
       for (const member of ensemble.members ?? []) console.log(`    ${member.role}: ${member.name ?? member.agent_id ?? ''} | ${member.state}`);
     }
   }
-  if (Array.isArray(result.approvals)) for (const approval of result.approvals) console.log(`  Approval ${approval.request_id}: ${approval.name ?? approval.agent_id} ${approval.tool_name ?? ''}`);
+  if (Array.isArray(result.approvals)) for (const approval of result.approvals) console.log(`  Approval ${approval.request_id}: ${approval.name ?? approval.agent_id} ${approval.tool_name ?? ''} ${approval.command ?? ''} ${approval.reason ?? ''}`);
   if (host.warning()) console.log(`Host: ${host.warning()}`);
 }
 console.log('subagent-mcp companion. Type help for commands.');
@@ -54,7 +60,22 @@ try {
     const [cmd, arg, ...rest] = line.split(/\s+/);
     if (cmd === 'quit' || cmd === 'q') break;
     if (!cmd) continue;
-    if (cmd === 'help') { console.log('list | watch | show AGENT | digest AGENT | diff AGENT | message AGENT TEXT | stop AGENT | stop-all | cleanup AGENT | approve REQUEST allow|allow_for_session|deny | backend NAME | ensembles | setup | update | quit'); continue; }
+    if (cmd === 'help') { console.log('list | older | select AGENT | j/k | watch | show AGENT | digest AGENT | diff AGENT | message AGENT TEXT | stop AGENT | stop-all | cleanup AGENT | approve REQUEST allow|allow_for_session|deny | backend NAME | ensembles | setup | update | quit'); continue; }
+    if (cmd === 'older') { showOlder = !showOlder; try { display(await dashboard()); } catch (error) { console.error(error.message); } continue; }
+    if (cmd === 'select' && arg) { selected = arg; try { console.log(JSON.stringify(await host.call('get_agent_events', { agent: selected, summary: true }, 10000), null, 2)); } catch (error) { console.error(error.message); } continue; }
+    if (cmd === 'j' || cmd === 'k') {
+      try {
+        const board = await dashboard();
+        const agents = board.agents ?? [];
+        if (!agents.length) { console.log('No agents.'); continue; }
+        const current = agents.findIndex(a => a.agent_id === selected || a.name === selected);
+        const index = current < 0 ? 0 : Math.max(0, Math.min(agents.length - 1, current + (cmd === 'j' ? 1 : -1)));
+        selected = agents[index].agent_id ?? agents[index].name;
+        display(board);
+        if (selected) console.log(JSON.stringify(await host.call('get_agent_events', { agent: selected, summary: true }, 10000), null, 2));
+      } catch (error) { console.error(error.message); }
+      continue;
+    }
     if (cmd === 'watch') {
       let running = true, pending = false, revision;
       const refresh = async () => {
@@ -70,8 +91,15 @@ try {
       finally { running = false; clearInterval(timer); }
       continue;
     }
-    if (cmd === 'setup') { console.log(`Ask your main agent to follow ${resolve(root, 'SETUP.md')} and help configure this project.`); continue; }
-    if (cmd === 'update') { console.log(`Ask your main agent to follow ${resolve(root, 'UPDATING.md')}.`); continue; }
+    if (cmd === 'setup') { console.log(`Copy into Codex: Run the subagent-mcp setup interview for this project. Follow ${resolve(root, 'SETUP.md')}; inspect available models and agent configs, ask my preferences, and propose configuration changes before writing them.`); continue; }
+    if (cmd === 'update') {
+      let info;
+      try { info = JSON.parse(await readFile(resolve(cwd, '.subagents/memory/update.json'), 'utf8')); }
+      catch { console.log('Update availability is unknown; the host has not provided a readable update check.'); continue; }
+      if (!info.available) { console.log('No update is reported as available.'); continue; }
+      console.log(`Copy into Codex: Update subagent-mcp${typeof info.latest === 'string' ? ` to ${info.latest}` : ''} by following ${resolve(root, 'UPDATING.md')} step by step; verify in a separate worktree first and stop on failure.`);
+      continue;
+    }
     if (cmd === 'stop-all') {
       try {
         const board = await dashboard();
@@ -125,7 +153,14 @@ try {
     try {
       const result = method === 'get_dashboard' ? await dashboard() : await host.call(method, input, 10000);
       if (method === 'get_dashboard') display(result);
-      else console.log(JSON.stringify(result, null, 2));
+      else if (cmd === 'diff' && typeof result.patch === 'string' && stdout.isTTY) {
+        const pages = result.patch.match(/[\s\S]{1,4000}/g) ?? ['No changes.'];
+        for (let i = 0; i < pages.length; i++) {
+          console.log(pages[i]);
+          if (i + 1 < pages.length && (await rl.question(`Page ${i + 1}/${pages.length}; Enter for next, q to stop: `)).trim().toLowerCase() === 'q') break;
+        }
+        if (result.truncated) console.log('Diff was truncated by the host.');
+      } else console.log(JSON.stringify(result, null, 2));
     } catch (error) { console.error(error.message); }
   }
 } catch (error) { if (error.code !== 'ERR_USE_AFTER_CLOSE') console.error(error.message); }
