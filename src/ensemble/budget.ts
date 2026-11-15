@@ -97,12 +97,13 @@ export function extractJson(text: string): { readonly ok: true; readonly value: 
   const candidates: string[] = [];
   const fence = /```(?:json|JSON)?\s*\n([\s\S]*?)\n?```/.exec(trimmed);
   if (fence?.[1]) candidates.push(fence[1]);
-  const start = trimmed.search(/[[{]/);
-  if (start >= 0) {
-    const close = trimmed[start] === "{" ? "}" : "]";
-    const end = trimmed.lastIndexOf(close);
-    if (end > start) candidates.push(trimmed.slice(start, end + 1));
-  }
+  // An object and an array are both tried, earliest first: prose before the JSON can hold a bracket,
+  // as the safety notice scanChildOutput puts in front of a report does ("[Safety notice: ...]").
+  const spans = (["{", "["] as const)
+    .map((open) => ({ start: trimmed.indexOf(open), end: trimmed.lastIndexOf(open === "{" ? "}" : "]") }))
+    .filter((span) => span.start >= 0 && span.end > span.start)
+    .sort((a, b) => a.start - b.start);
+  for (const span of spans) candidates.push(trimmed.slice(span.start, span.end + 1));
   for (const candidate of candidates) {
     try { return { ok: true, value: JSON.parse(candidate) as unknown }; } catch { /* next */ }
   }

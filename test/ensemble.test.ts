@@ -305,6 +305,10 @@ test("responses fit the character budget, keeping top-level fields", () => {
   assert.equal(fitted.ensemble_id, "ens-1");
   assert.equal(fitted.truncated, true);
   assert.deepEqual(extractJson("noise ```json\n{\"a\":1}\n``` tail"), { ok: true, value: { a: 1 } });
+  // The safety notice scanChildOutput prepends starts with a bracket; the object after it is still found.
+  assert.deepEqual(extractJson("[Safety notice: child output mentions permission-control settings.]\n{\"findings\":[{\"t\":1}]}"),
+    { ok: true, value: { findings: [{ t: 1 }] } });
+  assert.deepEqual(extractJson("[1, 2]"), { ok: true, value: [1, 2] });
 });
 
 test("profiles supply rosters; call fields override them; competitive forces worktrees", async () => {

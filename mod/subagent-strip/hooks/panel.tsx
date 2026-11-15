@@ -187,6 +187,8 @@ export const registerPanel = (on: On) => {
     const mine = ++epoch
     // `/subagent-mcp widget` asks the desktop app for the small floating form; other surfaces ignore it.
     const widget = e.args.trim() === 'widget'
+    // Opening starts on the list, not a diff or question left from the last time the pane was open.
+    await update($, panel, s => ({ ...s, diff: null, confirm: null }))
     const opened = await $.ui.open({ id: PANE, title: 'Subagents', closeOnEscape: true, rows: 16, ...(widget ? { placement: 'widget' as const } : { focus: true as const }) })
 
     const refresh = async () => {

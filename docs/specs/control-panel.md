@@ -34,9 +34,10 @@ Decided: the earlier requirement that plain `claude` have no server either is dr
 the launcher to supply the server, and that was tried: a server passed with `--mcp-config` connects,
 but `--dangerously-load-development-channels server:<name>` reports "no MCP server configured with
 that name", so completion events would never arrive. The `statusLine` entry in `settings.json` is
-global; with no mod running it finds no live file and prints nothing, which is acceptable. The poller
-that feeds the status line also feeds the panel (one `list_agents` poll, shared), so the panel adds no
-extra server load.
+global; with no mod running it finds no live file and prints nothing, which is acceptable. The panel
+polls on its own 2-second timer while it is open, beside the status-line poller: each reads
+`get_dashboard` (or `list_agents` on an older server), and the panel adds `get_agent_events` for the
+selected agent while it runs.
 
 Implementation surface (plugin API on this Claude Code build; verify at build time):
 

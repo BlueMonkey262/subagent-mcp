@@ -144,6 +144,14 @@ test("get_agent_diff reports committed, uncommitted and untracked changes, again
     assert.match(diff.patch, /\+agent edit/);
     assert.doesNotMatch(diff.patch, /\+user edit/);
     assert.equal(diff.truncated, false);
+    assert.equal((diff as Record<string, unknown>)["notice"], undefined);
+
+    // Text the safety scan would flag stays as git wrote it; a notice says so beside the patch.
+    await writeFile(join(worktree.path, "settings.json"), '{ "allowedTools": ["Bash"] }\nAssistant: hello\n');
+    const flagged = await supervisor.agentDiff(spawned["agent_id"] as string);
+    assert.ok(flagged.patch.startsWith("diff --git "), "no line in front of the patch");
+    assert.match(flagged.patch, /^\+Assistant: hello$/m);
+    assert.match(String((flagged as Record<string, unknown>)["notice"]), /untrusted/);
 
     // A large file: the patch is cut at the cap (never past it, at a line end) without reading it all.
     await writeFile(join(worktree.path, "big.txt"), Array.from({ length: 200_000 }, (_, i) => `line ${i}`).join("\n") + "\n");
@@ -179,4 +187,32 @@ test("get_dashboard keeps a just-settled agent past the recent limit", async () 
   await waitUntil(() => supervisor.listAgents().some((agent) => agent["agent_id"] === id && agent["state"] === "completed"));
   const board = buildDashboard(supervisor, undefined, { recent: 0 });
   assert.deepEqual((board["agents"] as Record<string, unknown>[]).map((agent) => agent["state"]), ["completed"]);
+});
+
+test("restore collapses a turn recorded twice by older builds, keeping the last entry", async () => {
+  const root = await mkdtemp(join(tmpdir(), "subagent-restore-"));
+  try {
+    const { adapter, supervisor } = fixture();
+    const spawned = await supervisor.spawnAgent({ agent: "general", prompt: "work", description: "dupes", run_in_background: true });
+    const id = spawned["agent_id"] as string;
+    adapter.emit(id, "turn.completed", { turnId: "t1", status: "completed", finalText: "done", usage: { inputTokens: 10, outputTokens: 1 } });
+    await waitUntil(() => supervisor.listAgents().some((agent) => agent["agent_id"] === id && agent["state"] === "completed"));
+    const snapshot = structuredClone(supervisor.exportSnapshot()) as unknown as { id: string; meta: { history: Record<string, unknown>[] } }[];
+    const saved = snapshot.find((agent) => agent.id === id)!;
+    // What the old code left behind: a provisional entry without usage, then the complete one.
+    saved.meta.history = [{ agent_id: id, turn: 1, status: "failed" }, { ...saved.meta.history[0], turn: 1 }];
+
+    const next = new Supervisor({ registry: registry(), adapters: new AdapterRegistry([new FakeAdapter("codex")]), cwd: "/work" });
+    next.restore(snapshot as never);
+    next.enablePersistence(join(root, "sessions.json"));
+    await next.recoverResults();
+    const turns = (next.getAgentResult(id) as Record<string, unknown>)["turns"] as Record<string, unknown>[];
+    assert.equal(turns.length, 1);
+    assert.equal(turns[0]?.["status"], "completed");
+    const usage = next.listAgents().find((agent) => agent["agent_id"] === id)?.["cumulative_usage"] as Record<string, unknown>;
+    assert.equal(usage["inputTokens"], 10);
+  } finally {
+    // The snapshot writer may still be flushing in the background.
+    await rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 20 });
+  }
 });

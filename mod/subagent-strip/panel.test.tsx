@@ -316,7 +316,15 @@ test('v shows the selected agent\'s worktree diff one file at a time, and b goes
   expect(await ui.find({ type: 'Text', text: /new\.txt \(2\/2\)/ })).toBeTruthy()
   await ui.press({ key: 'diff-back' })
   expect(await ui.find({ key: 'agent-id-Ada' })).toBeTruthy()
+
+  // Left open on a diff, the pane reopens on the list.
+  await ui.press({ key: 'diff' })
   await ui.unmount()
+  await $.command.run({ command: 'subagent-mcp', args: '' })
+  const again = await $.ui.mount(PANE)
+  expect(await again.find({ key: 'agent-id-Ada' })).toBeTruthy()
+  expect(await again.find({ key: 'diff-back' })).toBeFalsy()
+  await again.unmount()
 })
 
 test('no diff key for an agent without a worktree', async ($, on) => {

@@ -35,9 +35,14 @@ command -v claude >/dev/null || { echo "subagent-mcp: 'claude' not found on PATH
 # Load the status-line mod (append to any existing plugin dirs), unless it is already listed: the
 # desktop app setup in SETUP.md puts the same folder in ~/.claude/settings.json.
 MOD="$ROOT/mod/subagent-strip"
-case ":${CLAUDE_CODE_PLUGIN_DIRS:-}:" in
-*":$MOD:"*) ;;
-*) export CLAUDE_CODE_PLUGIN_DIRS="$MOD${CLAUDE_CODE_PLUGIN_DIRS:+:$CLAUDE_CODE_PLUGIN_DIRS}" ;;
-esac
+MOD_REAL="$(cd "$MOD" && pwd -P)"
+listed=0
+IFS=':' read -r -a plugin_dirs <<< "${CLAUDE_CODE_PLUGIN_DIRS:-}"
+for dir in ${plugin_dirs[@]+"${plugin_dirs[@]}"}; do
+    # Compare physical paths, so a trailing slash, ~ or a symlinked checkout still counts as listed.
+    dir="${dir/#\~/$HOME}"
+    [ "$(cd "$dir" 2>/dev/null && pwd -P)" = "$MOD_REAL" ] && listed=1
+done
+[ "$listed" = 1 ] || export CLAUDE_CODE_PLUGIN_DIRS="$MOD${CLAUDE_CODE_PLUGIN_DIRS:+:$CLAUDE_CODE_PLUGIN_DIRS}"
 
 exec claude --dangerously-load-development-channels server:subagent-mcp "$@"
