@@ -507,12 +507,18 @@ against the repository, tests, and the operator's actual request.
   the reconnecting proxy replaces the host only when it runs *older* code, is idle, and no other
   Claude Code session is attached. Agent records, results and usage carry over, and queued or
   scheduled tasks plus undelivered pings are preserved and re-armed. A host running
-  newer code than the proxy is never downgraded; tool responses then carry a `host_warning` to
-  reconnect. When agents are running or another session is attached, the old host is kept and the
-  `host_warning` says so; `restart_host` then reloads it once agents finish. `restart_host` is
-  always refused while agents are running or waiting, and also refused when the host already runs
-  the code on disk or other sessions are attached, unless called with `force: true`. Changes to
-  tool definitions need the `/mcp` reconnect either way.
+  newer code than the proxy is never downgraded. When agents are running or another session is
+  attached, the old host is kept and the `host_warning` says so; `restart_host` then reloads it
+  once agents finish. `restart_host` is always refused while agents are running or waiting, and
+  also refused when the host already runs the code on disk or other sessions are attached, unless
+  called with `force: true`.
+- **Tool definitions follow the host.** The tools are defined once (`src/tool-catalog.ts`). The host
+  serves them (`tool_catalog`) and checks every call's arguments against them; the proxy lists the
+  connected host's catalog and sends `notifications/tools/list_changed` when a host on a new build
+  brings different tools, so new tools appear without `/mcp`. A proxy whose host was restarted by
+  another session reconnects on its next call. A host that predates `tool_catalog` (older than this
+  proxy) gets the proxy's own tools; a proxy that predates it (connected to a newer host) still
+  needs one `/mcp` reconnect to become a proxy that refreshes.
 
 ## Update notifications
 

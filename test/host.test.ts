@@ -715,6 +715,88 @@ test("the host runs ensembles over the socket, strips forged membership and push
   }
 });
 
+async function configuredCwd(prefix: string): Promise<string> {
+  const cwd = await mkdtemp(join(tmpdir(), prefix));
+  const agents = join(cwd, ".subagents");
+  await mkdir(agents, { recursive: true });
+  await writeFile(join(agents, "models.yaml"), "models:\n  claude: []\n  codex: [fake-model]\n  opencode: []\n  antigravity: []\n  cursor: []\n");
+  await writeFile(join(agents, "general.md"), "---\nname: general\nbackend: codex\nmodel: fake-model\ndescription: General agent\n---\nWork.\n");
+  return cwd;
+}
+
+test("the host serves its tool catalog and rejects arguments that do not match it", { timeout: 20_000 }, async () => {
+  const cwd = await configuredCwd("subagent-host-catalog-");
+  let client: HostClient | undefined;
+  try {
+    client = await connectHost(daemonOptions(cwd));
+    const catalog = await client.call("tool_catalog") as { build: string; tools: { name: string; inputSchema: { type: string } }[] };
+    assert.equal(typeof catalog.build, "string");
+    assert.ok(catalog.tools.some((tool) => tool.name === "get_dashboard" && tool.inputSchema.type === "object"));
+    await assert.rejects(client.call("list_agents", { limit: 0 }), /Invalid arguments for list_agents/);
+    assert.deepEqual((await client.call("list_agents", { limit: 5 }) as { agents: unknown[] }).agents, []);
+  } finally {
+    client?.close();
+    await stopDaemon(cwd);
+  }
+});
+
+test("a session whose host another session restarted reconnects on its next call", { timeout: 30_000 }, async () => {
+  const cwd = await configuredCwd("subagent-host-rejoin-");
+  const options = daemonOptions(cwd);
+  const first = new HostSession(options);
+  const second = new HostSession(options);
+  let attaches = 0;
+  first.onAttach(() => { attaches += 1; });
+  try {
+    await first.connect();
+    const before = await first.call("hello") as { pid: number };
+    await second.connect();
+    await second.restart(true);
+    // Several calls at once after the drop share one reconnect.
+    const hellos = await Promise.all([first.call("hello"), first.call("hello"), first.call("hello")]) as { pid: number; clients: number }[];
+    const after = hellos[0]!;
+    assert.notEqual(after.pid, before.pid, "talking to the new host");
+    assert.ok(hellos.every((hello) => hello.pid === after.pid));
+    assert.equal(attaches, 2, "one reconnect, and it counts as an attach, so the tool list is checked again");
+    assert.equal((await second.call("hello") as { clients: number }).clients, 2, "no orphaned extra connection");
+  } finally {
+    first.close();
+    second.close();
+    await stopDaemon(cwd);
+  }
+});
+
+test("the MCP server lists the catalog, forwards calls, and reports bad arguments as tool errors", { timeout: 30_000 }, async () => {
+  const cwd = await configuredCwd("subagent-host-mcp-");
+  const { Client } = await import("@modelcontextprotocol/sdk/client/index.js");
+  const { StdioClientTransport } = await import("@modelcontextprotocol/sdk/client/stdio.js");
+  const { TOOL_CATALOG } = await import("../src/tool-catalog.js");
+  const client = new Client({ name: "test", version: "0" });
+  const transport = new StdioClientTransport({ command: process.execPath, args: [serverPath], cwd, env: { ...process.env, SUBAGENT_MCP_UPDATE_CHECK: "0" } as Record<string, string> });
+  try {
+    await client.connect(transport);
+    const listed = await client.listTools();
+    assert.deepEqual(listed.tools.map((tool) => tool.name).sort(), TOOL_CATALOG.map((tool) => tool.name).sort());
+    const spawn = listed.tools.find((tool) => tool.name === "spawn_agent")!;
+    assert.ok((spawn.inputSchema.required as string[]).includes("prompt"));
+    const ok = await client.callTool({ name: "list_agents", arguments: { limit: 3 } }) as { isError?: boolean; content: { text: string }[] };
+    assert.notEqual(ok.isError, true);
+    assert.deepEqual(JSON.parse(ok.content[0]!.text).agents, []);
+    const bad = await client.callTool({ name: "list_agents", arguments: { limit: 0 } }) as { isError?: boolean; content: { text: string }[] };
+    assert.equal(bad.isError, true);
+    assert.match(bad.content[0]!.text, /Invalid arguments for list_agents/);
+    const missing = await client.callTool({ name: "no_such_tool", arguments: {} }) as { isError?: boolean };
+    assert.equal(missing.isError, true);
+    // restart_host is answered by the front end, so the front end checks its arguments.
+    const restart = await client.callTool({ name: "restart_host", arguments: { force: "yes" } }) as { isError?: boolean; content: { text: string }[] };
+    assert.equal(restart.isError, true);
+    assert.match(restart.content[0]!.text, /Invalid arguments for restart_host/);
+  } finally {
+    await client.close().catch(() => undefined);
+    await stopDaemon(cwd);
+  }
+});
+
 test("list_models names the models.yaml the host loaded", async () => {
   const cwd = await mkdtemp(join(tmpdir(), "subagent-host-"));
   const supervisor = new Supervisor({ registry: registry(), adapters: new AdapterRegistry([new FakeAdapter("codex")]), cwd });

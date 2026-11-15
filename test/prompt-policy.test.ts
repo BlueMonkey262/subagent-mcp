@@ -45,8 +45,9 @@ test("the public delegation surface carries the same trust-boundary reminder", a
   assert.match(ORCHESTRATOR_AUTHORITY_NOTICE, /hard fact/);
   assert.match(ORCHESTRATOR_AUTHORITY_NOTICE, /Only the operator/);
 
-  const serverSource = await readFile(join(root, "src/server.ts"), "utf8");
-  assert.match(serverSource, /ORCHESTRATOR_AUTHORITY_NOTICE/);
+  const { TOOL_CATALOG } = await import("../src/tool-catalog.js");
+  const spawn = TOOL_CATALOG.find((tool) => tool.name === "spawn_agent");
+  assert.ok(spawn?.description.includes(ORCHESTRATOR_AUTHORITY_NOTICE), "spawn_agent's description carries the notice");
 
   const readme = await readFile(join(root, "README.md"), "utf8");
   assert.match(readme, /Subagent messages, reports, events, and approval/);

@@ -1,4 +1,5 @@
 import { buildDashboard } from "./dashboard.js";
+import { catalogJson, validateToolInput } from "./tool-catalog.js";
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { readdirSync, readFileSync, realpathSync, statSync } from "node:fs";
@@ -116,6 +117,8 @@ export function hostDisposition(hello: HostHello, local: BuildInfo): HostDisposi
 }
 
 const IDLE_EXIT_MS = 60_000;
+/** After a failed first connection, how long a tool call waits before trying the host again. */
+const RECONNECT_RETRY_MS = 30_000;
 const CONNECT_WAIT_MS = 8_000;
 const RECORDED_HOST_WAIT_MS = 2_000;
 /** Bound on re-flushing pings that were enqueued while an attach_session was already flushing. */
@@ -446,10 +449,40 @@ export class HostSession {
   #attachFailureLogged = false;
   readonly #detached: ((data: Readonly<Record<string, unknown>>) => void)[] = [];
   readonly #ensemble: ((data: Readonly<Record<string, unknown>>) => void)[] = [];
+  /** Front-end listeners run on every (re)connection; not to be confused with `#attached` (ping-consumer state). */
+  readonly #onConnect: (() => void)[] = [];
+  /** One reconnect at a time: concurrent calls after a drop share it instead of each opening a socket. */
+  #reconnecting: Promise<void> | undefined;
+  #lastAttempt = 0;
 
   constructor(readonly options: Parameters<typeof connectHost>[0]) {}
 
+  /** Called after every (re)connection to a host, which may run a different build than before. */
+  onAttach(listener: () => void): void {
+    this.#onConnect.push(listener);
+  }
+
+  /** The connected host's build id, if it reported one. */
+  hostBuild(): string | undefined {
+    return this.#client?.host?.build;
+  }
+
+  #reconnect(): Promise<void> {
+    this.#reconnecting ??= (async () => {
+      this.#lastAttempt = Date.now();
+      try {
+        this.#attach(await connectHost(this.options));
+      } catch (error) {
+        this.#fail(error);
+      } finally {
+        this.#reconnecting = undefined;
+      }
+    })();
+    return this.#reconnecting;
+  }
+
   async connect(): Promise<void> {
+    this.#lastAttempt = Date.now();
     try {
       this.#attach(await connectHost(this.options));
     } catch (error) {
@@ -484,6 +517,12 @@ export class HostSession {
   }
 
   async call(method: string, params?: unknown, timeoutMs = 0): Promise<unknown> {
+    // Another session's restart_host (or a crash) closes the socket; connect to the host that is up now
+    // instead of failing every call until the user reconnects with /mcp.
+    // A first connection that failed is tried again too, at most every RECONNECT_RETRY_MS.
+    const lost = this.#client?.closed === true;
+    const neverUp = this.#client === undefined && Date.now() - this.#lastAttempt >= RECONNECT_RETRY_MS;
+    if (lost || neverUp) await this.#reconnect();
     const client = this.#client;
     if (client === undefined) {
       throw this.#error ?? new Error("subagent-mcp host is not connected. Ask the user to run `/mcp` and then reconnect subagent-mcp.");
@@ -495,6 +534,13 @@ export class HostSession {
       void this.#startAttach(client).catch(() => undefined);
     }
     return result;
+  }
+
+  /** The connected host runs a newer build than this proxy. */
+  hostIsNewer(): boolean {
+    const host = this.#client?.host;
+    const local = buildInfo();
+    return host !== undefined && host.build !== local.build && typeof host.builtAt === "number" && host.builtAt > local.builtAt;
   }
 
   /** Why the connected host's code differs from this proxy's, if it does. */
@@ -566,12 +612,17 @@ export class HostSession {
   }
 
   #attach(client: HostClient): void {
+    // A replaced client must not keep delivering events (or count as another session at the host).
+    if (this.#client !== undefined && this.#client !== client) this.#client.close();
     this.#client = client;
     this.#error = undefined;
     this.#attached = false;
     this.#attachInFlight = undefined;
     for (const listener of this.#detached) client.onDetached(listener);
     for (const listener of this.#ensemble) client.onEnsemble(listener);
+    // #18's listeners (refresh the served catalog after a reconnect/restart) ...
+    for (const listener of this.#onConnect) listener();
+    // ... and main's ping-consumer re-attach, which retries on this new connection.
     if (this.#wantsAttach) {
       // The replacement host restored queued pings; consume them on this connection too.
       void this.#startAttach(client).catch(() => undefined);
@@ -866,6 +917,11 @@ export class HostClient {
   /** The host's `hello` when this client connected: its build, and whether it was kept as stale or newer. */
   host: HostHello | undefined;
 
+  /** The socket closed (the host exited or restarted); calls fail until a new client connects. */
+  get closed(): boolean {
+    return this.#closed;
+  }
+
   static connect(socketPath: string, timeoutMs = 5_000): Promise<HostClient> {
     return new Promise((resolve, reject) => {
       const socket = createConnection(socketPath);
@@ -1002,7 +1058,8 @@ async function handleLine(
     const result = await dispatch(supervisor, method, request["params"], context);
     socket.write(`${JSON.stringify({ id, result })}\n`);
     // A client that makes tool calls has its listeners attached: retry events no one was connected to receive.
-    if (method !== "hello" && method !== "shutdown") void context.ensembles?.deliverPending();
+    // tool_catalog is a front end's own startup read, before its MCP client is listening, so it doesn't count.
+    if (method !== "hello" && method !== "shutdown" && method !== "tool_catalog") void context.ensembles?.deliverPending();
     if (method === "shutdown") setTimeout(onShutdown, 30);
   } catch (error) {
     const body = error instanceof Error
@@ -1029,10 +1086,16 @@ interface DispatchContext {
 }
 
 async function dispatch(supervisor: Supervisor, method: string, params: unknown, context: DispatchContext): Promise<unknown> {
-  const input = isRecord(params) ? params : {};
+  // Front ends that list this host's catalog forward calls without checking them, so the host does.
+  // Methods that are not catalog tools (hello, attach_session, shutdown, tool_catalog) pass through.
+  const checked = validateToolInput(method, isRecord(params) ? params : {});
+  if (!checked.ok) throw new Error(checked.error);
+  const input = isRecord(checked.value) ? checked.value : {};
   // A stale backend process must not keep the host "busy" for restart/idle decisions.
   supervisor.checkLiveness();
   switch (method) {
+    case "tool_catalog":
+      return { build: HOST_BUILD.build, tools: catalogJson() };
     case "hello":
       return {
         protocol: HOST_PROTOCOL,
