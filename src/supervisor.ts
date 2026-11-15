@@ -759,7 +759,6 @@ export class Supervisor {
     try { this.#assertModelAllowed(record.backend, record.model); } catch (error) { record.release(); throw error; }
     record.state = "running";
     record.timedOut = false;
-    delete record.lastError;
     record.detached = input.run_in_background === true;
     delete record.result;
     record.updatedAt = new Date().toISOString();
@@ -797,6 +796,9 @@ export class Supervisor {
     record.meta.turn += 1;
     delete record.result;
     delete record.usage;
+    // A new turn starts clean: an error from the previous turn (for example a permission denial)
+    // must not stick to this resume, including when #pump delivers a queued message.
+    delete record.lastError;
     delete record.meta.structured;
     delete record.meta.validation_errors;
     await adapter.resume({
