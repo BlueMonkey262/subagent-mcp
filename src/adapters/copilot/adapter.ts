@@ -483,23 +483,29 @@ export class CopilotAdapter implements BackendAdapter {
     turn.interruptRequested = true;
     turn.interruptPromise = (async () => {
       signalProcessGroup(session.child, "SIGTERM");
-      await new Promise<void>((resolve) => {
-        if (turn.terminal) return resolve();
-        const timer = setTimeout(() => resolve(), this.#options.interruptGraceMs);
-        const check = setInterval(() => {
-          if (turn.terminal) {
-            clearTimeout(timer);
-            clearInterval(check);
-            resolve();
-          }
-        }, 20);
-      });
-      if (!turn.terminal) {
+      // Turn completion is not process exit: Copilot can emit `result` and keep running while it
+      // saves the session. Wait for the process to close; escalate to SIGKILL if it does not.
+      if (!await this.#waitForClose(session, this.#options.interruptGraceMs)) {
         signalProcessGroup(session.child, "SIGKILL");
+        await this.#waitForClose(session, this.#options.interruptGraceMs);
+      }
+      if (!turn.terminal) {
         this.#completeTurn(session, turn.timedOut ? "failed" : "interrupted");
       }
     })();
     return turn.interruptPromise;
+  }
+
+  /** Resolve true when the process closes, or false when `timeoutMs` elapses first. */
+  async #waitForClose(session: CopilotSession, timeoutMs: number): Promise<boolean> {
+    if (session.closed.settled) return true;
+    let timer: NodeJS.Timeout | undefined;
+    const closed = await Promise.race([
+      session.closed.promise.then(() => true),
+      new Promise<boolean>((resolve) => { timer = setTimeout(() => resolve(false), timeoutMs); }),
+    ]);
+    if (timer) clearTimeout(timer);
+    return closed;
   }
 
   #completeTurn(

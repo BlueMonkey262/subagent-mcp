@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { existsSync, readFileSync } from "node:fs";
 import { mkdtemp, readFile, realpath } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -79,6 +80,15 @@ async function waitUntil(predicate: () => boolean, timeoutMs = 4_000): Promise<v
   while (!predicate()) {
     if (Date.now() > deadline) throw new Error("Timed out waiting for condition");
     await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+}
+
+function processIsAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
   }
 }
 
@@ -239,6 +249,30 @@ test("stop_agent interrupts the process group once, without reporting a process 
     assert.equal(events.find((event) => event.type === "turn.completed")?.data.status, "interrupted");
     assert.ok(!events.some((event) => event.type === "error"), "a deliberate stop is not a process fault");
   } finally {
+    await adapter.closeAll();
+  }
+});
+
+test("interrupt SIGKILLs a child that emits a result but keeps running after SIGTERM", async () => {
+  const cwd = await realpath(await mkdtemp(path.join(os.tmpdir(), "copilot-adapter-sigterm-result-")));
+  const pidFile = path.join(cwd, "child.pid");
+  const adapter = fixtureAdapter({ COPILOT_FIXTURE_PID: pidFile });
+  let pid: number | undefined;
+  try {
+    const turn = await adapter.spawn(spawnRequest(cwd, "SIGTERM_RESULT"));
+    await waitUntil(() => existsSync(pidFile));
+    pid = Number(readFileSync(pidFile, "utf8"));
+    assert.ok(processIsAlive(pid), "the fixture starts alive");
+
+    await adapter.interrupt(turn.agentId);
+
+    // The result marked the turn terminal, but the process ignored SIGTERM: interrupt must kill it.
+    await waitUntil(() => !processIsAlive(pid as number));
+    const events = await eventsThrough(adapter, turn.agentId, (event) => event.type === "turn.completed");
+    assert.equal(events.filter((event) => event.type === "turn.completed").length, 1);
+    assert.equal(events.find((event) => event.type === "turn.completed")?.data.status, "interrupted");
+  } finally {
+    if (pid !== undefined && processIsAlive(pid)) process.kill(pid, "SIGKILL");
     await adapter.closeAll();
   }
 });

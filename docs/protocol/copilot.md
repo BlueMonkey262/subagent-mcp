@@ -106,6 +106,8 @@ your Copilot plan and model settings allow will run; an unavailable model fails 
 
 ## Interruption
 
-`stop_agent` sends SIGTERM to the process group, waits a short grace interval for the process to
-exit, then sends SIGKILL and reports the turn `interrupted`. A turn timeout does the same and
-reports `failed` with a `COPILOT_TURN_TIMEOUT` error.
+`stop_agent` sends SIGTERM to the process group and waits for the **process to close** (not merely
+for the turn's `result`, since Copilot can emit `result` and keep running while it saves). If the
+process is still alive after the grace interval, the adapter sends SIGKILL and waits a bounded time
+for close, then reports the turn `interrupted`. A turn timeout does the same and reports `failed`
+with a `COPILOT_TURN_TIMEOUT` error.

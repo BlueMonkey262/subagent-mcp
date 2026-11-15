@@ -5,6 +5,7 @@ import { existsSync, rmSync, writeFileSync } from "node:fs";
 // Behavior is selected by keywords in the prompt.
 
 const invocation = process.env.COPILOT_FIXTURE_INVOCATION;
+const pidFile = process.env.COPILOT_FIXTURE_PID;
 const args = process.argv.slice(2);
 
 function optionValue(name) {
@@ -24,6 +25,8 @@ const prompt = optionValue("--prompt") ?? "";
 const resumed = optionValue("--resume");
 const sessionId = resumed ?? process.env.COPILOT_FIXTURE_SESSION_ID ?? "44444444-4444-4444-8444-444444444444";
 const model = optionValue("--model") ?? "auto";
+
+if (pidFile) writeFileSync(pidFile, String(process.pid));
 
 if (invocation) {
   writeFileSync(invocation, JSON.stringify({
@@ -93,7 +96,7 @@ if (prompt.includes("STARTUP_ERROR")) {
     setInterval(() => {}, 1_000);
   } else if (prompt.includes("EXIT_EARLY")) {
     finish(17);
-  } else if (prompt.includes("HANG")) {
+  } else if (prompt.includes("HANG") || prompt.includes("SIGTERM_RESULT")) {
     send("assistant.message", { messageId: "m-0", content: "working on it", toolRequests: [], turnId: "0" });
     setInterval(() => {}, 1_000);
   } else if (prompt.includes("MODEL_UNAVAILABLE")) {
@@ -139,5 +142,16 @@ if (prompt.includes("STARTUP_ERROR")) {
   }
 }
 
-process.on("SIGTERM", () => process.exit(0));
+let sigtermResultSent = false;
+process.on("SIGTERM", () => {
+  if (prompt.includes("SIGTERM_RESULT")) {
+    // Emit `result` on SIGTERM but ignore the signal and stay alive; only SIGKILL ends this process.
+    if (!sigtermResultSent) {
+      sigtermResultSent = true;
+      result(0);
+    }
+    return;
+  }
+  process.exit(0);
+});
 process.on("SIGINT", () => process.exit(0));
