@@ -46,3 +46,8 @@ models:
     # `auto` is the CLI default; effort is folded into the id (e.g. grok-4.7-high).
     - name: auto
       description: Cursor Agent CLI default model routing (`agent --list-models` for the full roster).
+  copilot:
+    # GitHub Copilot CLI model ids as `copilot --model` accepts them. Which ones run depends on your
+    # Copilot plan and model settings; `auto` routes to a model your plan allows.
+    - name: auto
+      description: Copilot routes each request to a model your plan allows (rejects effort).

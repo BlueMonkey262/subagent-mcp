@@ -87,5 +87,5 @@ test("the environment forces the Claude switch and adds to the block lists", () 
   assert.deepEqual(merged.disabledBackends, ["cursor", "antigravity"]);
   assert.deepEqual(merged.blockModels, ["*grok*", "codex:gpt-5.6-sol"]);
   assert.throws(() => applyPolicyEnv(OPEN_POLICY, { [BLOCK_CLAUDE_MODELS_ENV]: "maybe" }), /must be 1\/true or 0\/false/);
-  assert.throws(() => applyPolicyEnv(OPEN_POLICY, { [DISABLED_BACKENDS_ENV]: "copilot" }), /"copilot" is not a backend/);
+  assert.throws(() => applyPolicyEnv(OPEN_POLICY, { [DISABLED_BACKENDS_ENV]: "windsurf" }), /"windsurf" is not a backend/);
 });

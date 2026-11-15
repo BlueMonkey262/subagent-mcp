@@ -308,8 +308,8 @@ Work.
   });
   await writeFile(models, `blockClaudeModels: "yes"\n${roster}`);
   await assert.rejects(load(), /blockClaudeModels must be true or false/);
-  await writeFile(models, `disabledBackends: [copilot]\n${roster}`);
-  await assert.rejects(load(), /"copilot" is not a backend/);
+  await writeFile(models, `disabledBackends: [windsurf]\n${roster}`);
+  await assert.rejects(load(), /"windsurf" is not a backend/);
   await writeFile(models, `blockModels: grok\n${roster}`);
   await assert.rejects(load(), /blockModels must be an array/);
 });

@@ -10,7 +10,7 @@ asking. `<repo>` is the absolute path of your checkout.
 - [Claude Code](https://claude.com/claude-code) (`claude` on your PATH)
 - Python 3 (only for the optional status line)
 - Optional backends, install only the ones you want: Codex (`codex`), OpenCode (`opencode`),
-  Cursor (`agent`), Antigravity (`agy`)
+  Cursor (`agent`), Antigravity (`agy`), GitHub Copilot (`copilot`)
 
 ## 1. Build
 
@@ -81,7 +81,7 @@ Details: [`nim/README.md`](nim/README.md).
 
 ## 7. Optional: turn off Claude Code's built-in Agent tool
 
-subagent-mcp gives Claude agents on any backend (Claude, Codex, OpenCode, Cursor, Antigravity),
+subagent-mcp gives Claude agents on any backend (Claude, Codex, OpenCode, Cursor, Antigravity, Copilot),
 with model choice, worktree isolation and usage tracking. Claude Code also has its own built-in
 `Agent` tool, which only runs Claude subagents. With both available, the model sometimes reaches for
 the built-in one and bypasses all of that.
