@@ -1617,7 +1617,7 @@ export class Supervisor {
                 else record.meta.validation_errors = validate.errors;
               } catch(error) { record.meta.validation_errors = String(error); }
             }
-            const outcome = { agent_id: record.id, turn: record.meta.turn, turn_id: event.data.turnId,
+            const outcome = { agent_id: record.id, name: record.name, turn: record.meta.turn, turn_id: event.data.turnId,
               status: event.data.status, result: record.result, usage: record.usage, finished_at: record.updatedAt,
               structured_result: record.meta.structured, validation_errors: record.meta.validation_errors,
               ...(record.lastError === undefined ? {} : { error: record.lastError }) };
@@ -1734,7 +1734,7 @@ export class Supervisor {
     const index = record.meta.history.findIndex(h => h.turn === turn && h.turn_id === undefined);
     const previous = index < 0 ? undefined : record.meta.history[index];
     const entry = {
-      ...previous, agent_id: record.id, turn, turn_id: data.turnId, status: data.status,
+      ...previous, agent_id: record.id, name: record.name, turn, turn_id: data.turnId, status: data.status,
       ...(data.finalText === undefined ? {} : { result: scanChildOutput(data.finalText) }),
       ...(data.usage === undefined ? {} : { usage: { ...data.usage } }),
       finished_at: previous?.finished_at ?? new Date().toISOString(),
@@ -1937,7 +1937,7 @@ export class Supervisor {
   async #notify(record: AgentRecord): Promise<void> {
     if (record.state !== 'running' && record.state !== 'starting') { record.openTools?.clear(); delete record.meta.activity; }
     if (!['running','starting','needs_approval'].includes(record.state) && !record.meta.history.some(h => h.turn === record.meta.turn)) {
-      const outcome = { agent_id: record.id, turn: record.meta.turn, status: record.state, result: record.result,
+      const outcome = { agent_id: record.id, name: record.name, turn: record.meta.turn, status: record.state, result: record.result,
         error: record.lastError, finished_at: record.updatedAt };
       try {
         await this.#resultsStore?.append(outcome);

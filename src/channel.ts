@@ -1,3 +1,5 @@
+import { fileURLToPath } from "node:url";
+
 import type { Server } from "@modelcontextprotocol/sdk/server/index.js";
 
 import { MAX_CONTENT_CHARS, truncateText } from "./truncate.js";
@@ -18,6 +20,9 @@ export const CHANNEL_METHOD = "notifications/claude/channel";
 /** `clientInfo.name` Claude Code sends in `initialize`. */
 const CLAUDE_CODE_CLIENT_NAME = "claude-code";
 
+/** The `subagent-mcp` command beside this build (dist/src/channel.js → bin/subagent-mcp). */
+const CLI = fileURLToPath(new URL("../../bin/subagent-mcp", import.meta.url));
+
 export const CHANNEL_INSTRUCTIONS =
   'Every agent has a human-memorable name; refer to agents by name. When a run_in_background agent settles, ' +
   'an event arrives as <channel source="subagent-mcp" agent="..." agent_id="..." ' +
@@ -31,7 +36,11 @@ export const CHANNEL_INSTRUCTIONS =
   'queued task receipt immediately. Choose notify per job: "always" (default), "on_failure", or "never"; ' +
   "needs_approval always pings. If no Claude Code session is attached when a background agent settles, the ping " +
   "is queued and delivered when a session next attaches (at most once). A scheduled task whose start was missed " +
-  "past the grace window is blocked with MISSED_START.";
+  "past the grace window is blocked with MISSED_START. " +
+  "Channel events reach only terminal sessions started with channels enabled. Elsewhere, such as the Claude " +
+  `desktop app, wake on completion by running \`${CLI} wait <agent...>\` as a background shell command after a ` +
+  "background spawn: it exits when the agents settle (exit 0 completed, 2 failed or interrupted) or one needs " +
+  "approval (exit 3), printing one JSON line per agent. Add --cwd <project> when the shell is not in the project.";
 
 export function isClaudeCodeClient(clientName: string | undefined): boolean {
   return clientName === CLAUDE_CODE_CLIENT_NAME;
