@@ -170,7 +170,7 @@ export class CodexAdapter implements BackendAdapter {
       await this.#startTurn(existing, request.prompt, request.timeoutMs, request.reasoningEffort);
       return { agentId: request.agentId, turnId: requireString(existing.currentTurn.id, "turn id"), backend: this.backend };
     }
-    const session = this.#launch({ cwd: request.cwd, model: request.model }, request.agentId);
+    const session = this.#launch({ cwd: request.cwd, model: request.model, env: request.env }, request.agentId);
     await this.#handshake(session);
     const resumed = await this.#request(session, "thread/resume", {
       threadId: request.agentId,
@@ -345,10 +345,14 @@ export class CodexAdapter implements BackendAdapter {
     for (const launch of this.#launches) this.#terminate(launch);
   }
 
-  #launch(request: Pick<SpawnRequest, "cwd" | "model">, expectedThreadId?: string): CodexSession {
+  /**
+   * `request.env` is the agent definition's `env:` (plus the bridge's depth variable). Setting
+   * `CODEX_HOME` there points an agent at another Codex home, and so another signed-in account.
+   */
+  #launch(request: Pick<SpawnRequest, "cwd" | "model"> & { readonly env?: SpawnRequest["env"] }, expectedThreadId?: string): CodexSession {
     const child = this.#spawnProcess(this.#options.executable, [...this.#options.executableArgs], {
       cwd: request.cwd,
-      env: { ...process.env, ...this.#options.env },
+      env: { ...process.env, ...this.#options.env, ...request.env },
       shell: false,
       windowsHide: true,
       // Own process group so stop and timeout can reap shells Codex spawned.

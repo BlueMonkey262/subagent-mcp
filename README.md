@@ -320,7 +320,11 @@ against the repository, tests, and the operator's actual request.
 - **Codex**: drives `codex app-server` (JSON-RPC 2.0 over stdio, verified against
   `codex-cli 0.153.3`), one process per agent. `spawn_agent`'s optional `effort` (or an
   agent config's `reasoningEffort` frontmatter field, which pins it the same way `model` does)
-  is sent as `reasoningEffort` on every `turn/start` call. **Important,
+  is sent as `reasoningEffort` on every `turn/start` call. An agent config's `env` frontmatter is
+  added to the app-server's environment on spawn and cold resume, so `env: { CODEX_HOME:
+  /Users/you/.codex-alt }` runs that agent under a second Codex home and its signed-in account
+  (sign it in once with `CODEX_HOME=~/.codex-alt codex login`; use an absolute path in `env`, since
+  `~` is not expanded). Live usage in `list_models` still reads the default home. **Important,
   discovered by testing against the
   real binary rather than assumed from docs:** on this development host, Codex's
   `workspaceWrite` sandbox does not actually confine writes to the declared `writableRoots`,
