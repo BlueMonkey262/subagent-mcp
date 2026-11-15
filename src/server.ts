@@ -92,9 +92,19 @@ async function main(): Promise<void> {
       input = checked.value;
     }
     try {
-      const value = local ? await restart(isRecord(input) && input["force"] === true) : await call(name, input, tool.timeoutMs);
+      const meta = request.params._meta;
+      const thread = server.server.getClientVersion()?.name === "codex-mcp-client" && isRecord(meta)
+        && typeof meta["threadId"] === "string" && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(meta["threadId"])
+        ? meta["threadId"] : undefined;
+      const value = local ? await restart(isRecord(input) && input["force"] === true)
+        : thread !== undefined && (name === "spawn_agent" || name === "send_message" || name === "start_ensemble")
+          ? await call("codex_" + name, { input, thread }, tool.timeoutMs)
+          : await call(name, input, tool.timeoutMs);
       return tool.format === "compact" ? toCompactContent(value) : toContent(value);
     } catch (error) {
+      if (error instanceof Error && /Unknown host method codex_(spawn_agent|send_message|start_ensemble)/.test(error.message)) {
+        return failure("The running subagent-mcp host is too old for Codex notifications. Once its agents finish and other sessions disconnect, call restart_host and retry.");
+      }
       return failure(error instanceof Error ? error.message : String(error));
     }
   });

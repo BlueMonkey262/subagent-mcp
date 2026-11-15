@@ -11,6 +11,11 @@ Follow [`SETUP.md`](SETUP.md), or point Claude Code at this repo and ask it to *
 
 That installs: the server (user-scoped MCP), the `subagent-mcp` launcher, and the status-line mod.
 
+To use Codex as the main agent, install and sign in to Codex, then run `subagent-mcp --codex`
+from your project. The launcher registers the server with Codex on first use and forwards any
+remaining arguments, such as `subagent-mcp --codex resume --last`. Background completion and
+approval pings wake the originating Codex session; see [Codex background completion alerts](#codex-background-completion-alerts).
+
 ### Backends and providers
 
 | Backend | Notes |
@@ -556,6 +561,22 @@ connection, so do it between sessions.
   channel below, which covers completion, failure, and approval requests only. In the desktop app,
   where channels can't be turned on, the panel mod's toasts cover the same three (SETUP.md step 4b).
 - Antigravity works in live use, including tool soft-denial and interrupts.
+
+## Codex background completion alerts
+
+Codex CLI 0.169.0 supplies a thread ID with MCP tool calls. Background jobs started or resumed
+from that session, including ensembles, use `codex queue --thread <id> --resume` to send their
+completion and approval alerts to that thread and start a new turn. The message includes a
+bounded result when available; retrieve full results and approval details from the MCP tools.
+Register the MCP server in Codex's normal configuration so it remains available after resume.
+This path was tested with the CLI; desktop and IDE behavior has not yet been verified. Sessions
+without thread metadata can use `wait_for_agents` instead.
+
+The host persists failed deliveries and retries them. A crash during delivery can produce a
+duplicate. Codex may accept a queued message but report a resume warning; in that case the
+message is queued but immediate wake-up is not guaranteed. Queued notifications are Codex user
+messages and can start a new model turn and consume plan usage. After upgrading, an older shared
+host must be restarted once its active work and other sessions permit it.
 
 ## Claude Code channel (background completion alerts)
 

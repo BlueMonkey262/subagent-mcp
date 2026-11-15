@@ -5,6 +5,7 @@ import type { PermissionConfig } from './config/schema.js';
 
 interface ExecutionMeta {
   turn: number;
+  codexThread?: string;
   cleaned?: boolean;
   history: Record<string, unknown>[];
   activity?: string;
@@ -155,6 +156,7 @@ interface AgentRecord {
   /** One queued send_message, delivered once the current turn reaches turn.completed. */
   pendingMessage?: {
     readonly prompt: string;
+    readonly codexThread?: string;
     readonly effort?: string;
     readonly timeout?: number;
     /** Carried so a queued Antigravity resume can accept a changed agent definition. */
@@ -209,6 +211,8 @@ export interface AgentSnapshot {
 }
 
 export interface SpawnAgentInput {
+  /** Internal origin, set by the MCP proxy from Codex call metadata. */
+  readonly codexThread?: string | undefined;
   readonly isolation?: 'none' | 'worktree' | undefined;
   readonly permission?: PermissionConfig | undefined;
   readonly result_schema?: Record<string, unknown> | undefined;
@@ -257,6 +261,7 @@ export interface AgentOutcome {
 }
 
 export interface SendMessageInput {
+  readonly codexThread?: string | undefined;
   readonly agent: string;
   readonly prompt: string;
   readonly effort?: string | undefined;
@@ -1177,7 +1182,7 @@ export class Supervisor {
       const picked = input.name !== undefined ? { name: input.name } : this.#nextAgentName();
       const name = picked.name;
       const record: AgentRecord = {
-        meta: { turn: 1, history: [], notify, ...(input.permission ? { permission } : {}), ...(worktree ? { worktree } : {}),
+        meta: { turn: 1, history: [], notify, ...(input.codexThread ? { codexThread: input.codexThread } : {}), ...(input.permission ? { permission } : {}), ...(worktree ? { worktree } : {}),
           ...(input.group_id ? { group_id: input.group_id } : {}),
           ...(input.ensemble ? { ensemble: { id: input.ensemble.id, role: input.ensemble.role } } : {}),
           ...(input.result_schema ? { schema: input.result_schema } : {}),
@@ -1253,6 +1258,7 @@ export class Supervisor {
       }
       record.pendingMessage = {
         prompt: input.prompt,
+        ...(input.codexThread === undefined ? {} : { codexThread: input.codexThread }),
         ...(input.effort === undefined ? {} : { effort: input.effort }),
         ...(input.timeout === undefined ? {} : { timeout: input.timeout }),
         ...(input.allow_agent_definition_change === true ? { allowDefinitionChange: true } : {}),
@@ -1286,6 +1292,9 @@ export class Supervisor {
     record.release = await this.#acquireCapacity(record.backend, record.model);
     try { this.#assertModelAllowed(record.backend, record.model); } catch (error) { record.release(); throw error; }
     const previousState = record.state;
+    const previousThread = record.meta.codexThread;
+    if (input.codexThread === undefined) delete record.meta.codexThread;
+    else record.meta.codexThread = input.codexThread;
     record.state = "running";
     record.timedOut = false;
     this.#clearLastError(record);
@@ -1305,6 +1314,8 @@ export class Supervisor {
     } catch (error) {
       record.release();
       record.state = previousState;
+      if (previousThread === undefined) delete record.meta.codexThread;
+      else record.meta.codexThread = previousThread;
       record.updatedAt = new Date().toISOString();
       void this.#writeSnapshot().catch(() => undefined);
       throw error;
@@ -1655,6 +1666,8 @@ export class Supervisor {
                 continue;
               }
               try {
+                if (pending.codexThread === undefined) delete record.meta.codexThread;
+                else record.meta.codexThread = pending.codexThread;
                 await this.#deliverResume(record, adapter, pending.prompt, pending.effort, pending.timeout,
                   pending.allowDefinitionChange === true);
               } catch (error) {
@@ -1959,7 +1972,7 @@ export class Supervisor {
       const terminal = record.state !== "needs_approval";
       if (this.#shouldNotify(record)) {
         try {
-          this.#onDetachedSettled?.(this.#result(record));
+          this.#onDetachedSettled?.({ ...this.#result(record), ...(record.meta.codexThread ? { codex_thread: record.meta.codexThread } : {}) });
         } catch {
           // A failing notifier must not break the event pump.
         }
@@ -2259,6 +2272,14 @@ export class Supervisor {
     return this.#undeliveredPings.length;
   }
 
+  hasUndeliveredCodexPings(): boolean {
+    return this.#undeliveredPings.some(ping => typeof ping.codex_thread === 'string');
+  }
+
+  hasUndeliveredClaudePings(): boolean {
+    return this.#undeliveredPings.some(ping => typeof ping.codex_thread !== 'string');
+  }
+
   /**
    * Deliver queued pings, removing each entry only after its write reports success. Failed entries
    * stay queued. A crash between a successful write and the snapshot can redeliver that ping.
@@ -2306,6 +2327,7 @@ export class Supervisor {
     try {
       this.#onDetachedSettled?.({
         agent_id: task.id, task_id: task.id, status: task.state, backend: task.input.backend,
+        ...(task.input.codexThread ? { codex_thread: task.input.codexThread } : {}),
         ...(task.start_at === undefined ? {} : { start_at: task.start_at }),
         ...(task.result ?? {}),
       });

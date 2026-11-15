@@ -4,6 +4,27 @@ Follow these steps yourself, or point Claude Code at this repo and ask it to "se
 Claude should do the steps in order, say what it changed, and never overwrite existing config without
 asking. `<repo>` is the absolute path of your checkout.
 
+For Codex as the main agent, build the project as in step 1, install the launcher as in step 2,
+and run `subagent-mcp --codex` from your project. On first use, it registers the MCP server with
+Codex if no `subagent-mcp` registration exists; it preserves existing registrations. Remaining
+arguments are forwarded to Codex, so `subagent-mcp --codex resume --last` resumes a session.
+Codex must be installed and signed in (`codex login`). You can also register manually with
+`codex mcp add subagent-mcp -- <repo>/bin/run-server.sh`. Claude's launcher, channel, status line,
+and panel below are specific to Claude Code. With Codex CLI 0.169.0, the server uses the thread ID
+provided on MCP calls to queue completion and approval notifications back to that session. Codex
+starts a new turn for each notification. Failed deliveries are retried; a crash during delivery
+can cause a duplicate. Codex needs its local daemon and a persistent session for `queue --resume`.
+If the client does not supply thread metadata, use `wait_for_agents` instead. Desktop and IDE
+notification behavior has not yet been verified. After upgrading, an older shared host may need
+`restart_host` once its agents finish and other sessions disconnect.
+
+To exercise the Codex CLI integration with a real background agent, run
+`node <repo>/bin/codex-smoke.mjs <configured-codex-model>` from a configured project. This uses
+the signed-in account and consumes model usage. It starts an ephemeral Codex session with a
+temporary MCP configuration, spawns a real agent, and checks the result returned by
+`wait_for_agents`. The test uses Codex's automatic approval review; the project must allow the
+configured backend and model.
+
 ## Prerequisites
 
 - Node.js 22 or newer

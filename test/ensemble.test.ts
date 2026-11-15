@@ -377,3 +377,20 @@ test("a retry while the first push is still in flight does not send the event tw
   const view = await f.manager.get({ ensemble: String(started.ensemble_id) });
   assert.notEqual((view as Record<string, unknown>).undelivered, true);
 });
+
+test('Codex ensemble origin follows member approvals and the consolidated result', async () => {
+  const f = fixture();
+  const thread = '01a1e113-23c3-7203-a5ca-cc754be5b4df';
+  const started = await f.manager.start({ task: 't', agents: roster.slice(0, 1) }, thread);
+  const [member] = await memberIds(f.manager, String(started.ensemble_id));
+  f.codex.emit(member!.agent_id, 'approval.requested', {
+    requestId: 'req-origin', agentId: member!.agent_id, backend: 'codex', toolName: 'Bash',
+    input: {}, cwd: '/repo', requestedAt: new Date().toISOString(),
+  });
+  await until(() => f.detached.length === 1);
+  assert.equal(f.detached[0]!.codex_thread, thread);
+  await f.supervisor.resolveApproval('req-origin', 'allow');
+  complete(f.codex, member!.agent_id, 'done');
+  await until(() => f.events.length === 1);
+  assert.equal(f.events[0]!.codex_thread, thread);
+});

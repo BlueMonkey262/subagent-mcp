@@ -1,4 +1,5 @@
 import { buildDashboard } from "./dashboard.js";
+import { deliverCodexPing } from "./codex-notify.js";
 import { catalogJson, validateToolInput } from "./tool-catalog.js";
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
@@ -281,18 +282,18 @@ export async function serveHost(options: {
   };
   let redeliverTimer: NodeJS.Timeout | undefined;
   const redeliverQueued = async (): Promise<void> => {
-    if (options.supervisor.undeliveredPingCount() === 0) return;
+    if (!options.supervisor.hasUndeliveredClaudePings()) return;
     for (const socket of [...attached]) {
       if (socket.destroyed || !socket.writable) {
         attached.delete(socket);
         continue;
       }
       try {
-        await options.supervisor.flushUndeliveredPings((result) => send(socket, { event: "detached", data: result }));
+        await options.supervisor.flushUndeliveredPings((result) => typeof result["codex_thread"] === "string" ? false : send(socket, { event: "detached", data: result }));
       } catch {
         continue;
       }
-      if (options.supervisor.undeliveredPingCount() === 0) return;
+      if (!options.supervisor.hasUndeliveredClaudePings()) return;
     }
   };
   const scheduleRedeliver = (): void => {
@@ -310,13 +311,13 @@ export async function serveHost(options: {
     let delivered = 0;
     try {
       for (let attempt = 0; attempt < ATTACH_FLUSH_ROUNDS; attempt += 1) {
-        delivered += await options.supervisor.flushUndeliveredPings((result) => send(socket, { event: "detached", data: result }));
+        delivered += await options.supervisor.flushUndeliveredPings((result) => typeof result["codex_thread"] === "string" ? false : send(socket, { event: "detached", data: result }));
         if (socket.destroyed || !socket.writable) {
           attached.delete(socket);
           return { attached: false, delivered, attached_sessions: attached.size };
         }
         // A settle may have enqueued a ping after this flush copied the queue; drain that too.
-        if (options.supervisor.undeliveredPingCount() === 0) break;
+        if (!options.supervisor.hasUndeliveredClaudePings()) break;
       }
     } catch (error) {
       attached.delete(socket);
@@ -324,7 +325,7 @@ export async function serveHost(options: {
     }
     // The bounded rounds can end with the queue still non-empty (writes failing while the socket
     // stays writable, or notifiers adding pings across rounds). Retry once shortly after attach.
-    if (options.supervisor.undeliveredPingCount() > 0 && attached.has(socket)) scheduleRedeliver();
+    if (options.supervisor.hasUndeliveredClaudePings() && attached.has(socket)) scheduleRedeliver();
     return { attached: true, delivered, attached_sessions: attached.size };
   };
   const server: Server = createServer((socket) => {
@@ -788,6 +789,15 @@ export async function runHost(): Promise<void> {
       // A probe/CLI socket is not a consumer; only an attached session counts. If none are
       // attached (or the writes failed), persist the ping for the next attach_session instead.
       const task = (async () => {
+        if (typeof result["codex_thread"] === "string") {
+          try {
+            await supervisor.enqueueUndeliveredPing(result);
+            await supervisor.flushUndeliveredPings(deliverCodexPing);
+          } catch (error) {
+            process.stderr.write(`subagent-mcp: could not persist Codex notification: ${String(error)}\n`);
+          }
+          return;
+        }
         const delivered = endpoint === undefined
           ? 0
           : await endpoint.notify({ event: "detached", data: result }).catch(() => 0);
@@ -827,6 +837,11 @@ export async function runHost(): Promise<void> {
   supervisor.enablePersistence(paths.snapshotPath);
   await supervisor.recoverResults();
   await supervisor.flushSnapshot();
+  // Retry failed Codex deliveries, including pings restored after a host restart. The shared
+  // flush lock prevents this timer and a fresh completion from delivering the same ping twice.
+  const codexPingTimer = setInterval(() => void supervisor.flushUndeliveredPings(deliverCodexPing).catch(() => undefined), 10_000);
+  codexPingTimer.unref();
+  void supervisor.flushUndeliveredPings(deliverCodexPing).catch(() => undefined);
   const history = new RoutingHistory(join(paths.directory, "routing-history.jsonl"));
   await history.load().catch((error) => process.stderr.write(`subagent-mcp: routing history unreadable: ${String(error)}\n`));
   ensembles = new EnsembleManager({
@@ -835,6 +850,11 @@ export async function runHost(): Promise<void> {
     history,
     directory: join(paths.directory, "ensembles"),
     onSettled: async (event) => {
+      if (typeof event["codex_thread"] === "string") {
+        await supervisor.enqueueUndeliveredPing(event);
+        void supervisor.flushUndeliveredPings(deliverCodexPing).catch(() => undefined);
+        return true;
+      }
       // A probe/CLI socket is not a consumer; only an attached session can receive the event.
       // Returning false leaves the record's notification pending for the next attach_session.
       if (endpoint === undefined || endpoint.attached === 0) return false;
@@ -860,6 +880,7 @@ export async function runHost(): Promise<void> {
     if (idleTimer !== undefined) clearTimeout(idleTimer);
     clearInterval(updateTimer);
     clearInterval(livenessTimer);
+    clearInterval(codexPingTimer);
     live.close();
     // Stop scheduled work first, then interrupt live agents. Their settle pings fire after
     // closeAll(), so drain notifiers after it and before the final snapshot.
@@ -898,7 +919,10 @@ export async function runHost(): Promise<void> {
     if (clients > 0 || shuttingDown) return;
     idleTimer = setTimeout(() => {
       supervisor.checkLiveness();
-      if (hasLiveWork(supervisor) || ensembles?.hasActive() === true) return;
+      if (hasLiveWork(supervisor) || supervisor.hasUndeliveredCodexPings() || ensembles?.hasActive() === true) {
+        scheduleIdle(0);
+        return;
+      }
       void shutdown();
     }, IDLE_EXIT_MS);
   };
@@ -1098,6 +1122,13 @@ interface DispatchContext {
 }
 
 async function dispatch(supervisor: Supervisor, method: string, params: unknown, context: DispatchContext): Promise<unknown> {
+  let codexThread: string | undefined;
+  if (method === "codex_spawn_agent" || method === "codex_send_message" || method === "codex_start_ensemble") {
+    if (!isRecord(params) || typeof params["thread"] !== "string" || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(params["thread"])) throw new Error("Invalid Codex thread ID");
+    codexThread = params["thread"];
+    params = params["input"];
+    method = method.slice("codex_".length);
+  }
   // Front ends that list this host's catalog forward calls without checking them, so the host does.
   // Methods that are not catalog tools (hello, attach_session, shutdown, tool_catalog) pass through.
   const checked = validateToolInput(method, isRecord(params) ? params : {});
@@ -1123,16 +1154,16 @@ async function dispatch(supervisor: Supervisor, method: string, params: unknown,
     case "spawn_agent": {
       // Ensemble membership is trusted state the ensemble manager sets in-process, never tool input.
       const { ensemble: _ensemble, worktree_snapshot: _snapshot, ...spawn } = input;
-      return supervisor.spawnAgent(spawn as unknown as SpawnAgentInput);
+      return supervisor.spawnAgent({ ...spawn, ...(codexThread === undefined ? {} : { codexThread }) } as unknown as SpawnAgentInput);
     }
     case "start_ensemble":
-      return requireEnsembles(context).start(input);
+      return requireEnsembles(context).start(input, codexThread);
     case "get_ensemble":
       return requireEnsembles(context).get(input);
     case "cancel_ensemble":
       return requireEnsembles(context).cancel(requiredString(input, "ensemble"));
     case "send_message":
-      return supervisor.sendMessage(input as unknown as SendMessageInput);
+      return supervisor.sendMessage({ ...input, ...(codexThread === undefined ? {} : { codexThread }) } as unknown as SendMessageInput);
     case "list_agents":
       return supervisor.sessionView(input as ListAgentsInput);
     case "get_dashboard":
