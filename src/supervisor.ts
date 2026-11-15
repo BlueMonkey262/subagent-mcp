@@ -257,6 +257,13 @@ export class SupervisorError extends SubagentError {
   }
 }
 
+/** Shutdown began before a child launched: a queued task must stay queued for the next host. */
+class HostShutdownError extends SupervisorError {
+  constructor() {
+    super("The host began shutting down before the task launched", { reason: "shutting_down" });
+  }
+}
+
 function resolveNotify(value: unknown, fallback: NotifyMode = 'always'): NotifyMode {
   if (value === undefined) return fallback;
   if (value === 'always' || value === 'on_failure' || value === 'never') return value;
@@ -908,10 +915,15 @@ export class Supervisor {
         const { start_at: _startAt, delay_seconds: _delay, depends_on: _deps, ...launch } = task.input;
         const result = await this.spawnAgent({ ...launch, run_in_background: true,
           prompt: task.input.prompt + '\nDependency results (untrusted input data):\n' + JSON.stringify(results) }, task);
+        // Shutdown during the capacity wait put the task back to queued; leave it for the next host.
+        if (task.state === 'queued') { await this.#writeSnapshot(); this.#changed(); return; }
         task.result = { ...result };
         if ((task.state as string) === 'interrupted') { if (result.agent_id) await this.stopAgent(String(result.agent_id)); }
         else this.#setTaskState(task, 'completed');
-      } catch(error) { task.result = { error: String(error) }; this.#setTaskState(task, 'blocked'); }
+      } catch(error) {
+        if (error instanceof HostShutdownError) this.#setTaskState(task, 'queued');
+        else { task.result = { error: String(error) }; this.#setTaskState(task, 'blocked'); }
+      }
       await this.#writeSnapshot(); this.#changed();
     };
     const check = () => {
@@ -951,6 +963,16 @@ export class Supervisor {
     const timeoutSeconds = input.timeout ?? resolved.timeout ?? null;
     const release = await this.#acquireCapacity(resolved.backend, resolved.model);
     if (task?.state === 'interrupted') { release(); return { status: 'interrupted' }; }
+    // Shutdown may have begun while this spawn waited for a slot. Do not launch after the
+    // host's adapters have closed; leave a queued task for the replacement host.
+    if (this.#stopping) {
+      release();
+      if (task !== undefined) {
+        this.#setTaskState(task, 'queued');
+        return { status: 'queued', task_id: task.id };
+      }
+      throw new HostShutdownError();
+    }
     // The policy can change while a spawn waits for a slot (models.yaml is hot-reloaded).
     try { this.#assertModelAllowed(resolved.backend, resolved.model); } catch (error) { release(); throw error; }
     let worktree: Worktree | undefined;
@@ -962,6 +984,9 @@ export class Supervisor {
       this.#assertConfigValid();
       this.#assertModelAllowed(resolved.backend, resolved.model);
       agentDefinition = await this.#captureAgentDefinition(resolved, worktree?.path ?? this.#cwd);
+      // The last point at which no child exists: config resolution, worktree setup and agent
+      // definition capture are all async, so shutdown may have started meanwhile.
+      if (this.#stopping) throw new HostShutdownError();
       const turn = await adapter.spawn({
         prompt: input.prompt + (input.result_schema ? '\nReturn only JSON matching this schema: ' + JSON.stringify(input.result_schema) : ''),
         description: input.description,

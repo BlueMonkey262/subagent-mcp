@@ -647,6 +647,23 @@ test("pings with no attached session are queued, persisted, and flushed on attac
   }
 });
 
+test("a queued task waiting for capacity stays queued when shutdown begins", async () => {
+  const limits = { ...defaultServerLimits(), maxConcurrent: 1 };
+  const { supervisor, adapter } = fixture({ limits });
+  adapter.queueScript([]);
+  const blocker = await supervisor.spawnAgent(spawn);
+  const task = await supervisor.spawnAgent({ ...spawn, delay_seconds: 1 });
+  await waitUntil(() => supervisor.concurrency().waiting === 1, 3_000);
+
+  const quiescing = supervisor.quiesce();
+  adapter.emit(String(blocker["agent_id"]), "turn.completed", { turnId: "release", status: "completed" });
+  await quiescing;
+
+  assert.equal(adapter.spawnRequests.length, 1, "no child launched after shutdown began");
+  assert.equal(supervisor.getAgentResult(String(task["task_id"]))?.state, "queued");
+  assert.equal(supervisor.hasPendingWork(), true, "the task remains for the next host");
+});
+
 test("a delayed task whose timer fires during shutdown stays queued and runs once on restart", async (t) => {
   t.mock.timers.enable({ apis: ["setTimeout", "Date"] });
   const path = join(await mkdtemp(join(tmpdir(), "delayed-shutdown-")), "sessions.json");

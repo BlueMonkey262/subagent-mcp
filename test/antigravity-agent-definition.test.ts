@@ -227,3 +227,66 @@ test("a queued send_message keeps allow_agent_definition_change and classifies d
   await waitUntil(() => isState(allowedId, "completed"));
   assert.equal((supervisor.getAgentResult(allowedId) as Record<string, unknown>)["error"], undefined);
 });
+
+test("a task does not launch if shutdown begins during agent-definition capture", async () => {
+  const project = await mkdtemp(join(tmpdir(), "antigravity-shutdown-"));
+  const global = await mkdtemp(join(tmpdir(), "antigravity-global-"));
+  const definitionPath = join(project, ".agents", "agents", "reviewer.md");
+  await writeDefinition(definitionPath, "reviewer");
+  const agent: AgentConfig = {
+    name: "reviewer",
+    backend: "antigravity",
+    model: "gemini-fixture",
+    antigravityAgent: "reviewer",
+    description: "Antigravity reviewer",
+    systemPrompt: "",
+    permission,
+    env: {},
+    sourcePath: join(project, ".subagents", "reviewer.md"),
+  };
+  const roster: ModelRoster = {
+    claude: [],
+    codex: [],
+    opencode: [],
+    antigravity: [{ name: "gemini-fixture" }],
+    cursor: [],
+  };
+  const adapter = new FakeAdapter("antigravity");
+  const resolver = new FileAntigravityAgentResolver();
+  let releaseGate: (() => void) | undefined;
+  let enteredGate: (() => void) | undefined;
+  const entered = new Promise<void>((resolve) => { enteredGate = resolve; });
+  const gate = new Promise<void>((resolve) => { releaseGate = resolve; });
+  const supervisor = new Supervisor({
+    registry: new ConfigRegistry([agent], roster, defaultServerLimits()),
+    adapters: new AdapterRegistry([adapter]),
+    cwd: project,
+    antigravityResolver: {
+      resolve: async input => {
+        enteredGate?.();
+        await gate;
+        return resolver.resolve({ ...input, globalDirectory: global });
+      },
+    },
+  });
+
+  const task = await supervisor.spawnAgent({
+    agent: "reviewer",
+    prompt: "review this",
+    description: "review",
+    run_in_background: true,
+    delay_seconds: 1,
+  });
+  const keepAlive = setTimeout(() => undefined, 5_000);
+  try {
+    await entered;
+    const quiescing = supervisor.quiesce();
+    releaseGate?.();
+    await quiescing;
+  } finally {
+    clearTimeout(keepAlive);
+  }
+
+  assert.equal(adapter.spawnRequests.length, 0, "shutdown refused the launch after capacity was acquired");
+  assert.equal(supervisor.getAgentResult(String(task["task_id"]))?.state, "queued");
+});
