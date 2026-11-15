@@ -29,6 +29,21 @@ The project config's `antigravityAgent` must name an agent that Antigravity disc
 `.agents/agents/<name>.md` or its configured global location. This bridge does not generate
 workspace agent files or lower a system prompt into a user message.
 
+Before launch the bridge resolves the definition in this order: explicit `antigravityAgentFile`
+from the `.subagents` config, `<cwd>/.agents/agents/<name>.md`, then
+`~/.gemini/agents/<name>.md`. It validates that the frontmatter `name` and file basename match
+`antigravityAgent`, and records the source path, SHA-256, body, `description`, `tools` and any
+native `permission` block. A project-local copy is written to
+`.subagents/memory/antigravity-agents/<sha256>.md` when persistence is enabled. Spawn results,
+`list_agents`, and `list_agent_configs` expose a compact `agent_definition` with
+`bridge_enforced: false`: Antigravity still owns tool execution and permissions.
+
+A resume re-resolves the same definition and compares its SHA-256 with the captured value. A
+mismatch fails closed with `ANTIGRAVITY_AGENT_CHANGED`; `send_message` with
+`allow_agent_definition_change: true` explicitly accepts the new instructions. `subagent-mcp
+antigravity doctor` reports each config's resolved definition, and `subagent-mcp antigravity
+vendor <agent-config>` copies a resolved global definition into the project.
+
 Verified on agy 1.2.x:
 
 - The agent file's frontmatter must list `tools` (for example

@@ -44,6 +44,8 @@ export interface AgentConfig {
    * its own model price table, which Mistral notes may be missing or stale. Not a billing guarantee.
    */
   readonly vibeMaxPriceUsd?: number;
+  /** Optional repo-relative definition file; resolved and audited before launch. */
+  readonly antigravityAgentFile?: string;
   readonly description: string;
   readonly systemPrompt: string;
   readonly maxTurns?: number;
@@ -94,11 +96,25 @@ export interface ProviderLimit {
 export interface ServerLimits {
   readonly maxConcurrent: number;
   readonly codexResumeIdleMs: number;
+  /** A running agent without a heartbeat or live backend probe for this long is reported stale. */
+  readonly staleAgentMs: number;
+  /** Default bounded wait for send_message before it returns a running receipt. */
+  readonly sendMessageWaitMs: number;
+  /** How late a persisted scheduled task may start before it is blocked as MISSED_START. */
+  readonly scheduledGraceMs: number;
+  readonly perBackendConcurrency: Readonly<Partial<Record<Backend, number>>>;
+  /** `backend:model-glob` patterns; every matching rule applies as its own pool. */
+  readonly perModelConcurrency: readonly ModelConcurrencyRule[];
   readonly allowances: Readonly<Partial<Record<Backend, Allowance>>>;
   /** Which backends and models are refused (see core/model-policy.ts). */
   readonly modelPolicy: ModelPolicy;
   /** Keyed by provider id (the part of an OpenCode model id before the first `/`). */
   readonly providerLimits: Readonly<Record<string, ProviderLimit>>;
+}
+
+export interface ModelConcurrencyRule {
+  readonly pattern: string;
+  readonly limit: number;
 }
 
 export interface ResolvedAgentConfig extends Omit<AgentConfig, "model"> {

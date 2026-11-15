@@ -10,7 +10,7 @@ import type { AgentEvent, NewAgentEvent, NormalizedEventData, NormalizedEventTyp
 import { signalProcessGroup } from "../../process-group.js";
 import { classifyProviderError } from "../../core/providers.js";
 import { scanChildOutput } from "../../safety/output.js";
-import type { AdapterTurn, BackendAdapter, EventOptions, ProviderInfo, ProviderModel, ResumeRequest, SpawnRequest } from "../adapter.js";
+import type { AdapterLiveness, AdapterTurn, BackendAdapter, EventOptions, ProviderInfo, ProviderModel, ResumeRequest, SpawnRequest } from "../adapter.js";
 
 /**
  * Verified live against the installed `opencode 1.17.6` server (see the probe transcripts this
@@ -280,6 +280,18 @@ export class OpenCodeAdapter implements BackendAdapter {
       await this.#fetchJson(baseUrl, "POST", `/session/${agentId}/permissions/${permissionId}?directory=${encodeURIComponent(session.directory)}`, { response });
     }
     session.seenPermissions.delete(resolution.requestId);
+  }
+
+  liveness(agentId: string): AdapterLiveness {
+    const session = this.#sessions.get(agentId);
+    if (session === undefined) return { state: "unknown", reason: "no live OpenCode session" };
+    const server = this.#server;
+    if (server === undefined) return { state: "stale", reason: "OpenCode server is not running" };
+    if (server.process.exitCode !== null || server.process.signalCode !== null) {
+      return { state: "stale", reason: "OpenCode server process exited" };
+    }
+    if (session.pumpAbort.signal.aborted) return { state: "stale", reason: "OpenCode poll pump stopped" };
+    return { state: "live" };
   }
 
   async close(agentId: string): Promise<void> {

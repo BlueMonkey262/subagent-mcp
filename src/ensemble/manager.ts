@@ -1173,7 +1173,7 @@ export async function supervisorCandidateSource(supervisor: Supervisor): Promise
   const local = await supervisor.listModels(undefined, false);
   const roster = (local["models"] ?? {}) as Readonly<Record<string, readonly { name: string; blocked?: boolean }[]>>;
   const remaining = (local["remaining"] ?? {}) as Readonly<Partial<Record<Backend, Readonly<Record<string, number>>>>>;
-  const configs = supervisor.listAgentConfigs().configs.map((config) => ({
+  const configs = (await supervisor.listAgentConfigs()).configs.map((config) => ({
     name: config.name, backend: config.backend,
     ...(config.model === undefined ? {} : { model: config.model }),
     ...("blocked" in config && config.blocked === true ? { blocked: true } : {}),

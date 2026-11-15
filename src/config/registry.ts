@@ -7,6 +7,9 @@ import { ConfigurationError } from "../core/errors.js";
 import {
   AGENT_DEPTH_ENV,
   DEFAULT_CODEX_RESUME_IDLE_MS,
+  DEFAULT_SCHEDULED_GRACE_MS,
+  DEFAULT_SEND_MESSAGE_WAIT_MS,
+  DEFAULT_STALE_AGENT_MS,
   MAX_CONCURRENT_AGENTS,
 } from "../core/limits.js";
 import { BACKENDS, isBackend, type Backend } from "../core/types.js";
@@ -18,6 +21,7 @@ import {
   type ClaudePermissionMode,
   type ModelEntry,
   type ModelRoster,
+  type ModelConcurrencyRule,
   type PermissionConfig,
   type PermissionDefault,
   type ProviderLimit,
@@ -45,6 +49,11 @@ export interface AgentConfigSource {
   listModels(backend?: Backend): Readonly<Record<Backend, readonly ModelEntry[]>> | readonly ModelEntry[];
   maxConcurrent(): number;
   codexResumeIdleMs(): number;
+  staleAgentMs(): number;
+  sendMessageWaitMs(): number;
+  scheduledGraceMs(): number;
+  perBackendConcurrency(): Readonly<Partial<Record<Backend, number>>>;
+  perModelConcurrency(): readonly ModelConcurrencyRule[];
   allowances(): Readonly<Partial<Record<Backend, Allowance>>>;
   modelPolicy(): ModelPolicy;
   providerLimits(): Readonly<Record<string, ProviderLimit>>;
@@ -102,6 +111,26 @@ export class ConfigRegistry implements AgentConfigSource {
 
   codexResumeIdleMs(): number {
     return this.limits.codexResumeIdleMs;
+  }
+
+  staleAgentMs(): number {
+    return this.limits.staleAgentMs;
+  }
+
+  sendMessageWaitMs(): number {
+    return this.limits.sendMessageWaitMs;
+  }
+
+  scheduledGraceMs(): number {
+    return this.limits.scheduledGraceMs;
+  }
+
+  perBackendConcurrency(): Readonly<Partial<Record<Backend, number>>> {
+    return this.limits.perBackendConcurrency;
+  }
+
+  perModelConcurrency(): readonly ModelConcurrencyRule[] {
+    return this.limits.perModelConcurrency;
   }
 
   allowances(): Readonly<Partial<Record<Backend, Allowance>>> {
@@ -191,6 +220,11 @@ export function defaultServerLimits(): ServerLimits {
   return {
     maxConcurrent: MAX_CONCURRENT_AGENTS,
     codexResumeIdleMs: DEFAULT_CODEX_RESUME_IDLE_MS,
+    staleAgentMs: DEFAULT_STALE_AGENT_MS,
+    sendMessageWaitMs: DEFAULT_SEND_MESSAGE_WAIT_MS,
+    scheduledGraceMs: DEFAULT_SCHEDULED_GRACE_MS,
+    perBackendConcurrency: {},
+    perModelConcurrency: [],
     allowances: {},
     modelPolicy: OPEN_POLICY,
     providerLimits: {},
@@ -245,6 +279,7 @@ export async function loadAgentConfig(path: string): Promise<AgentConfig> {
   }
   const vibeMaxTokens = optionalPositiveInteger(value, "vibeMaxTokens", path);
   const vibeMaxPriceUsd = optionalPositiveNumber(value, "vibeMaxPriceUsd", path);
+  const antigravityAgentFile = optionalString(value, "antigravityAgentFile", path);
   const description = requiredString(value, "description", path);
   const maxTurns = optionalPositiveInteger(value, "maxTurns", path);
   const timeout = optionalPositiveInteger(value, "timeout", path);
@@ -262,6 +297,7 @@ export async function loadAgentConfig(path: string): Promise<AgentConfig> {
     ...(vibeTransport === undefined ? {} : { vibeTransport: vibeTransport as "cli" | "acp" }),
     ...(vibeMaxTokens === undefined ? {} : { vibeMaxTokens }),
     ...(vibeMaxPriceUsd === undefined ? {} : { vibeMaxPriceUsd }),
+    ...(antigravityAgentFile === undefined ? {} : { antigravityAgentFile }),
     description,
     systemPrompt: body.trim(),
     ...(maxTurns === undefined ? {} : { maxTurns }),
@@ -433,9 +469,17 @@ function isPermissionDefault(value: unknown): value is PermissionDefault {
 function parseServerLimits(root: UnknownRecord, path: string): ServerLimits {
   const maxConcurrent = optionalPositiveInteger(root, "maxConcurrent", path) ?? MAX_CONCURRENT_AGENTS;
   const idleSeconds = optionalPositiveInteger(root, "codexResumeIdleSeconds", path);
+  const staleSeconds = optionalPositiveInteger(root, "staleAgentSeconds", path);
+  const sendWaitSeconds = optionalPositiveInteger(root, "sendMessageWaitSeconds", path);
+  const scheduledGraceSeconds = optionalPositiveInteger(root, "scheduledGraceSeconds", path);
   return {
     maxConcurrent,
     codexResumeIdleMs: idleSeconds === undefined ? DEFAULT_CODEX_RESUME_IDLE_MS : idleSeconds * 1000,
+    staleAgentMs: staleSeconds === undefined ? DEFAULT_STALE_AGENT_MS : staleSeconds * 1000,
+    sendMessageWaitMs: sendWaitSeconds === undefined ? DEFAULT_SEND_MESSAGE_WAIT_MS : sendWaitSeconds * 1000,
+    scheduledGraceMs: scheduledGraceSeconds === undefined ? DEFAULT_SCHEDULED_GRACE_MS : scheduledGraceSeconds * 1000,
+    perBackendConcurrency: parsePerBackendConcurrency(root["perBackendConcurrency"], path),
+    perModelConcurrency: parsePerModelConcurrency(root["perModelConcurrency"], path),
     allowances: parseAllowances(root["allowances"], path),
     modelPolicy: {
       blockClaudeModels: optionalBoolean(root, "blockClaudeModels", path) ?? false,
@@ -466,6 +510,35 @@ function parseProviderLimits(value: unknown, path: string): Readonly<Record<stri
     };
   }
   return limits;
+}
+
+function parsePerBackendConcurrency(value: unknown, path: string): Readonly<Partial<Record<Backend, number>>> {
+  if (value === undefined) return {};
+  if (!isRecord(value)) throw new ConfigurationError(`${path}: perBackendConcurrency must be an object`);
+  const limits: Partial<Record<Backend, number>> = {};
+  for (const [key, raw] of Object.entries(value)) {
+    if (!isBackend(key)) {
+      throw new ConfigurationError(`${path}: perBackendConcurrency.${key} is not a backend (${BACKENDS.join(", ")})`);
+    }
+    limits[key] = positiveIntegerValue(raw, `${path}: perBackendConcurrency.${key}`);
+  }
+  return limits;
+}
+
+function parsePerModelConcurrency(value: unknown, path: string): readonly ModelConcurrencyRule[] {
+  if (value === undefined) return [];
+  if (!isRecord(value)) throw new ConfigurationError(`${path}: perModelConcurrency must be an object`);
+  return Object.entries(value).map(([key, raw]) => ({
+    pattern: parsePatternList([key], `${path}: perModelConcurrency`)[0]!,
+    limit: positiveIntegerValue(raw, `${path}: perModelConcurrency.${key}`),
+  }));
+}
+
+function positiveIntegerValue(value: unknown, context: string): number {
+  if (typeof value !== "number" || !Number.isSafeInteger(value) || value <= 0) {
+    throw new ConfigurationError(`${context} must be a positive integer`);
+  }
+  return value;
 }
 
 function parseAllowances(value: unknown, path: string): Readonly<Partial<Record<Backend, Allowance>>> {

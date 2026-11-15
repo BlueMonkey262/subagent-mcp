@@ -10,7 +10,7 @@ import type { Usage } from "../../core/types.js";
 import { EventBuffer } from "../../events/buffer.js";
 import type { AgentEvent, NewAgentEvent, NormalizedEventData, NormalizedEventType } from "../../events/schema.js";
 import { scanChildOutput } from "../../safety/output.js";
-import type { AdapterTurn, BackendAdapter, EventOptions, ResumeRequest, SpawnRequest } from "../adapter.js";
+import type { AdapterLiveness, AdapterTurn, BackendAdapter, EventOptions, ResumeRequest, SpawnRequest } from "../adapter.js";
 
 /**
  * Cursor Agent CLI adapter. Unlike Claude/Codex/Antigravity, the Cursor CLI is one process per
@@ -174,6 +174,15 @@ export class CursorAdapter implements BackendAdapter {
       `Cursor print mode does not expose approval ${resolution.requestId} to the host`,
       { agentId, requestId: resolution.requestId },
     );
+  }
+
+  liveness(agentId: string): AdapterLiveness {
+    const session = this.#sessions.get(agentId);
+    if (session === undefined) return { state: "unknown", reason: "no live Cursor session" };
+    if (session.exited || session.child.exitCode !== null || session.child.signalCode !== null) {
+      return { state: "stale", reason: "Cursor process exited" };
+    }
+    return { state: "live" };
   }
 
   async close(agentId: string): Promise<void> {
