@@ -1,4 +1,5 @@
 import type { ApprovalRequest } from "../approval/types.js";
+import type { FailureAction, FailureCategory } from "../core/failure.js";
 import type { Backend, Usage } from "../core/types.js";
 
 export type NormalizedEventData = {
@@ -31,6 +32,14 @@ export type NormalizedEventData = {
     readonly code: string;
     readonly message: string;
     readonly fatal: boolean;
+    /** Backend-neutral classification for automation. */
+    readonly category?: FailureCategory;
+    readonly retryable?: boolean;
+    readonly recommended_action?: FailureAction;
+    readonly retry_after_seconds?: number;
+    readonly source?: "adapter" | "supervisor";
+    readonly turnId?: string;
+    readonly subtype?: string;
     /**
      * Set when the error describes how a successful turn went (for example actions that were denied),
      * so it stays on the agent after the turn completes. Other non-fatal errors, such as a rate limit

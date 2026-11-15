@@ -1,4 +1,5 @@
 import type { Backend } from "./types.js";
+import { classifyFailure } from "./failure.js";
 
 /**
  * The upstream provider a turn bills against, when the backend makes it knowable from the model id.
@@ -15,15 +16,25 @@ export function providerOf(backend: Backend, model: string): string | undefined 
 export type ProviderErrorClass = "rate_limit" | "auth" | "quota";
 
 /**
- * Classify a provider error by HTTP status first, then by message text. Unknown errors stay
+ * Classify a provider error by HTTP status first, then by message text, by delegating to
+ * `classifyFailure` so the cooldown decision and the error the agent reports are the same
+ * judgement. Only the three classes that mean "back off" survive here; anything else stays
  * unclassified rather than being guessed into a class that would trigger a cooldown.
+ * The one rule that lives here instead of in the shared engine is HTTP 402, which is billing.
  */
 export function classifyProviderError(message: string, statusCode?: number): ProviderErrorClass | undefined {
-  if (statusCode === 429) return "rate_limit";
-  if (statusCode === 401 || statusCode === 403) return "auth";
   if (statusCode === 402) return "quota";
-  if (/\b429\b|rate[ _-]?limit|too many requests|requests per (second|minute)|throttl/i.test(message)) return "rate_limit";
-  if (/\b40[13]\b|unauthori[sz]ed|invalid (api )?key|api key (is )?(invalid|missing)|authentication|forbidden/i.test(message)) return "auth";
-  if (/\b402\b|insufficient (funds|credit|balance)|quota exceeded|exceeded your (current )?quota|billing/i.test(message)) return "quota";
-  return undefined;
+  const info = classifyFailure({
+    message,
+    ...(statusCode === undefined ? {} : { httpStatus: statusCode }),
+  });
+  const category = info.category;
+  switch (category) {
+    case "rate_limit":
+    case "auth":
+    case "quota":
+      return category;
+    default:
+      return undefined;
+  }
 }

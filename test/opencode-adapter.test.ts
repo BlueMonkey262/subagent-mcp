@@ -122,6 +122,21 @@ async function nextEvent(iterator: AsyncIterator<AgentEvent>, type: string): Pro
   }
 }
 
+async function nextEventWithin(iterator: AsyncIterator<AgentEvent>, type: string, ms = 1_000): Promise<AgentEvent> {
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    return await Promise.race([
+      nextEvent(iterator, type),
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error(`timed out waiting for ${type}`)), ms);
+        timer.unref();
+      }),
+    ]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+}
+
 function assistant(id: string, content: unknown[], extra: Record<string, unknown> = {}): Record<string, unknown> {
   return {
     id,
@@ -214,6 +229,29 @@ test("v2: failed and interrupted outcomes map to the matching turn status", asyn
       await adapter.closeAll();
       fake.close();
     }
+  }
+});
+
+test("v2: a failed idle with no error still emits OPENCODE_TURN_FAILED before turn.completed", async () => {
+  const fake = new FakeV2();
+  const baseUrl = await fake.listen();
+  const adapter = new OpenCodeAdapter({ baseUrl, protocol: "v2", password: PASSWORD, ...fast });
+  try {
+    const turn = await adapter.spawn(request());
+    const events = adapter.events(turn.agentId)[Symbol.asyncIterator]();
+    fake.push({ id: "msg_idle_failed", type: "idle", time: { created: Date.now() }, outcome: "failed" });
+    const error = await nextEventWithin(events, "error");
+    assert.deepEqual(error.data, {
+      code: "OPENCODE_TURN_FAILED",
+      message: "OpenCode turn ended with failed",
+      fatal: false,
+      details: { outcome: "failed" },
+    });
+    const done = await nextEventWithin(events, "turn.completed");
+    assert.equal((done.data as { status: string }).status, "failed");
+  } finally {
+    await adapter.closeAll();
+    fake.close();
   }
 });
 

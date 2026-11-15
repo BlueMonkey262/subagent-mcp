@@ -167,6 +167,33 @@ test("persistent process normalizes results, preserves one session, and scans ou
   }
 });
 
+test("is_error with subtype success is never translated to CLAUDE_SUCCESS", async () => {
+  const cwd = await realpath(await mkdtemp(path.join(os.tmpdir(), "claude-adapter-error-")));
+  const adapter = await fixtureAdapter(cwd);
+  try {
+    const turn = await adapter.spawn(spawnRequest(cwd, "QUOTA_ERROR"));
+    const events = await eventsThrough(adapter, turn.agentId, (event) => event.type === "turn.completed");
+    const error = events.find((event) => event.type === "error");
+    assert.ok(error);
+    assert.equal(error.data.code, "CLAUDE_RESULT_ERROR");
+    assert.notEqual(error.data.code, "CLAUDE_SUCCESS");
+    assert.equal(error.data.subtype, "success");
+    assert.equal(error.data.details?.is_error, true);
+    assert.match(error.data.message, /usage limit/);
+    assert.equal(events.find((event) => event.type === "turn.completed")?.data.status, "failed");
+    const cursor = events.at(-1)!.sequence;
+
+    const empty = await adapter.resume(resumeRequest(spawnRequest(cwd, "ERROR_NO_MESSAGE"), turn.agentId, "ERROR_NO_MESSAGE"));
+    const emptyEvents = await eventsThrough(adapter, empty.agentId, (event) => event.type === "turn.completed", cursor);
+    const emptyError = emptyEvents.find((event) => event.type === "error");
+    assert.ok(emptyError);
+    assert.equal(emptyError.data.code, "CLAUDE_RESULT_ERROR");
+    assert.equal(emptyError.data.message, "Claude reported an error result without a message");
+  } finally {
+    await adapter.closeAll();
+  }
+});
+
 test("approval uses full control envelope and keeps control/tool IDs distinct", async () => {
   const cwd = await realpath(await mkdtemp(path.join(os.tmpdir(), "claude-adapter-approval-")));
   const transcript = path.join(cwd, "stdin.jsonl");

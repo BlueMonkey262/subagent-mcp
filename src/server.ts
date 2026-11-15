@@ -12,6 +12,7 @@ import { BACKENDS, isBackend } from "./core/types.js";
 import { NORMALIZED_EVENT_TYPES } from "./events/schema.js";
 import { HostSession, runHost } from "./host.js";
 import { ORCHESTRATOR_AUTHORITY_NOTICE } from "./prompt-policy.js";
+import { attachSessionAfterInitialize } from "./session.js";
 
 async function main(): Promise<void> {
   if (process.env.SUBAGENT_MCP_HOST === "1") {
@@ -30,8 +31,8 @@ async function main(): Promise<void> {
   host.onDetached(createChannelNotifier(server.server));
   host.onEnsemble(createEnsembleChannelNotifier(server.server));
   await host.connect();
-  const call = async (method: string, params?: unknown): Promise<unknown> => {
-    const result = await host.call(method, params);
+  const call = async (method: string, params?: unknown, timeoutMs = 0): Promise<unknown> => {
+    const result = await host.call(method, params, timeoutMs);
     const warning = host.warning();
     return warning !== undefined && typeof result === "object" && result !== null && !Array.isArray(result)
       ? { ...result, host_warning: warning }
@@ -56,6 +57,11 @@ async function main(): Promise<void> {
         "patterns, or Claude models) are refused: pick another. If a Claude subagent is really needed while Claude " +
         "models are blocked, ask the user for explicit approval and use your built-in Agent tool instead. " +
         "Results are capped at 4000 characters by default; set `max_result_chars` to override the cap. " +
+        "To run work later (for example overnight), pass `start_at` (ISO datetime) or `delay_seconds`; exactly one " +
+        "is allowed, it must be within 7 days, and the call returns immediately with a queued task receipt " +
+        "`{task_id, agent_id, status: \"queued\", start_at}`. `notify` chooses whether a completion ping is sent: " +
+        "`always` (default), `on_failure`, or `never`; needs_approval always pings because the agent is blocked. " +
+        "Queued and scheduled tasks persist across host restarts. " +
         ORCHESTRATOR_AUTHORITY_NOTICE,
       inputSchema: {
         agent: z.string().describe("Name of a configured agent in .subagents/<name>.md"),
@@ -75,6 +81,18 @@ async function main(): Promise<void> {
         isolation: z.enum(['none','worktree']).optional().describe('Managed Git worktree; does not enforce filesystem confinement. Starts from committed HEAD.'),
         group_id: z.string().optional(),
         depends_on: z.array(z.string()).min(1).optional().describe('Existing agent IDs/names; pins their current turns and queues until successful'),
+        start_at: z.iso.datetime().optional().describe(
+          "ISO datetime at which a queued spawn may start. Mutually exclusive with delay_seconds; must be in the " +
+          "future and within 7 days. Returns a queued receipt immediately.",
+        ),
+        delay_seconds: z.number().int().positive().max(604_800).optional().describe(
+          "Positive seconds from now at which a queued spawn may start. Mutually exclusive with start_at; at most " +
+          "7 days. Returns a queued receipt immediately.",
+        ),
+        notify: z.enum(['always', 'on_failure', 'never']).optional().describe(
+          "Completion ping policy: always (default), on_failure, or never. needs_approval always pings. " +
+          "Results remain retrievable regardless.",
+        ),
         result_schema: z.record(z.string(), z.unknown()).optional().describe('JSON Schema for locally validated JSON output'),
         permission: z.object({ allow: z.array(z.string()), deny: z.array(z.string()), default: z.enum(['allow','deny','escalate']), mode: z.literal('manual').optional() }).optional().describe('Narrow config permissions; Claude only'),
         max_turns: z.number().int().positive().optional(),
@@ -92,16 +110,23 @@ async function main(): Promise<void> {
     {
       title: "Resume subagent",
       description:
-        "Resume a completed agent by ID or name, preserving its full history. Blocks like spawn_agent. " +
-        "Codex resumes replay the whole thread with no prompt cache: the result includes a warning, and a resume " +
-        "after a long idle (default 30 minutes, codexResumeIdleSeconds in models.yaml) is refused unless " +
-        "allow_expensive_resume is true. `timeout` is the turn cap in seconds and is echoed as timeout_seconds. " +
-        "If the agent is still mid-turn, this queues the message (one slot) for delivery the moment the current turn " +
-        "ends, rather than failing — call list_agents/get_agent_events if you need to know when it lands. Results " +
-        "are capped at 4000 characters by default; set `max_result_chars` to override the cap.",
+        "Resume a completed agent by ID or name, preserving its full history. Blocks for at most `wait_seconds` " +
+        "(default 30 seconds, or sendMessageWaitSeconds in models.yaml); on expiry it returns status \"running\" with " +
+        "`wait_expired: true` and leaves the turn running. Codex resumes replay the whole thread with no prompt cache: " +
+        "the result includes a warning, and a resume after a long idle (default 30 minutes, codexResumeIdleSeconds in " +
+        "models.yaml) is refused unless allow_expensive_resume is true. `timeout` is the turn cap in seconds and is " +
+        "echoed as timeout_seconds. If the agent is still mid-turn, this queues the message (one slot) for delivery " +
+        "the moment the current turn ends — call list_agents/get_agent_events if you need to know when it lands. " +
+        "`notify` changes the completion ping policy for this and later turns (`always`, `on_failure`, `never`); " +
+        "needs_approval always pings. Results are capped at 4000 characters by default; set `max_result_chars` to " +
+        "override the cap.",
       inputSchema: {
         agent: z.string().describe("Agent ID or name"),
         prompt: z.string(),
+        notify: z.enum(['always', 'on_failure', 'never']).optional().describe(
+          "Completion ping policy for this and later turns: always (default), on_failure, or never. " +
+          "needs_approval always pings.",
+        ),
         effort: z.string().optional().describe(
           "Reasoning effort for this turn (Codex, Antigravity and Copilot per-turn; Claude only when the session must cold-start). " +
           "OpenCode, Cursor and Vibe reject it. Defaults to the value used at spawn.",
@@ -109,8 +134,15 @@ async function main(): Promise<void> {
         timeout: z.number().int().positive().optional().describe(
           "Turn cap in seconds for this resume. Overrides the agent config. Echoed back as timeout_seconds.",
         ),
+        wait_seconds: z.number().min(0).max(86_400).optional().describe(
+          "How long this call waits for the turn to settle before returning status \"running\". " +
+          "Defaults to sendMessageWaitSeconds (30s). 0 returns immediately. This does not cancel the turn.",
+        ),
         allow_expensive_resume: z.boolean().optional().describe(
           "Resume a Codex agent even though it has been idle past the uncached-replay limit.",
+        ),
+        allow_agent_definition_change: z.boolean().optional().describe(
+          "Resume an Antigravity conversation even though its custom-agent file changed since spawn.",
         ),
         run_in_background: z.boolean().optional(),
         max_result_chars: z.number().int().positive().optional().describe("Maximum result characters returned by this call"),
@@ -125,16 +157,20 @@ async function main(): Promise<void> {
       title: "List agents",
       description:
         "List agents tracked by this host, including ones restored after a reconnect, with their lifecycle state " +
-        "and human-memorable name. Refer to agents by name in later tool calls. Also reports timeout_seconds, the " +
-        "concurrency cap, how many agents are active, and how many spawns are waiting. Newest first by creation " +
-        "time; order and cursors are stable while agents run, so pages never skip or repeat an agent.",
+        "and human-memorable name. Refer to agents by name in later tool calls. Active agents report `liveness` " +
+        "(`live`, `stale`, or `unknown`), `last_heartbeat_at`, and a `liveness_reason`; a backend whose process is " +
+        "gone is marked failed with an `AGENT_UNRESPONSIVE` error and its capacity slot is released. Failed agents " +
+        "always include a structured `error` with `category`, `retryable`, and `recommended_action`. Queued and " +
+        "scheduled rows carry `start_at` and `notify`. Also reports " +
+        "timeout_seconds, per-backend/per-model concurrency pools, and how many spawns are waiting. Newest first by " +
+        "creation time; order and cursors are stable while agents run, so pages never skip or repeat an agent.",
       inputSchema: {
         states: z.array(z.enum(['starting','running','needs_approval','completed','interrupted','failed','queued','blocked'])).optional(),
         backend: z.enum(BACKENDS).optional(), updated_since: z.iso.datetime().optional(),
         limit: z.number().int().min(1).max(100).optional(), cursor: z.string().optional(),
       },
     },
-    async input => toContent(await call("list_agents", input)),
+    async input => toContent(await call("list_agents", input, 10_000)),
   );
 
   server.registerTool('list_agent_configs', { description: 'Discover callable configs, source files, pinned options and backend capabilities', inputSchema: {} },
@@ -250,7 +286,8 @@ async function main(): Promise<void> {
       description:
         "Config-sourced model roster plus per-backend usage counters (spawns, resumes, turns, failures, timeouts, " +
         "tokens, and cost) and, when models.yaml sets allowances, how much of each allowance is left. Also reports " +
-        "the concurrency cap, the number of active agents, and how many spawns are waiting for a slot. " +
+        "the concurrency cap, per-backend/per-model pool state, the number of active agents, and how many spawns " +
+        "are waiting for a slot. " +
         "With `live` (on by default when one `backend` is named), adds a `live` section from the backend's own API. " +
         "OpenCode >= 2: every model the server can run (context, max output, USD cost per million tokens), its default " +
         "model, OpenCode Go rolling/weekly/monthly usage and workspace budgets. Codex: the model catalog (reasoning " +
@@ -331,7 +368,9 @@ async function main(): Promise<void> {
       title: "Restart host",
       description:
         "Restart this project's subagent-mcp host so it runs the subagent-mcp code currently on disk (after a " +
-        "rebuild). Agent records, results and usage are kept. Always refused while any agent is running, waiting " +
+        "rebuild). Agent records, results and usage are kept, and queued or scheduled (`start_at`/`delay_seconds`) " +
+        "tasks persist so a restart is safe for them; the replacement host re-arms their timers and the result " +
+        "reports `scheduled_tasks_preserved`. Undelivered pings are kept too. Always refused while any agent is running, waiting " +
         "for a slot, or waiting for approval. Also refused when the host already runs the code on disk, or when " +
         "other Claude Code sessions are connected to it (restarting would disconnect them); ask the user before " +
         "passing `force: true` to override those two. Reconnecting with `/mcp` already reloads an idle host that no " +
@@ -345,6 +384,8 @@ async function main(): Promise<void> {
   );
 
   const transport = new StdioServerTransport();
+  // Probes and non-Claude clients never attach; the queue is drained after initialize for Claude Code.
+  attachSessionAfterInitialize(server.server, host);
   await server.connect(transport);
 
   // The host process owns the agents. Exiting this proxy must not kill them.
