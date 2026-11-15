@@ -69,6 +69,14 @@ lines.on("line", (line) => {
       return;
     }
     if (prompt.includes("HANG")) return;
+    if (prompt.includes("QUOTA_ERROR")) {
+      result("Claude AI usage limit reached", uuid, { is_error: true, errors: ["Claude AI usage limit reached"] });
+      return;
+    }
+    if (prompt.includes("ERROR_NO_MESSAGE")) {
+      result("", uuid, { is_error: true, errors: [] });
+      return;
+    }
     if (prompt.includes("APPROVAL")) {
       const controlRequestId = `control-${turn}`;
       const toolUseId = `tool-${turn}`;

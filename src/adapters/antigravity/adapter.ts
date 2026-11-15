@@ -10,7 +10,7 @@ import type { Usage } from "../../core/types.js";
 import { EventBuffer } from "../../events/buffer.js";
 import type { AgentEvent, NewAgentEvent, NormalizedEventData, NormalizedEventType } from "../../events/schema.js";
 import { scanChildOutput } from "../../safety/output.js";
-import type { AdapterTurn, BackendAdapter, EventOptions, ResumeRequest, SpawnRequest } from "../adapter.js";
+import type { AdapterLiveness, AdapterTurn, BackendAdapter, EventOptions, ResumeRequest, SpawnRequest } from "../adapter.js";
 import { ensureAntigravityAgent } from "./agent-definition.js";
 
 const DEFAULT_INIT_TIMEOUT_MS = 15_000;
@@ -49,6 +49,16 @@ interface Deferred<T> {
   settled: boolean;
 }
 
+interface DeniedTool {
+  readonly toolName: string;
+  readonly errorMessage?: string;
+}
+
+interface DeniedAction {
+  readonly action: string;
+  readonly displayName?: string;
+}
+
 interface AntigravityTurn {
   readonly id: string;
   terminal: boolean;
@@ -56,6 +66,8 @@ interface AntigravityTurn {
   timedOut: boolean;
   timeout?: NodeJS.Timeout;
   interruptPromise?: Promise<void>;
+  /** Reset with each new turn; a tool step can report a denial before the result does. */
+  readonly deniedTools: DeniedTool[];
 }
 
 interface AntigravitySession {
@@ -112,7 +124,7 @@ export class AntigravityAdapter implements BackendAdapter {
 
   async spawn(request: SpawnRequest): Promise<AdapterTurn> {
     validateRequest(request);
-    await this.#prepareAgentDefinition(request.cwd, request.antigravityAgent);
+    await this.#prepareAgentDefinition(request.cwd, request.antigravityAgent, request.antigravityAgentFile);
     const turnId = randomUUID();
     const session = this.#launch(request, turnId);
     const agentId = await session.ready.promise;
@@ -140,7 +152,7 @@ export class AntigravityAdapter implements BackendAdapter {
     }
 
     const turnId = randomUUID();
-    await this.#prepareAgentDefinition(request.cwd, request.antigravityAgent);
+    await this.#prepareAgentDefinition(request.cwd, request.antigravityAgent, request.antigravityAgentFile);
     const session = this.#launch({
       model: request.model,
       ...(request.antigravityAgent === undefined ? {} : { antigravityAgent: request.antigravityAgent }),
@@ -200,6 +212,18 @@ export class AntigravityAdapter implements BackendAdapter {
     );
   }
 
+  liveness(agentId: string): AdapterLiveness {
+    const session = this.#sessions.get(agentId);
+    if (session === undefined) return { state: "unknown", reason: "no live Antigravity session" };
+    if (session.exited || session.terminated || session.child.exitCode !== null || session.child.signalCode !== null) {
+      return { state: "stale", reason: "Antigravity process exited or was terminated" };
+    }
+    if (session.child.stdin.destroyed || !session.child.stdin.writable) {
+      return { state: "stale", reason: "Antigravity stdin is no longer writable" };
+    }
+    return { state: "live" };
+  }
+
   async close(agentId: string): Promise<void> {
     const session = this.#requireSession(agentId);
     if (!session.currentTurn.terminal) await this.interrupt(agentId);
@@ -211,10 +235,14 @@ export class AntigravityAdapter implements BackendAdapter {
     for (const launch of this.#launches) this.#terminate(launch);
   }
 
-  async #prepareAgentDefinition(cwd: string, agentName: string | undefined): Promise<void> {
+  async #prepareAgentDefinition(cwd: string, agentName: string | undefined, agentFile?: string): Promise<void> {
     const name = requireAgentName(agentName);
     try {
-      const ensured = await ensureAntigravityAgent({ cwd, name });
+      const ensured = await ensureAntigravityAgent({
+        cwd,
+        name,
+        ...(agentFile === undefined ? {} : { file: agentFile }),
+      });
       if (ensured.copied && ensured.copiedFrom !== undefined) {
         process.stderr.write(
           `subagent-mcp: Antigravity agent "${name}" was missing; copied ${ensured.copiedFrom} to ${ensured.path}\n`,
@@ -387,14 +415,24 @@ export class AntigravityAdapter implements BackendAdapter {
         input: isRecord(toolInfo.parameters) ? toolInfo.parameters : {},
       });
     }
-    if (step.state !== "DONE" || session.completedTools.has(toolCallId)) return;
+    // A tool step ends in DONE, or in ERROR when it failed or headless mode denied it.
+    if ((step.state !== "DONE" && step.state !== "ERROR") || session.completedTools.has(toolCallId)) return;
     session.completedTools.add(toolCallId);
-    const failed = isRecord(toolInfo.error);
+    const error = isRecord(toolInfo.error) ? toolInfo.error : undefined;
+    const status = error === undefined && step.state === "DONE" ? "completed"
+      : isPermissionDenial(error) ? "denied" : "failed";
+    if (status === "denied") {
+      session.currentTurn.deniedTools.push({
+        toolName,
+        ...(typeof error?.message === "string" ? { errorMessage: error.message } : {}),
+      });
+    }
+    const output = toolEndOutput(status, toolInfo, error);
     this.#emit(session, "tool.end", {
       toolCallId,
       toolName,
-      status: failed ? "failed" : "completed",
-      ...(toolInfo.output === undefined ? {} : { output: toolInfo.output }),
+      status,
+      ...(output === undefined ? {} : { output }),
     });
   }
 
@@ -415,10 +453,30 @@ export class AntigravityAdapter implements BackendAdapter {
         fatal: false,
       });
     }
+    const response = typeof result.response === "string" ? scanChildOutput(result.response) : undefined;
+    // Headless agy auto-denies actions no permissions.allow rule covers. The result still says
+    // SUCCESS, often with an empty response, so name the denied actions instead of returning nothing.
+    const denied = deniedActions(result, session.currentTurn.deniedTools);
+    let outcome: "completed" | "interrupted" | "failed" = normalized;
+    let finalText = response;
+    if (denied.length > 0) {
+      const message = deniedActionsMessage(denied);
+      this.#emit(session, "error", {
+        code: "ANTIGRAVITY_PERMISSION_DENIED",
+        message,
+        fatal: false,
+        persists: true,
+        details: { deniedActions: denied },
+      });
+      if (response === undefined || response.trim() === "") {
+        finalText = message;
+        if (outcome === "completed") outcome = "failed";
+      }
+    }
     this.#completeTurn(
       session,
-      session.currentTurn.timedOut ? "failed" : session.currentTurn.interruptRequested ? "interrupted" : normalized,
-      typeof result.response === "string" ? scanChildOutput(result.response) : undefined,
+      session.currentTurn.timedOut ? "failed" : session.currentTurn.interruptRequested ? "interrupted" : outcome,
+      finalText,
       extractUsage(result),
     );
   }
@@ -602,7 +660,7 @@ function requireAgentName(value: string | undefined): string {
 }
 
 function newTurn(id: string): AntigravityTurn {
-  return { id, terminal: false, interruptRequested: false, timedOut: false };
+  return { id, terminal: false, interruptRequested: false, timedOut: false, deniedTools: [] };
 }
 
 function deferred<T>(): Deferred<T> {
@@ -613,6 +671,70 @@ function deferred<T>(): Deferred<T> {
     rejectPromise = reject;
   });
   return { promise, resolve: resolvePromise, reject: rejectPromise, settled: false };
+}
+
+/** agy reports a headless permission denial as a TOOL_ERROR whose message says so. */
+function isPermissionDenial(error: Readonly<Record<string, unknown>> | undefined): boolean {
+  return typeof error?.message === "string" && /permission check failed|denied permission/i.test(error.message);
+}
+
+function deniedActions(
+  result: Readonly<Record<string, unknown>>,
+  stepDenials: readonly DeniedTool[],
+): DeniedAction[] {
+  const entries = Array.isArray(result.denied_actions) ? result.denied_actions.filter(isRecord) : [];
+  // The result can omit denied_actions entirely, or carry entries without an action. Fall back to
+  // the tool step that already reported the denial so the parent still learns what was blocked.
+  if (entries.length === 0) {
+    return stepDenials.map((denial) => ({ action: ruleActionForTool(denial.toolName) }));
+  }
+  const denied = new Map<string, DeniedAction>();
+  entries.forEach((entry, index) => {
+    const displayName = nonEmptyString(entry.display_name);
+    const stepError = nonEmptyString(stepDenials[index]?.errorMessage);
+    const action = nonEmptyString(entry.action)
+      ?? displayName
+      ?? (stepError === undefined ? undefined : scanChildOutput(stepError))
+      ?? "tool";
+    denied.set(action, { action, ...(displayName === undefined ? {} : { displayName }) });
+  });
+  return [...denied.values()];
+}
+
+/** agy's rule syntax names commands as `command(...)`; the tool step calls it `run_command`. */
+function ruleActionForTool(toolName: string): string {
+  if (toolName === "run_command") return "command";
+  if (toolName.startsWith("run_") && toolName.length > "run_".length) return toolName.slice("run_".length);
+  return toolName === "" ? "tool" : toolName;
+}
+
+function deniedActionsMessage(denied: readonly DeniedAction[]): string {
+  const names = denied.map((entry) => entry.displayName === undefined || entry.displayName === entry.action
+    ? entry.action
+    : `${entry.action} (${entry.displayName})`);
+  return `Antigravity headless mode auto-denied: ${names.join(", ")}. Headless runs cannot ask for approval. `
+    + `To allow only a specific action, add a narrow allow rule under permissions.allow in `
+    + `~/.gemini/antigravity-cli/settings.json; for example "command(git)" allows only git commands, `
+    + `while a broad wildcard such as "command(*)" grants every command. Keep dangerous commands blocked `
+    + `with a deny rule such as "command(sudo)" under permissions.deny.`;
+}
+
+function toolEndOutput(
+  status: "completed" | "failed" | "denied",
+  toolInfo: Readonly<Record<string, unknown>>,
+  error: Readonly<Record<string, unknown>> | undefined,
+): unknown {
+  if (status === "completed" || error === undefined) return toolInfo.output;
+  // Keep a partial or empty output but also carry the reason, so a failed/denied tool does not lose
+  // its error when `output` is "" or truncated. Error text gets the same hygiene as other child text.
+  return {
+    ...(toolInfo.output === undefined ? {} : { output: toolInfo.output }),
+    error: typeof error.message === "string" ? { ...error, message: scanChildOutput(error.message) } : error,
+  };
+}
+
+function nonEmptyString(value: unknown): string | undefined {
+  return typeof value === "string" && value.trim() !== "" ? value : undefined;
 }
 
 function extractUsage(result: Readonly<Record<string, unknown>>): Usage | undefined {

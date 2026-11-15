@@ -169,10 +169,17 @@ Work.
   );
 });
 
-test("models.yaml can set the concurrency cap, Codex resume idle, and allowances", async () => {
+test("models.yaml can set concurrency, stale limits, per-pool caps, and allowances", async () => {
   const { agents, models } = await fixture();
   await writeFile(models, `maxConcurrent: 4
 codexResumeIdleSeconds: 600
+staleAgentSeconds: 90
+sendMessageWaitSeconds: 45
+perBackendConcurrency:
+  opencode: 2
+perModelConcurrency:
+  "opencode:local/*": 1
+  "*gpt-5.6*": 3
 allowances:
   cursor:
     maxSpawns: 8
@@ -194,6 +201,13 @@ Work.
   const registry = await loadConfigRegistry({ agentsDirectory: agents, modelsFile: models });
   assert.equal(registry.maxConcurrent(), 4);
   assert.equal(registry.codexResumeIdleMs(), 600_000);
+  assert.equal(registry.staleAgentMs(), 90_000);
+  assert.equal(registry.sendMessageWaitMs(), 45_000);
+  assert.deepEqual(registry.perBackendConcurrency(), { opencode: 2 });
+  assert.deepEqual(registry.perModelConcurrency(), [
+    { pattern: "opencode:local/*", limit: 1 },
+    { pattern: "*gpt-5.6*", limit: 3 },
+  ]);
   assert.deepEqual(registry.allowances().cursor, { maxSpawns: 8, maxCostUsd: 1.5 });
 });
 
@@ -244,6 +258,7 @@ name: antigravity
 backend: antigravity
 description: Antigravity code reviewer
 antigravityAgent: code-reviewer
+antigravityAgentFile: .agents/agents/code-reviewer.md
 ---
 This must be mirrored by the Antigravity custom-agent Markdown body.
 `);
@@ -257,6 +272,7 @@ No custom agent.
   const registry = await loadConfigRegistry({ agentsDirectory: agents, modelsFile: models });
   const resolved = registry.resolveAgent({ agent: "antigravity", model: "gemini-3.8-flash-high" });
   assert.equal(resolved.antigravityAgent, "code-reviewer");
+  assert.equal(resolved.antigravityAgentFile, ".agents/agents/code-reviewer.md");
   assert.throws(
     () => registry.resolveAgent({ agent: "missing-agent", model: "gemini-3.8-flash-high" }),
     /does not set antigravityAgent/,
@@ -308,8 +324,8 @@ Work.
   });
   await writeFile(models, `blockClaudeModels: "yes"\n${roster}`);
   await assert.rejects(load(), /blockClaudeModels must be true or false/);
-  await writeFile(models, `disabledBackends: [copilot]\n${roster}`);
-  await assert.rejects(load(), /"copilot" is not a backend/);
+  await writeFile(models, `disabledBackends: [windsurf]\n${roster}`);
+  await assert.rejects(load(), /"windsurf" is not a backend/);
   await writeFile(models, `blockModels: grok\n${roster}`);
   await assert.rejects(load(), /blockModels must be an array/);
 });

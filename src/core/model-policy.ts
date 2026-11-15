@@ -93,6 +93,13 @@ function matchesGlob(value: string, glob: string): boolean {
   return globIndex === glob.length;
 }
 
+/** Whether a `backend:model-glob` pattern matches one backend/model pair. Shared with concurrency rules. */
+export function matchesModelPattern(pattern: string, backend: Backend, model: string): boolean {
+  const compiled = compilePattern(pattern);
+  return (compiled.backend === undefined || compiled.backend === backend)
+    && matchesGlob(model, compiled.glob);
+}
+
 /** Why `policy` refuses `model` on `backend`, or undefined when it may run. */
 export function blockReason(
   policy: ModelPolicy,
@@ -184,6 +191,11 @@ export function applyPolicyEnv(file: ModelPolicy, env: NodeJS.ProcessEnv = proce
     disabledBackends: [...new Set([...file.disabledBackends, ...disabled])],
     blockModels: [...new Set([...file.blockModels, ...patterns])],
   };
+}
+
+/** The backends `SUBAGENT_MCP_DISABLED_BACKENDS` disables, whatever models.yaml says. */
+export function envDisabledBackends(env: NodeJS.ProcessEnv = process.env): Backend[] {
+  return parseBackendList(readList(env, DISABLED_BACKENDS_ENV), DISABLED_BACKENDS_ENV);
 }
 
 /** True when any rule is active. */

@@ -5,6 +5,8 @@ import type { AgentEvent } from "../events/schema.js";
 
 export interface SpawnRequest {
   readonly prompt: string;
+  /** Vibe only: which transport a new agent uses. A resumed agent keeps its own (see the Vibe adapter). */
+  readonly vibeTransport?: "cli" | "acp";
   readonly description: string;
   /** Always resolved and roster-validated before reaching an adapter. */
   readonly model: string;
@@ -12,6 +14,8 @@ export interface SpawnRequest {
   readonly modelProvider?: string;
   /** Antigravity custom-agent name. Only Antigravity honors this. */
   readonly antigravityAgent?: string;
+  /** Antigravity explicit definition file (`antigravityAgentFile`); seeded from its template if missing. */
+  readonly antigravityAgentFile?: string;
   readonly cwd: string;
   /** Resolved agent execution config; empty values are explicit, never backend defaults. */
   readonly systemPrompt: string;
@@ -19,9 +23,13 @@ export interface SpawnRequest {
   readonly permission: PermissionConfig;
   readonly maxTurns?: number;
   readonly timeoutMs?: number;
+  /** Vibe only: per-turn token cap (`--max-tokens`). */
+  readonly vibeMaxTokens?: number;
+  /** Vibe only: approximate per-turn dollar cap (`--max-price`), from Vibe's own price table. */
+  readonly vibeMaxPriceUsd?: number;
   /**
    * Reasoning effort (e.g. "low"/"medium"/"high"/"xhigh"/"max"). Claude maps it to `--effort` at
-   * launch; Codex and Antigravity apply it per turn. The registry rejects it for OpenCode and
+   * launch; Codex, Antigravity and Copilot apply it per turn. The registry rejects it for OpenCode and
    * Cursor before an adapter sees it (Cursor folds effort into the model name).
    */
   readonly reasoningEffort?: string;
@@ -37,15 +45,21 @@ export interface ResumeRequest {
   readonly modelProvider?: string;
   /** Antigravity custom-agent name. Only Antigravity honors this. */
   readonly antigravityAgent?: string;
+  /** Antigravity explicit definition file (`antigravityAgentFile`); seeded from its template if missing. */
+  readonly antigravityAgentFile?: string;
   /** Re-resolved from the named config so a restarted adapter preserves execution policy. */
   readonly systemPrompt: string;
   readonly env: Readonly<Record<string, string>>;
   readonly permission: PermissionConfig;
   readonly maxTurns?: number;
   readonly timeoutMs?: number;
+  /** Vibe only: per-turn token cap (`--max-tokens`). */
+  readonly vibeMaxTokens?: number;
+  /** Vibe only: approximate per-turn dollar cap (`--max-price`), from Vibe's own price table. */
+  readonly vibeMaxPriceUsd?: number;
   /**
    * Reasoning effort (e.g. "low"/"medium"/"high"/"xhigh"/"max"). Claude maps it to `--effort` at
-   * launch; Codex and Antigravity apply it per turn. The registry rejects it for OpenCode and
+   * launch; Codex, Antigravity and Copilot apply it per turn. The registry rejects it for OpenCode and
    * Cursor before an adapter sees it (Cursor folds effort into the model name).
    */
   readonly reasoningEffort?: string;
@@ -61,6 +75,15 @@ export interface EventOptions {
   readonly since?: number;
   readonly signal?: AbortSignal;
 }
+
+/**
+ * Whether the adapter still owns a reporting channel for an agent. `stale` is authoritative:
+ * the backend process/session is gone, so no future event can arrive without a resume.
+ */
+export type AdapterLiveness =
+  | { readonly state: "live"; readonly detail?: string }
+  | { readonly state: "stale"; readonly reason: string }
+  | { readonly state: "unknown"; readonly reason?: string };
 
 /**
  * Persistent backend boundary. A turn receipt is not completion; terminal state and
@@ -80,6 +103,8 @@ export interface BackendAdapter {
   interrupt(agentId: string): Promise<void>;
   events(agentId: string, options?: EventOptions): AsyncIterable<AgentEvent>;
   approve(agentId: string, resolution: ApprovalResolution): Promise<void>;
+  /** Optional synchronous health probe used by `list_agents` and the stale-agent watchdog. */
+  liveness?(agentId: string): AdapterLiveness;
   /**
    * Optional live view of what the backend itself reports: models it can run and plan/quota usage.
    * Only backends with a queryable API implement it (OpenCode today); `list_models` surfaces it.

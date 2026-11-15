@@ -11,6 +11,33 @@ export type PanelAgent = {
   activity?: string
   /** Set while the agent is waiting on an approval. */
   approval?: { requestId: string; tool: string; command: string }
+  /** tool, thinking, approval while it runs (get_dashboard / list_agents phase); its state once settled. */
+  phase?: string
+  /** The last tool call it made, kept after the call ends. */
+  lastTool?: string
+  /** It has a managed worktree, so `v` can show its diff. */
+  worktree?: boolean
+  /** Ensemble name/role when it is an ensemble member. */
+  ensemble?: string
+}
+
+export type PanelEnsemble = {
+  id: string
+  name: string
+  status: string
+  valid: number
+  of: number
+  members: { role: string; name?: string; state: string; valid?: boolean }[]
+}
+
+/** The diff view for one agent: one file section at a time. */
+export type PanelDiff = {
+  agent: string
+  summary: string
+  /** Per-file unified diff sections, in order. */
+  sections: { path: string; patch: string }[]
+  index: number
+  truncated: boolean
 }
 
 /** What a confirmation is waiting on; null when nothing is. */
@@ -39,6 +66,10 @@ export type PanelState = {
   /** Backends the server refuses, and which of them come from the environment (not editable here). */
   disabled: string[]
   locked: string[]
+  /** Recent ensembles (get_dashboard); empty with a server that predates it. */
+  ensembles: PanelEnsemble[]
+  /** Set while the diff view is open. */
+  diff: PanelDiff | null
 }
 
 declare module 'claude-code' {

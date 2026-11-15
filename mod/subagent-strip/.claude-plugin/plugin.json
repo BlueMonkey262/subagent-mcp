@@ -1,6 +1,14 @@
 {
   "name": "subagent-strip",
-  "version": "0.6.0-dev",
-  "description": "Polls subagent-mcp and writes live agents to a file the status line script reads",
-  "types": "./types/index.d.ts"
+  "version": "0.7.0-dev",
+  "description": "Status line rows, the /subagent-mcp control panel and completion toasts for subagent-mcp agents",
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "toasts": {
+      "type": "boolean",
+      "title": "Toasts",
+      "description": "Show a toast when an agent finishes, needs approval, or an ensemble completes. The desktop app gets no subagent-mcp channel events, so this is how it hears about them.",
+      "default": true
+    }
+  }
 }

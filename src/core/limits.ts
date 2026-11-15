@@ -2,8 +2,14 @@ import { CapacityError, ConfigurationError } from "./errors.js";
 
 /** Default cap. Around a dozen live agents exhausts RAM; raise it via config or env. */
 export const MAX_CONCURRENT_AGENTS = 12;
+/** Bounded default wait for send_message before returning a running receipt. */
+export const DEFAULT_SEND_MESSAGE_WAIT_MS = 30_000;
+/** A running agent with no backend liveness signal for this long is reported stale. */
+export const DEFAULT_STALE_AGENT_MS = 5 * 60 * 1000;
 /** Codex resume replays the thread with no prompt cache. Refuse after this idle unless forced. */
 export const DEFAULT_CODEX_RESUME_IDLE_MS = 30 * 60 * 1000;
+/** A scheduled task restored later than this after its start is blocked as MISSED_START. */
+export const DEFAULT_SCHEDULED_GRACE_MS = 60 * 60 * 1000;
 export const MAX_AGENT_DEPTH = 3;
 export const AGENT_DEPTH_ENV = "SUBAGENT_MCP_DEPTH";
 export const MAX_CONCURRENT_ENV = "SUBAGENT_MCP_MAX_CONCURRENT";
@@ -39,20 +45,33 @@ export function childDepthEnv(env: NodeJS.ProcessEnv = process.env): NodeJS.Proc
 
 interface CapacityWaiter {
   readonly agentId: string;
+  readonly keys: readonly string[];
   readonly resolve: (release: () => void) => void;
 }
 
+export interface CapacityPoolView {
+  readonly key: string;
+  readonly limit?: number;
+  readonly active: number;
+  readonly waiting: number;
+}
+
 /**
- * Process-local capacity guard. `acquire` fails when the cap is full.
- * `acquireWhenFree` waits in FIFO order so a spawn queues instead of failing.
+ * Process-local capacity guard with a global cap and optional named pools. `acquire` fails when
+ * the cap is full; `acquireWhenFree` waits without blocking unrelated pools. Queue pumping scans
+ * for the first waiter whose global and named pools all fit, so one saturated local model cannot
+ * head-of-line block a spawn on another model.
  */
 export class AgentCapacity {
   readonly #active = new Set<string>();
   readonly #queue: CapacityWaiter[] = [];
   #limit: number;
+  readonly #poolLimits = new Map<string, number>();
+  readonly #poolActive = new Map<string, Set<string>>();
 
-  constructor(limit = MAX_CONCURRENT_AGENTS) {
+  constructor(limit = MAX_CONCURRENT_AGENTS, poolLimits: Readonly<Record<string, number>> = {}) {
     this.#limit = requirePositiveInteger(limit, "maxConcurrent");
+    this.setPoolLimits(poolLimits);
   }
 
   get limit(): number {
@@ -76,49 +95,112 @@ export class AgentCapacity {
     this.#pump();
   }
 
-  acquire(agentId: string): () => void {
+  setPoolLimits(limits: Readonly<Record<string, number>>): void {
+    this.#poolLimits.clear();
+    for (const [key, limit] of Object.entries(limits)) {
+      if (key.trim() === "") throw new ConfigurationError("capacity pool key must not be empty");
+      this.#poolLimits.set(key, requirePositiveInteger(limit, `capacity pool ${key}`));
+    }
+    this.#pump();
+  }
+
+  acquire(agentId: string, keys: readonly string[] = []): () => void {
     if (this.#active.has(agentId)) {
       throw new CapacityError(`Agent ${agentId} is already counted as active`, { agentId });
     }
-    if (this.#active.size >= this.#limit || this.#queue.length > 0) {
-      throw new CapacityError(`Concurrent agent limit of ${this.#limit} reached`, {
-        limit: this.#limit,
-        active: this.#active.size,
-        waiting: this.#queue.length,
-      });
+    if (this.#active.size >= this.#limit || this.#queue.length > 0 || !this.#fits(keys)) {
+      const blocked = this.#blockedPools(keys);
+      throw new CapacityError(
+        blocked.length > 0 ? `Concurrency pool limit reached: ${blocked.join(", ")}` : `Concurrent agent limit of ${this.#limit} reached`,
+        {
+          limit: this.#limit,
+          active: this.#active.size,
+          waiting: this.#queue.length,
+          ...(blocked.length === 0 ? {} : { blocked_pools: blocked }),
+        },
+      );
     }
-    return this.#hold(agentId);
+    return this.#hold(agentId, keys);
   }
 
-  /** Resolves when a slot is free. Callers wait instead of receiving a capacity error. */
-  acquireWhenFree(agentId: string): Promise<() => void> {
+  /** Resolves when the global slot and every named pool have room. */
+  acquireWhenFree(agentId: string, keys: readonly string[] = []): Promise<() => void> {
     if (this.#active.has(agentId)) {
       return Promise.reject(new CapacityError(`Agent ${agentId} is already counted as active`, { agentId }));
     }
-    if (this.#active.size < this.#limit && this.#queue.length === 0) {
-      return Promise.resolve(this.#hold(agentId));
+    if (this.#active.size < this.#limit && this.#queue.length === 0 && this.#fits(keys)) {
+      return Promise.resolve(this.#hold(agentId, keys));
     }
     return new Promise((resolve) => {
-      this.#queue.push({ agentId, resolve });
+      this.#queue.push({ agentId, keys, resolve });
+      this.#pump();
     });
   }
 
-  #hold(agentId: string): () => void {
+  /** Configured and currently-held pools, for `list_agents` / `list_models`. */
+  poolViews(): readonly CapacityPoolView[] {
+    const keys = new Set([...this.#poolLimits.keys(), ...this.#poolActive.keys()]);
+    return [...keys].sort().map((key) => {
+      const limit = this.#poolLimits.get(key);
+      return {
+        key,
+        ...(limit === undefined ? {} : { limit }),
+        active: this.#poolActive.get(key)?.size ?? 0,
+        waiting: this.#queue.filter((waiter) => waiter.keys.includes(key)).length,
+      };
+    });
+  }
+
+  #fits(keys: readonly string[]): boolean {
+    if (this.#active.size >= this.#limit) return false;
+    for (const key of keys) {
+      const limit = this.#poolLimits.get(key);
+      if (limit !== undefined && (this.#poolActive.get(key)?.size ?? 0) >= limit) return false;
+    }
+    return true;
+  }
+
+  #blockedPools(keys: readonly string[]): string[] {
+    return keys.filter((key) => {
+      const limit = this.#poolLimits.get(key);
+      return limit !== undefined && (this.#poolActive.get(key)?.size ?? 0) >= limit;
+    });
+  }
+
+  #hold(agentId: string, keys: readonly string[]): () => void {
     this.#active.add(agentId);
+    for (const key of keys) {
+      const active = this.#poolActive.get(key) ?? new Set<string>();
+      active.add(agentId);
+      this.#poolActive.set(key, active);
+    }
     let released = false;
     return () => {
       if (released) return;
       released = true;
       this.#active.delete(agentId);
+      for (const key of keys) {
+        const active = this.#poolActive.get(key);
+        if (active === undefined) continue;
+        active.delete(agentId);
+        if (active.size === 0) this.#poolActive.delete(key);
+      }
       this.#pump();
     };
   }
 
   #pump(): void {
-    while (this.#queue.length > 0 && this.#active.size < this.#limit) {
-      const next = this.#queue.shift();
-      if (next === undefined) return;
-      next.resolve(this.#hold(next.agentId));
+    let granted = true;
+    while (granted) {
+      granted = false;
+      for (let index = 0; index < this.#queue.length; index += 1) {
+        const next = this.#queue[index];
+        if (next === undefined || !this.#fits(next.keys)) continue;
+        this.#queue.splice(index, 1);
+        next.resolve(this.#hold(next.agentId, next.keys));
+        granted = true;
+        break;
+      }
     }
   }
 }

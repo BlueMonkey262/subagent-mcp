@@ -44,20 +44,18 @@ person's own files only with their yes, show diffs, and keep their comments and 
 
 Releases that change `models.yaml` or agent-config semantics must add a dated note here:
 
-- *2026-11-14, `.subagents/` is no longer tracked.* The repo now ships only templates
-  (`.subagents/<name>.md.example`, `.subagents/models.yaml.example`), and the rest of `.subagents/` is
-  gitignored. If `<repo>/.subagents/models.yaml` or a `<repo>/.subagents/<name>.md` has local edits, the swap
-  in step 4 refuses to fast-forward, because the release deletes those files. Move each edited file aside
-  first (`mv <file> <file>.mine`), merge, then `mv` it back. From then on they are ignored files that no
-  update touches. Agent configs without a real `<name>.md` still fall back to the bundled
-  `<name>.md.example`, but `models.yaml` has no live fallback. An install whose unedited `models.yaml` is
-  removed by this update must copy the example and keep the models it has:
-  `cp .subagents/models.yaml.example .subagents/models.yaml`, then edit it. With no `models.yaml`, the
-  server starts with an empty roster and `list_models` / `spawn_agent` report the paths checked and that
-  same instruction.
-  The example's Claude ids changed: `claude-sonnet-5` → `claude-sonnet-5-5`, `claude-opus-5` →
-  `claude-opus-5-5`, and `claude-haiku-4-5-20251001` → `claude-haiku-5-5`. Update those entries in a
-  copied roster if the CLI offers them.
+- *2026-11-14, `.subagents/` and `.agents/` are no longer tracked.* The repo now ships only templates
+  (`.subagents/<name>.md.example`, `.subagents/models.yaml.example`,
+  `.agents/agents/<name>.md.example`), and the rest of `.subagents/` and `.agents/` is gitignored. This
+  release deletes the tracked files those templates replace, so the `merge --ff-only` in step 4 refuses
+  while any of them has local edits: `git -C <repo> status --short` lists them as modified. For each one,
+  move it aside first (`mv <file> <file>.mine`), run the merge, then move it back (`mv <file>.mine
+  <file>`). From then on they are ignored files that no update touches. If an unedited tracked
+  `models.yaml` is removed, copy the example and keep the models you have:
+  `cp .subagents/models.yaml.example .subagents/models.yaml`, then edit it. There is no live roster
+  fallback: with no `models.yaml` the server starts with an empty roster, and `list_models` /
+  `spawn_agent` report the paths checked and that same instruction. Agent configs without a real
+  `<name>.md` still fall back to the bundled `<name>.md.example`.
   `.agents/agents/subagent-general.md` moved the same way, to `subagent-general.md.example`. The server
   copies the template into place without the `.example` suffix before launching `agy` when the real file
   is missing, and never overwrites an existing file; no manual copy is needed.

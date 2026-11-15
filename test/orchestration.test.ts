@@ -14,7 +14,7 @@ import { createWorktree, discardWorktree, removeWorktree, restrictPermission } f
 const exec = promisify(execFile);
 function fixture() {
   const adapter = new FakeAdapter('claude');
-  const registry = new ConfigRegistry([{ name: 'general', backend: 'claude', model: 'fake', description: 'test', systemPrompt: '', env: {}, sourcePath: '/configs/general.md', permission: { allow: [], deny: [], default: 'escalate' } }], { claude: [{ name: 'fake' }], codex: [], opencode: [], cursor: [], antigravity: [] });
+  const registry = new ConfigRegistry([{ name: 'general', backend: 'claude', model: 'fake', description: 'test', systemPrompt: '', env: {}, sourcePath: '/configs/general.md', permission: { allow: [], deny: [], default: 'escalate' } }], { claude: [{ name: 'fake' }], codex: [], opencode: [], cursor: [], copilot: [], vibe: [], antigravity: [] });
   const supervisor = new Supervisor({ registry, adapters: new AdapterRegistry([adapter]), cwd: '/tmp', maxConcurrent: 3 });
   return { adapter, supervisor, registry };
 }
@@ -40,7 +40,7 @@ test('config discovery, bounded listing, progress and durable successive structu
   s.enablePersistence(path);
   a.queueScript([]);
   const id = String((await s.spawnAgent({ ...spawn, result_schema: { type: 'object', properties: { ok: { type: 'boolean' } }, required: ['ok'] } })).agent_id);
-  assert.equal(s.listAgentConfigs().configs[0]?.name, 'general');
+  assert.equal((await s.listAgentConfigs()).configs[0]?.name, 'general');
   a.emit(id, 'tool.start', { toolCallId: 't', toolName: 'Running tests', input: {} }); await tick();
   assert.equal(s.listAgents()[0]?.current_activity, 'Running tests');
   a.emit(id, 'turn.completed', { turnId: 'first', status: 'completed', finalText: '{"ok":true}', usage: { costUsd: 1 } });
@@ -110,7 +110,7 @@ test('spawn rechecks model policy after worktree setup and cleans up on refusal'
     name: 'general', backend: 'claude', model: 'fake', description: 'test', systemPrompt: '', env: {},
     sourcePath: '/configs/general.md', permission: { allow: [], deny: [], default: 'escalate' },
     worktreeSetup: [`touch ${started}; while [ ! -f ${release} ]; do sleep 0.01; done`],
-  }], { claude: [{ name: 'fake' }], codex: [], opencode: [], cursor: [], antigravity: [] }, limits);
+  }], { claude: [{ name: 'fake' }], codex: [], opencode: [], cursor: [], copilot: [], vibe: [], antigravity: [] }, limits);
   const supervisor = new Supervisor({ registry, adapters: new AdapterRegistry([adapter]), cwd: repository });
 
   const spawning = supervisor.spawnAgent({ ...spawn, isolation: 'worktree' })

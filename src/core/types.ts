@@ -1,4 +1,4 @@
-export const BACKENDS = ["claude", "codex", "opencode", "antigravity", "cursor"] as const;
+export const BACKENDS = ["claude", "codex", "opencode", "antigravity", "cursor", "copilot", "vibe"] as const;
 export type Backend = (typeof BACKENDS)[number];
 
 export function isBackend(value: unknown): value is Backend {
@@ -16,7 +16,7 @@ export type AgentLifecycleState =
 export interface Usage {
   /**
    * Input tokens as the backend reports them. Whether this includes cache reads differs: Codex
-   * includes them; Claude, OpenCode and Cursor do not. Use `uncachedInputTokens` to compare.
+   * and Vibe include them; Claude, OpenCode and Cursor do not. Use `uncachedInputTokens` to compare.
    */
   readonly inputTokens?: number;
   readonly outputTokens?: number;
@@ -28,4 +28,15 @@ export interface Usage {
    */
   readonly uncachedInputTokens?: number;
   readonly costUsd?: number;
+  /**
+   * How `costUsd` was obtained. "reported" is the provider's own figure; "estimated" is computed
+   * locally from configured per-token prices (Vibe), which may be stale and is not a bill —
+   * subscription usage in particular is not charged per token. Absent means unknown.
+   */
+  readonly costBasis?: "reported" | "estimated";
+  /**
+   * Upstream provider that served the turn, when the backend reports it (Vibe: the alias's
+   * `provider` in its config). OpenCode's provider is the model id's prefix instead.
+   */
+  readonly provider?: string;
 }

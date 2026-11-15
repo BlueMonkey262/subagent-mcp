@@ -10,7 +10,8 @@ asking. `<repo>` is the absolute path of your checkout.
 - [Claude Code](https://claude.com/claude-code) (`claude` on your PATH)
 - Python 3 (only for the optional status line)
 - Optional backends, install only the ones you want: Codex (`codex`), OpenCode (`opencode`),
-  Cursor (`agent`), Antigravity (`agy`)
+  Cursor (`agent`), Antigravity (`agy`), GitHub Copilot (`copilot`), Mistral Vibe (`vibe`, then
+  `vibe --setup` to log in)
 
 ## 1. Build
 
@@ -52,8 +53,31 @@ is split into new and cached where the backend allows it; otherwise the row show
 When a newer release is available, the status line also shows one dim update notice (see README
 "Update notifications").
 
-If you already have a `statusLine`, decide whether to replace it or skip this step. Don't set
-`CLAUDE_CODE_PLUGIN_DIRS` in `settings.json`; the launcher does it.
+If you already have a `statusLine`, decide whether to replace it or skip this step. For terminal
+sessions you don't need `CLAUDE_CODE_PLUGIN_DIRS` in `settings.json`; the launcher sets it. Step 4b
+puts it there for the desktop app.
+
+## 4b. Desktop app (optional)
+
+The Claude desktop app starts its Code-tab sessions itself, so the launcher never runs and the mod
+is not loaded. To get the `/subagent-mcp` panel, the desktop widget and the completion toasts
+there, name the mod folder in the `env` block of `~/.claude/settings.json` (merge, don't replace):
+
+```json
+"env": { "CLAUDE_CODE_PLUGIN_DIRS": "<repo>/mod/subagent-strip" }
+```
+
+Then start a new Code-tab session. The launcher sees the folder already listed and doesn't add it
+twice. The MCP server registered in step 3 is available to desktop sessions too.
+
+- Desktop sessions get no channel events (the launcher's
+  `--dangerously-load-development-channels` flag is terminal-only), so Claude is not woken when a
+  background agent finishes. The mod's toasts tell you instead: an agent finished or failed, an
+  agent needs approval, an ensemble completed. Turn them off with the mod's `toasts` option
+  (`/config`) if the terminal's channel events are enough.
+- `/subagent-mcp widget` opens the panel as the desktop app's small floating widget: running and
+  waiting counts and what each running agent is doing. Run `/subagent-mcp` for the full panel.
+- The desktop app has no status line, so step 4's rows don't apply there.
 
 ## 5. Configure agents and models
 
@@ -63,8 +87,8 @@ project's `.subagents/models.yaml`, then the install's `.subagents/models.yaml`;
 an empty roster and says which paths it checked.
 To customize, run `/subagent-mcp` then `i`, or by hand: copy the templates from `<repo>/.subagents`
 (`*.md.example`, `models.yaml.example`) into your project's `.subagents/`, drop the `.example` suffix, and
-edit `models.yaml` so it lists the models you actually have access to (`agent --list-models`, `opencode models`, and so on). Changes under
-`.subagents/` hot-reload.
+edit `models.yaml` so it lists the models you actually have access to (`agent --list-models`,
+`opencode models`, and so on). Changes under `.subagents/` hot-reload.
 
 Antigravity (`agy`) agents carry their system prompt in an `agy` custom agent, not in the
 `.subagents/` file. The bundled `antigravity-general` config points at `subagent-general`, whose template
@@ -74,6 +98,19 @@ launching `agy`, in your project or in the install checkout; it never overwrites
 logs the copy. You can also copy it yourself, or put an agent file of that name in
 `~/.gemini/agents/`. `agy` finds project agents from the directory it runs in, though `agy agents` only
 lists the global ones.
+
+To make the definition explicit and repo-owned, set `antigravityAgentFile` in the agent config:
+
+```yaml
+antigravityAgent: subagent-general
+antigravityAgentFile: .agents/agents/subagent-general.md
+```
+
+At spawn the bridge resolves and validates that file, records its SHA-256, tools and source path,
+and writes an exact copy under `.subagents/memory/antigravity-agents/`. A global fallback is
+allowed but reported as `portable: false`. `subagent-mcp antigravity doctor` audits every
+Antigravity config, and `subagent-mcp antigravity vendor <agent-config>` copies a resolved global
+definition into the project's `.agents/agents/` directory.
 
 ## 6. Optional: custom endpoints
 
@@ -88,7 +125,8 @@ Details: [`nim/README.md`](nim/README.md).
 
 ## 7. Optional: turn off Claude Code's built-in Agent tool
 
-subagent-mcp gives Claude agents on any backend (Claude, Codex, OpenCode, Cursor, Antigravity),
+subagent-mcp gives Claude agents on any backend (Claude, Codex, OpenCode, Cursor, Antigravity, Copilot,
+Vibe),
 with model choice, worktree isolation and usage tracking. Claude Code also has its own built-in
 `Agent` tool, which only runs Claude subagents. With both available, the model sometimes reaches for
 the built-in one and bypasses all of that.

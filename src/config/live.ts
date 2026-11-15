@@ -16,7 +16,13 @@ import {
   type ResolveAgentOptions,
 } from "./registry.js";
 import { missingModelsFileMessage } from "./models-file.js";
-import type { Allowance, ModelEntry, ResolvedAgentConfig } from "./schema.js";
+import type {
+  Allowance,
+  ModelConcurrencyRule,
+  ModelEntry,
+  ProviderLimit,
+  ResolvedAgentConfig,
+} from "./schema.js";
 import { applyPolicyEnv, OPEN_POLICY, type ModelPolicy } from "../core/model-policy.js";
 
 export function missingConfigMessage(input: {
@@ -41,6 +47,8 @@ export function missingConfigMessage(input: {
     "     opencode: []",
     "     antigravity: []",
     "     cursor: []",
+    "     copilot: []",
+    "     vibe: []",
     `2. ${input.agentsDirectory}/<name>.md`,
     "   One file per agent. The frontmatter name must match the filename. Example general.md:",
     "   ---",
@@ -119,7 +127,9 @@ export class LiveConfig implements AgentConfigSource {
     return this.#registry !== undefined;
   }
 
-  listAgents() { return this.#require().listAgents(); }
+  listAgents() {
+    return this.#require().listAgents();
+  }
 
   resolveAgent(options: ResolveAgentOptions): ResolvedAgentConfig {
     return this.#require().resolveAgent(options);
@@ -141,6 +151,26 @@ export class LiveConfig implements AgentConfigSource {
     return this.#registry?.codexResumeIdleMs() ?? new ConfigRegistry([], emptyRoster()).codexResumeIdleMs();
   }
 
+  staleAgentMs(): number {
+    return this.#registry?.staleAgentMs() ?? new ConfigRegistry([], emptyRoster()).staleAgentMs();
+  }
+
+  sendMessageWaitMs(): number {
+    return this.#registry?.sendMessageWaitMs() ?? new ConfigRegistry([], emptyRoster()).sendMessageWaitMs();
+  }
+
+  scheduledGraceMs(): number {
+    return this.#registry?.scheduledGraceMs() ?? new ConfigRegistry([], emptyRoster()).scheduledGraceMs();
+  }
+
+  perBackendConcurrency(): Readonly<Partial<Record<Backend, number>>> {
+    return this.#registry?.perBackendConcurrency() ?? {};
+  }
+
+  perModelConcurrency(): readonly ModelConcurrencyRule[] {
+    return this.#registry?.perModelConcurrency() ?? [];
+  }
+
   allowances(): Readonly<Partial<Record<Backend, Allowance>>> {
     return this.#registry?.allowances() ?? {};
   }
@@ -148,6 +178,10 @@ export class LiveConfig implements AgentConfigSource {
   /** The project's policy with the MCP server's environment applied, so one setting can cover every project. */
   modelPolicy(): ModelPolicy {
     return applyPolicyEnv(this.#registry?.modelPolicy() ?? OPEN_POLICY);
+  }
+
+  providerLimits(): Readonly<Record<string, ProviderLimit>> {
+    return this.#registry?.providerLimits() ?? {};
   }
 
   configWarning(): string | undefined {
@@ -196,5 +230,5 @@ export class LiveConfig implements AgentConfigSource {
 }
 
 function emptyRoster(): ConfigRegistry["roster"] {
-  return { claude: [], codex: [], opencode: [], antigravity: [], cursor: [] };
+  return { claude: [], codex: [], opencode: [], antigravity: [], cursor: [], copilot: [], vibe: [] };
 }

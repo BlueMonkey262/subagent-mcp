@@ -25,13 +25,27 @@ export interface AgentConfig {
   /** Pinned when present. Omission intentionally forces a model at spawn time. */
   readonly model?: string;
   /**
-   * Pinned when present. Claude, Codex, and Antigravity honor supported effort levels.
+   * Pinned when present. Claude, Codex, Antigravity, and Copilot honor supported effort levels.
    * OpenCode and Cursor reject it: OpenCode has no effort parameter, and Cursor folds effort
    * into the model id.
    */
   readonly reasoningEffort?: string;
   /** Antigravity-only custom-agent name, passed to `agy --agent`. */
   readonly antigravityAgent?: string;
+  /**
+   * Vibe only: `cli` (default) runs headless `vibe -p`, which cannot ask for approval; `acp` runs
+   * `vibe-acp` and routes each tool permission through the approval flow. Fixed per agent at spawn.
+   */
+  readonly vibeTransport?: "cli" | "acp";
+  /** Vibe only: per-turn cap on prompt + completion tokens (`vibe --max-tokens`). */
+  readonly vibeMaxTokens?: number;
+  /**
+   * Vibe only: per-turn cap in US dollars (`vibe --max-price`). Approximate: Vibe prices calls from
+   * its own model price table, which Mistral notes may be missing or stale. Not a billing guarantee.
+   */
+  readonly vibeMaxPriceUsd?: number;
+  /** Optional repo-relative definition file; resolved and audited before launch. */
+  readonly antigravityAgentFile?: string;
   readonly description: string;
   readonly systemPrompt: string;
   readonly maxTurns?: number;
@@ -68,12 +82,39 @@ export interface Allowance {
   readonly maxCostUsd?: number;
 }
 
+/**
+ * Per-provider guard for models routed through OpenCode (`provider/model` ids), separate from the
+ * global agent cap and from any backend's own plan limits.
+ */
+export interface ProviderLimit {
+  /** Active agents using this provider at once; further spawns and resumes wait for a slot. */
+  readonly maxConcurrent?: number;
+  /** After a turn fails on a recognized rate limit, new turns for this provider wait this long. */
+  readonly cooldownSeconds?: number;
+}
+
 export interface ServerLimits {
   readonly maxConcurrent: number;
   readonly codexResumeIdleMs: number;
+  /** A running agent without a heartbeat or live backend probe for this long is reported stale. */
+  readonly staleAgentMs: number;
+  /** Default bounded wait for send_message before it returns a running receipt. */
+  readonly sendMessageWaitMs: number;
+  /** How late a persisted scheduled task may start before it is blocked as MISSED_START. */
+  readonly scheduledGraceMs: number;
+  readonly perBackendConcurrency: Readonly<Partial<Record<Backend, number>>>;
+  /** `backend:model-glob` patterns; every matching rule applies as its own pool. */
+  readonly perModelConcurrency: readonly ModelConcurrencyRule[];
   readonly allowances: Readonly<Partial<Record<Backend, Allowance>>>;
   /** Which backends and models are refused (see core/model-policy.ts). */
   readonly modelPolicy: ModelPolicy;
+  /** Keyed by provider id (the part of an OpenCode model id before the first `/`). */
+  readonly providerLimits: Readonly<Record<string, ProviderLimit>>;
+}
+
+export interface ModelConcurrencyRule {
+  readonly pattern: string;
+  readonly limit: number;
 }
 
 export interface ResolvedAgentConfig extends Omit<AgentConfig, "model"> {
