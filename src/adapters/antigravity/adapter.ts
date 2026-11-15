@@ -429,6 +429,7 @@ export class AntigravityAdapter implements BackendAdapter {
         code: "ANTIGRAVITY_PERMISSION_DENIED",
         message,
         fatal: false,
+        persists: true,
         details: { deniedActions: denied },
       });
       if (response === undefined || response.trim() === "") {

@@ -1346,3 +1346,24 @@ test("the block is re-checked when a queued message is delivered and when a spaw
   assert.equal(claude.spawnRequests.length, 1);
   assert.equal(supervisor.concurrency().active, 0, "the refused spawn released its slot");
 });
+
+test("a non-fatal error the turn recovers from is dropped on success; one that persists, or a failed turn, keeps it", async () => {
+  const adapter = new FakeAdapter("codex");
+  const supervisor = new Supervisor({
+    registry: testRegistry([codexAgentConfig()]),
+    adapters: new AdapterRegistry([adapter]),
+    cwd: "/work",
+  });
+  const run = async (error: { code: string; persists?: boolean }, status: "completed" | "failed") => {
+    const spawned = await supervisor.spawnAgent({ agent: "general", prompt: "p", description: "d", run_in_background: true });
+    const agentId = spawned["agent_id"] as string;
+    await waitUntil(() => supervisor.listAgents().some((agent) => agent["agent_id"] === agentId && agent["state"] === "running"));
+    adapter.emit(agentId, "error", { code: error.code, message: "m", fatal: false, ...(error.persists ? { persists: true } : {}) });
+    adapter.emit(agentId, "turn.completed", { turnId: `${agentId}-t`, status, finalText: "done" });
+    await waitUntil(() => supervisor.listAgents().some((agent) => agent["agent_id"] === agentId && agent["state"] === status));
+    return (supervisor.getAgentResult(agentId) as { error?: { code: string } }).error?.code;
+  };
+  assert.equal(await run({ code: "OPENCODE_RATE_LIMITED" }, "completed"), undefined, "a retried rate limit is not the outcome");
+  assert.equal(await run({ code: "ANTIGRAVITY_PERMISSION_DENIED", persists: true }, "completed"), "ANTIGRAVITY_PERMISSION_DENIED");
+  assert.equal(await run({ code: "OPENCODE_PROVIDER_ERROR" }, "failed"), "OPENCODE_PROVIDER_ERROR");
+});

@@ -123,6 +123,8 @@ export class VibeAcpAdapter implements BackendAdapter {
   readonly buffer: EventBuffer;
   readonly #options: VibeAcpAdapterOptions;
   readonly #sessions = new Map<string, AcpSession>();
+  /** Processes still inside #open: not in #sessions yet, but closeAll() must not leave them running. */
+  readonly #launching = new Set<ReturnType<SpawnProcess>>();
   readonly #spawnProcess: SpawnProcess;
 
   constructor(options: VibeAcpAdapterOptions = {}) {
@@ -189,6 +191,7 @@ export class VibeAcpAdapter implements BackendAdapter {
 
   async closeAll(): Promise<void> {
     for (const session of this.#sessions.values()) this.#terminate(session);
+    for (const child of this.#launching) signalProcessGroup(child, "SIGKILL");
   }
 
   // ------------------------------------------------------------------ process and session
@@ -203,6 +206,7 @@ export class VibeAcpAdapter implements BackendAdapter {
       windowsHide: true,
       detached: true,
     });
+    this.#launching.add(child);
     let session: AcpSession | undefined;
     const early: { method: string; params: Readonly<Record<string, unknown>> }[] = [];
     const client = new AcpClient(child, {
@@ -254,7 +258,7 @@ export class VibeAcpAdapter implements BackendAdapter {
       }
       // The first usage report is the baseline that keeps earlier turns out of this one's usage.
       if (session.usage === undefined && !replayed) {
-        await Promise.race([session.firstUsage, delay(this.#options.usageBaselineWaitMs ?? DEFAULT_USAGE_BASELINE_WAIT_MS)]);
+        await raceTimeout(session.firstUsage, this.#options.usageBaselineWaitMs ?? DEFAULT_USAGE_BASELINE_WAIT_MS);
       }
       if (session.usage === undefined && resumeSessionId === undefined) session.usage = { inputTokens: 0, outputTokens: 0, cachedInputTokens: 0 };
       const provider = await this.#options.providerFor?.(request.model).catch(() => undefined);
@@ -268,6 +272,8 @@ export class VibeAcpAdapter implements BackendAdapter {
       throw new VibeAdapterError(`vibe-acp could not ${resumeSessionId === undefined ? "start a session" : `resume session ${resumeSessionId}`}: ${message}`, {
         ...(detail === "" ? {} : { stderr: detail }),
       });
+    } finally {
+      this.#launching.delete(child);
     }
   }
 
@@ -564,6 +570,12 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-function delay(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms).unref?.());
+/** Waits for `promise` or `ms`; the ref'd timer keeps the loop alive meanwhile and is cleared after. */
+async function raceTimeout(promise: Promise<unknown>, ms: number): Promise<void> {
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    await Promise.race([promise, new Promise<void>((resolve) => { timer = setTimeout(resolve, ms); })]);
+  } finally {
+    clearTimeout(timer);
+  }
 }

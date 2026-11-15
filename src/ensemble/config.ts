@@ -316,9 +316,13 @@ function normalizeMembers(agents: readonly MemberSpec[], mode: EnsembleSpec["mod
       throw new ConfigurationError(`specialist mode needs instructions for every member; missing for ${missing.map((agent) => agent.role).join(", ")}`);
     }
   }
+  // Pipeline: a member without depends_on follows the one before it; an explicit depends_on replaces that.
+  if (mode === "pipeline") {
+    agents = agents.map((agent, index, list) => index === 0 || agent.depends_on !== undefined ? agent : { ...agent, depends_on: [list[index - 1]!.role] });
+  }
   for (const agent of agents) {
-    if (agent.on_dependency_failure !== undefined && agent.depends_on === undefined && mode !== "pipeline") {
-      throw new ConfigurationError(`${agent.role}: on_dependency_failure needs depends_on`);
+    if (agent.on_dependency_failure !== undefined && agent.depends_on === undefined) {
+      throw new ConfigurationError(`${agent.role}: on_dependency_failure needs depends_on${mode === "pipeline" ? " (the first pipeline member has no dependency)" : ""}`);
     }
   }
   if (mode === "competitive") {
@@ -327,9 +331,6 @@ function normalizeMembers(agents: readonly MemberSpec[], mode: EnsembleSpec["mod
       throw new ConfigurationError(`competitive members must not share the working tree; remove isolation: none from ${shared.map((agent) => agent.role).join(", ")}`);
     }
     return agents.map((agent) => ({ ...agent, isolation: agent.isolation ?? ("worktree" satisfies IsolationMode) }));
-  }
-  if (mode === "pipeline" && agents.every((agent) => agent.depends_on === undefined)) {
-    return agents.map((agent, index) => index === 0 ? agent : { ...agent, depends_on: [agents[index - 1]!.role] });
   }
   return agents;
 }

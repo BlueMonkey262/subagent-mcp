@@ -129,3 +129,12 @@ test("routing performs at least as well as a fixed baseline and converges on the
   const favorite = Object.entries(picks).sort((a, b) => b[1] - a[1])[0]![0];
   assert.equal(favorite, "codex/small");
 });
+
+test("a config pinned to a model missing from the roster is rejected, not picked", async () => {
+  const result = await selectModels(source({
+    configs: () => [{ name: "codex-gone", backend: "codex", model: "removed" }, { name: "codex-general", backend: "codex" }],
+  }), {}, 3, { profiles });
+  assert.ok(!result.picks.some((pick) => pick.model === "removed"));
+  assert.ok(result.picks.length > 0, "the other candidates are still picked");
+  assert.match(result.rejected.find((entry) => entry.candidate === "config codex-gone")!.reason, /not in the codex roster/);
+});

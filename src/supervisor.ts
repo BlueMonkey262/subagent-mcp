@@ -85,6 +85,10 @@ interface AgentRecord {
   pendingApprovalId?: string;
   /** One queued send_message, delivered once the current turn reaches turn.completed. */
   pendingMessage?: { readonly prompt: string; readonly effort?: string; readonly timeout?: number };
+  /** Set while a queued message waits out its provider's cooldown; stop_agent calls it to drop the message. */
+  abortCooldownWait?: () => void;
+  /** lastError came from a non-fatal error that a successful turn.completed should clear. */
+  lastErrorTransient?: boolean;
   /** Seconds. Null when neither the call nor the agent config set a cap. */
   timeoutSeconds: number | null;
   timedOut: boolean;
@@ -197,7 +201,10 @@ export interface SupervisorOptions {
 
 interface ProviderGate {
   capacity?: AgentCapacity;
+  /** Earliest time a waiter may resume after a rate limit. */
   cooldownUntil: number;
+  /** Each waiter adds a random share of this to cooldownUntil, so waiters don't resume together. */
+  cooldownSpreadMs: number;
   rate_limited: number;
   auth_failures: number;
   quota_failures: number;
@@ -237,6 +244,9 @@ export class Supervisor {
   #storageError: string | undefined;
   #pending = new Map<string, PendingTask>();
   #changes = new Set<() => void>();
+  readonly #liveUsageListeners = new Set<() => void>();
+  /** When each agent last signaled live usage, for the once-a-second limit. */
+  readonly #liveUsageSignaledAt = new Map<string, number>();
 
   constructor(options: SupervisorOptions) {
     this.#registry = options.registry;
@@ -507,6 +517,12 @@ export class Supervisor {
   onChange(listener: () => void): () => void {
     this.#changes.add(listener);
     return () => { this.#changes.delete(listener); };
+  }
+
+  /** Subscribe to live usage of running turns, at most once a second per agent. Returns an unsubscribe. */
+  onLiveUsage(listener: () => void): () => void {
+    this.#liveUsageListeners.add(listener);
+    return () => { this.#liveUsageListeners.delete(listener); };
   }
 
   /** Current outcome of an agent or queued task, by ID or name. */
@@ -799,6 +815,7 @@ export class Supervisor {
     // A new turn starts clean: an error from the previous turn (for example a permission denial)
     // must not stick to this resume, including when #pump delivers a queued message.
     delete record.lastError;
+    delete record.lastErrorTransient;
     delete record.meta.structured;
     delete record.meta.validation_errors;
     await adapter.resume({
@@ -871,7 +888,12 @@ export class Supervisor {
     // A deliberate stop should not be undone by a message queued before it arrived.
     delete record.pendingMessage;
     record.detached = false; // this call blocks on the outcome itself
-    await adapter.interrupt(record.id);
+    if (record.abortCooldownWait !== undefined) {
+      // No turn is running: a queued message is waiting out a provider cooldown. Dropping it ends the agent.
+      record.abortCooldownWait();
+    } else {
+      await adapter.interrupt(record.id);
+    }
     await this.#waitForNotableState(record);
     return this.#result(record);
   }
@@ -991,6 +1013,11 @@ export class Supervisor {
             const finished = event.data.turnId !== undefined && record.meta.history.some(h => h.turn_id === event.data.turnId);
             if (!finished && (record.state === "running" || record.state === "needs_approval" || record.state === "starting")) {
               record.liveUsage = { ...event.data.usage };
+              const now = Date.now();
+              if (this.#liveUsageListeners.size > 0 && now - (this.#liveUsageSignaledAt.get(record.id) ?? 0) >= 1_000) {
+                this.#liveUsageSignaledAt.set(record.id, now);
+                for (const listener of this.#liveUsageListeners) listener();
+              }
             }
             continue;
           }
@@ -1004,6 +1031,9 @@ export class Supervisor {
             // The final usage wins; without one (an interrupt or crash), keep what was observed live.
             const turnUsage = event.data.usage ?? record.liveUsage;
             delete record.liveUsage;
+            // A warning or a retried provider error doesn't make a successful turn an error.
+            if (event.data.status === "completed" && record.lastErrorTransient === true) delete record.lastError;
+            delete record.lastErrorTransient;
             if (event.data.finalText !== undefined) record.result = scanChildOutput(event.data.finalText);
             if (turnUsage !== undefined) record.usage = { ...turnUsage };
             else delete record.usage;
@@ -1036,14 +1066,23 @@ export class Supervisor {
                 timedOut: record.timedOut,
               });
               record.timedOut = false;
+              const settled = event.data.status === "completed" ? "completed"
+                : event.data.status === "interrupted" ? "interrupted" : "failed";
+              // The agent keeps its slots between turns, but a rate limit (perhaps from this very
+              // turn) still holds back the next one.
+              if (!await this.#waitOutCooldownFor(record)) {
+                record.state = settled;
+                record.release();
+                await this.#notify(record);
+                continue;
+              }
               try {
                 await this.#deliverResume(record, adapter, pending.prompt, pending.effort, pending.timeout);
               } catch (error) {
                 if (!(error instanceof ModelBlockedError) && !(error instanceof ConfigInvalidError)) throw error;
                 // The queued message is refused; the agent ends on the turn that just finished.
                 record.lastError = { code: error.code, message: error.message };
-                record.state = event.data.status === "completed" ? "completed"
-                  : event.data.status === "interrupted" ? "interrupted" : "failed";
+                record.state = settled;
                 record.release();
                 await this.#notify(record);
               }
@@ -1067,6 +1106,7 @@ export class Supervisor {
           }
           if (event.type === "error") {
             record.lastError = { code: event.data.code, message: scanChildOutput(event.data.message) };
+            record.lastErrorTransient = !event.data.fatal && event.data.persists !== true;
             this.#noteProviderError(record, event.data.code, record.lastError.message, event.data.details);
             if (/TIMEOUT/.test(event.data.code)) record.timedOut = true;
             if (event.data.fatal) {
@@ -1470,20 +1510,54 @@ export class Supervisor {
     const provider = providerOf(backend, model);
     if (provider === undefined) return () => undefined;
     const gate = this.#gate(provider);
-    for (let wait = gate.cooldownUntil - Date.now(); wait > 0; wait = gate.cooldownUntil - Date.now()) {
-      await new Promise((resolve) => setTimeout(resolve, wait));
+    for (;;) {
+      await this.#waitOutCooldown(gate);
+      const limit = this.#registry.providerLimits()[provider]?.maxConcurrent;
+      if (limit === undefined) return () => undefined;
+      if (gate.capacity === undefined) gate.capacity = new AgentCapacity(limit);
+      else if (gate.capacity.limit !== limit) gate.capacity.setLimit(limit);
+      const release = await gate.capacity.acquireWhenFree(`pending-${randomUUID()}`);
+      // A rate limit hit while this call queued for the slot starts a cooldown it must also wait out.
+      if (gate.cooldownUntil <= Date.now()) return release;
+      release();
     }
-    const limit = this.#registry.providerLimits()[provider]?.maxConcurrent;
-    if (limit === undefined) return () => undefined;
-    if (gate.capacity === undefined) gate.capacity = new AgentCapacity(limit);
-    else if (gate.capacity.limit !== limit) gate.capacity.setLimit(limit);
-    return gate.capacity.acquireWhenFree(`pending-${randomUUID()}`);
+  }
+
+  /**
+   * Sleeps until the gate's cooldown is over. Each waiter adds its own share of the jitter window,
+   * so agents held back by one rate limit don't all resume in one burst. Resolves false if `signal` fires.
+   */
+  async #waitOutCooldown(gate: ProviderGate, signal?: { onAbort?: () => void }): Promise<boolean> {
+    while (gate.cooldownUntil > Date.now()) {
+      const wait = gate.cooldownUntil - Date.now() + Math.random() * gate.cooldownSpreadMs;
+      const finished = await new Promise<boolean>((resolve) => {
+        const timer = setTimeout(() => resolve(true), wait);
+        if (signal !== undefined) signal.onAbort = () => { clearTimeout(timer); resolve(false); };
+      });
+      if (!finished) return false;
+    }
+    return true;
+  }
+
+  /** For a queued message: waits out the agent's provider cooldown. False when stop_agent dropped the message meanwhile. */
+  async #waitOutCooldownFor(record: AgentRecord): Promise<boolean> {
+    const provider = providerOf(record.backend, record.model);
+    if (provider === undefined) return true;
+    const gate = this.#gate(provider);
+    if (gate.cooldownUntil <= Date.now()) return true;
+    const signal: { onAbort?: () => void } = {};
+    record.abortCooldownWait = () => signal.onAbort?.();
+    try {
+      return await this.#waitOutCooldown(gate, signal);
+    } finally {
+      delete record.abortCooldownWait;
+    }
   }
 
   #gate(provider: string): ProviderGate {
     let gate = this.#providers.get(provider);
     if (gate === undefined) {
-      gate = { cooldownUntil: 0, rate_limited: 0, auth_failures: 0, quota_failures: 0 };
+      gate = { cooldownUntil: 0, cooldownSpreadMs: 0, rate_limited: 0, auth_failures: 0, quota_failures: 0 };
       this.#providers.set(provider, gate);
     }
     return gate;
@@ -1506,9 +1580,11 @@ export class Supervisor {
     gate.rate_limited += 1;
     const seconds = this.#registry.providerLimits()[provider]?.cooldownSeconds;
     if (seconds === undefined) return;
-    // Jitter (±20%) so agents waiting on the same provider do not all resume in one burst.
-    const until = Date.now() + seconds * 1000 * (0.8 + Math.random() * 0.4);
+    // The gate opens at 80% of the cooldown; each waiter adds its own share of the remaining 40%
+    // (#waitOutCooldown), so waiters resume spread over 80-120% instead of in one burst.
+    const until = Date.now() + seconds * 1000 * 0.8;
     gate.cooldownUntil = Math.max(gate.cooldownUntil, until);
+    gate.cooldownSpreadMs = seconds * 1000 * 0.4;
   }
 
   /** Provider gates for list_models: limits, live slots, cooldown and failure counts. */

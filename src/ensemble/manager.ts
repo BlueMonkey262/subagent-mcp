@@ -89,6 +89,8 @@ interface LiveState {
   /** Cached member results by role, keyed on the outcome they were computed from. */
   readonly results: Map<string, { readonly key: string; readonly result: MemberResult }>;
   budgetWarned?: boolean;
+  /** The budget ran out while the synthesizer was running, and it was stopped. */
+  synthesisBudgetStop?: boolean;
 }
 
 /**
@@ -112,6 +114,7 @@ export class EnsembleManager {
   readonly #validators = new Map<string, ValidateFunction>();
   readonly #restoreWarnings: string[] = [];
   readonly #unsubscribe: () => void;
+  readonly #unsubscribeUsage: () => void;
   #refreshing = false;
   #refreshAgain = false;
 
@@ -125,10 +128,13 @@ export class EnsembleManager {
     this.#history = options.history;
     this.#candidateSource = options.candidateSource ?? (() => supervisorCandidateSource(this.#supervisor));
     this.#unsubscribe = this.#supervisor.onChange(() => this.#refreshAll());
+    // Live usage too, so a budget is enforced while members (or the synthesizer) are still running.
+    this.#unsubscribeUsage = this.#supervisor.onLiveUsage(() => this.#refreshAll());
   }
 
   close(): void {
     this.#unsubscribe();
+    this.#unsubscribeUsage();
     for (const live of this.#live.values()) if (live.deadline) clearTimeout(live.deadline);
   }
 
@@ -209,7 +215,7 @@ export class EnsembleManager {
     this.#armDeadline(record);
     live.launching = this.#launch(record, inputs);
     if (spec.run_in_background) {
-      await Promise.race([live.launching, delay(this.#launchWaitMs)]);
+      await raceTimeout(live.launching, this.#launchWaitMs);
       return this.#statusView(record);
     }
     try {
@@ -637,6 +643,7 @@ export class EnsembleManager {
       }
     }
     if (record.status === "synthesizing") changed = this.#refreshSynthesis(record) || changed;
+    if (record.status === "synthesizing" && this.#overBudget(record)) this.#stopSynthesisForBudget(record);
     if (lateSettled && FINAL_STATUSES.has(record.status)) {
       // A late result updates the stored aggregate (deterministic, free); one follow-up event once all have settled.
       record.summary = aggregate(this.#results(record), record.spec.aggregation, { cwd: this.#cwd });
@@ -683,13 +690,23 @@ export class EnsembleManager {
     if (budget === undefined) return false;
     const usage = this.#usageTotals(record);
     const live = this.#liveFor(record);
-    if (budget.max_cost_usd !== undefined && !usage.cost_complete && !live.budgetWarned) {
+    // Only a settled agent's usage is final; a running one may still report its cost at turn end.
+    if (budget.max_cost_usd !== undefined && usage.settled_without_cost && !live.budgetWarned) {
       live.budgetWarned = true;
       warnOnce(record, "Some members report no cost; the cost budget counts reported cost only.");
     }
     if (budget.max_cost_usd !== undefined && usage.cost_reported >= budget.max_cost_usd) return true;
     if (budget.max_total_tokens !== undefined && usage.tokens_reported >= budget.max_total_tokens) return true;
     return false;
+  }
+
+  /** The budget ran out during synthesis: stop the synthesizer; the deterministic aggregate stands. */
+  #stopSynthesisForBudget(record: EnsembleRecord): void {
+    const live = this.#liveFor(record);
+    const agentId = record.synthesis?.agent_id;
+    if (live.synthesisBudgetStop || agentId === undefined || record.synthesis?.state !== "running") return;
+    live.synthesisBudgetStop = true;
+    void this.#supervisor.stopAgents([agentId]).catch(() => undefined);
   }
 
   #satisfied(record: EnsembleRecord): boolean {
@@ -775,8 +792,9 @@ export class EnsembleManager {
       const extracted = extractJson(outcome.result ?? "");
       if (extracted.ok && this.#validatorFor(SYNTHESIS_SCHEMA as Record<string, unknown>)(extracted.value)) value = extracted.value;
     }
+    const budgetStop = this.#liveFor(record).synthesisBudgetStop === true && outcome.state !== "completed";
     record.synthesis = value === undefined
-      ? { ...synthesis, state: "failed", reason: outcome.state === "completed" ? "result did not match the synthesis schema" : describeError(outcome.error) ?? outcome.state }
+      ? { ...synthesis, state: "failed", reason: budgetStop ? "budget reached" : outcome.state === "completed" ? "result did not match the synthesis schema" : describeError(outcome.error) ?? outcome.state }
       : { ...synthesis, state: "completed", result: value };
     const pending = record.pending_final ?? { status: "completed" as const, reason: "all_settled" };
     // cancel() may be awaiting the synthesizer's stop: a cancel requested before it settled wins.
@@ -921,18 +939,23 @@ export class EnsembleManager {
     });
   }
 
-  #usageTotals(record: EnsembleRecord): { cost_reported: number; cost_complete: boolean; tokens_reported: number; tokens_complete: boolean } {
-    let cost = 0, tokens = 0, costComplete = true, tokensComplete = true;
-    const usages = record.members.filter((member) => member.launch === "launched").map((member) => member.usage);
+  #usageTotals(record: EnsembleRecord): { cost_reported: number; cost_complete: boolean; settled_without_cost: boolean; tokens_reported: number; tokens_complete: boolean } {
+    let cost = 0, tokens = 0, costComplete = true, tokensComplete = true, settledWithoutCost = false;
+    const usages = record.members.filter((member) => member.launch === "launched")
+      .map((member) => ({ usage: member.usage, settled: this.#terminal(member) }));
     if (record.synthesis?.agent_id !== undefined) {
-      try { usages.push(this.#supervisor.outcome(record.synthesis.agent_id).usage); } catch { usages.push(undefined); }
+      try {
+        const outcome = this.#supervisor.outcome(record.synthesis.agent_id);
+        usages.push({ usage: outcome.usage, settled: TERMINAL_STATES.has(outcome.state) });
+      } catch { usages.push({ usage: undefined, settled: false }); }
     }
-    for (const usage of usages) {
-      if (typeof usage?.["costUsd"] === "number") cost += usage["costUsd"]; else costComplete = false;
+    for (const { usage, settled } of usages) {
+      if (typeof usage?.["costUsd"] === "number") cost += usage["costUsd"];
+      else { costComplete = false; if (settled) settledWithoutCost = true; }
       const input = usage?.["inputTokens"], output = usage?.["outputTokens"];
       if (typeof input === "number" && typeof output === "number") tokens += input + output; else tokensComplete = false;
     }
-    return { cost_reported: cost, cost_complete: costComplete, tokens_reported: tokens, tokens_complete: tokensComplete };
+    return { cost_reported: cost, cost_complete: costComplete, settled_without_cost: settledWithoutCost, tokens_reported: tokens, tokens_complete: tokensComplete };
   }
 
   /** Unknown is reported as null, never as zero. */
@@ -1224,8 +1247,17 @@ function round(value: number): number {
   return Math.round(value * 10_000) / 10_000;
 }
 
-function delay(ms: number): Promise<void> {
-  return new Promise((resolve) => { const timer = setTimeout(resolve, ms); timer.unref(); });
+/**
+ * Waits for `promise` or `ms`, whichever comes first. The timer stays ref'd: while a member waits on
+ * a dependency it can be the only thing keeping the event loop alive. It is cleared once either side settles.
+ */
+async function raceTimeout(promise: Promise<unknown>, ms: number): Promise<void> {
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    await Promise.race([promise, new Promise<void>((resolve) => { timer = setTimeout(resolve, ms); })]);
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 function isErrno(error: unknown, code: string): boolean {

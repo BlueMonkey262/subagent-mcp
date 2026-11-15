@@ -128,8 +128,8 @@ call and reads one compact summary instead of one report per agent.
   `instructions`; they never see the parent conversation.
 - **Modes.** `parallel` (default); `specialist` (every member needs `instructions`); `competitive`
   (each member gets its own managed worktree; `isolation: none` is refused); `pipeline` (each member
-  starts after the previous one succeeds and receives its result; `depends_on` lists earlier roles
-  explicitly and works in any mode). With `on_dependency_failure: continue` a member starts once its
+  starts after the previous one succeeds and receives its result). `depends_on` lists earlier roles
+  explicitly and works in any mode; in a pipeline it replaces that member's link to the one before it. With `on_dependency_failure: continue` a member starts once its
   dependencies have settled, successful or not, and receives each outcome cut to
   `dependency_max_chars` (default 4000).
 - **Isolation.** `isolation` per member, or as the ensemble default: `none` shares your checkout;
