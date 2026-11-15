@@ -351,6 +351,14 @@ export class ServedCatalog {
   ) {}
 
   get tools(): readonly JsonToolDefinition[] { return this.#tools; }
+
+  async #serve(tools: readonly JsonToolDefinition[], build: string, fromHost: boolean): Promise<void> {
+    const changed = JSON.stringify(tools) !== JSON.stringify(this.#tools);
+    this.#tools = tools;
+    this.#build = build;
+    this.#fromHost = fromHost;
+    if (changed) await this.notify().catch(() => undefined);
+  }
   /** The tools came from the host whose build this is (not this front end's own catalog). */
   servesHost(build: string | undefined): boolean { return this.#fromHost && build !== undefined && this.#build === build; }
 
@@ -362,15 +370,19 @@ export class ServedCatalog {
     run = (async () => {
       try {
         const answer = await this.source.fetch();
-        const tools = isToolList(answer) ? answer.tools : undefined;
-        if (tools === undefined) return;
-        const changed = JSON.stringify(tools) !== JSON.stringify(this.#tools);
-        this.#tools = tools;
-        this.#build = build;
-        this.#fromHost = true;
-        if (changed) await this.notify().catch(() => undefined);
-      } catch {
-        // A host that predates tool_catalog: keep listing this build's tools.
+        // The host moved on to another build while this fetch ran: that build's refresh decides.
+        if (this.#checked !== build) return;
+        // A malformed answer is treated like a host without tool_catalog.
+        await this.#serve(isToolList(answer) ? answer.tools : catalogJson(), build, isToolList(answer));
+      } catch (error) {
+        if (this.#checked !== build) return;
+        if (/Unknown host method/.test(error instanceof Error ? error.message : String(error))) {
+          // A host that predates tool_catalog lists what this front end knows, not a previous host's tools.
+          await this.#serve(catalogJson(), build, false);
+        } else {
+          // A transient failure (a dropped socket): try again on the next call.
+          this.#checked = undefined;
+        }
       } finally {
         if (this.#refreshing === run) this.#refreshing = undefined;
       }

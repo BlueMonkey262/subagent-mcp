@@ -451,8 +451,9 @@ against the repository, tests, and the operator's actual request.
   serves them (`tool_catalog`) and checks every call's arguments against them; the proxy lists the
   connected host's catalog and sends `notifications/tools/list_changed` when a host on a new build
   brings different tools, so new tools appear without `/mcp`. A proxy whose host was restarted by
-  another session reconnects on its next call. Against a host that predates `tool_catalog`, the
-  proxy lists its own tools and a newer host still asks for `/mcp`.
+  another session reconnects on its next call. A host that predates `tool_catalog` (older than this
+  proxy) gets the proxy's own tools; a proxy that predates it (connected to a newer host) still
+  needs one `/mcp` reconnect to become a proxy that refreshes.
 
 ## Update notifications
 

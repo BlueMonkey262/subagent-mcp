@@ -112,6 +112,8 @@ export function hostDisposition(hello: HostHello, local: BuildInfo): HostDisposi
 }
 
 const IDLE_EXIT_MS = 60_000;
+/** After a failed first connection, how long a tool call waits before trying the host again. */
+const RECONNECT_RETRY_MS = 30_000;
 const CONNECT_WAIT_MS = 8_000;
 const RECORDED_HOST_WAIT_MS = 2_000;
 
@@ -271,6 +273,9 @@ export class HostSession {
   readonly #detached: ((data: Readonly<Record<string, unknown>>) => void)[] = [];
   readonly #ensemble: ((data: Readonly<Record<string, unknown>>) => void)[] = [];
   readonly #attached: (() => void)[] = [];
+  /** One reconnect at a time: concurrent calls after a drop share it instead of each opening a socket. */
+  #reconnecting: Promise<void> | undefined;
+  #lastAttempt = 0;
 
   constructor(readonly options: Parameters<typeof connectHost>[0]) {}
 
@@ -284,7 +289,22 @@ export class HostSession {
     return this.#client?.host?.build;
   }
 
+  #reconnect(): Promise<void> {
+    this.#reconnecting ??= (async () => {
+      this.#lastAttempt = Date.now();
+      try {
+        this.#attach(await connectHost(this.options));
+      } catch (error) {
+        this.#fail(error);
+      } finally {
+        this.#reconnecting = undefined;
+      }
+    })();
+    return this.#reconnecting;
+  }
+
   async connect(): Promise<void> {
+    this.#lastAttempt = Date.now();
     try {
       this.#attach(await connectHost(this.options));
     } catch (error) {
@@ -308,13 +328,10 @@ export class HostSession {
   async call(method: string, params?: unknown): Promise<unknown> {
     // Another session's restart_host (or a crash) closes the socket; connect to the host that is up now
     // instead of failing every call until the user reconnects with /mcp.
-    if (this.#client?.closed === true) {
-      try {
-        this.#attach(await connectHost(this.options));
-      } catch (error) {
-        this.#fail(error);
-      }
-    }
+    // A first connection that failed is tried again too, at most every RECONNECT_RETRY_MS.
+    const lost = this.#client?.closed === true;
+    const neverUp = this.#client === undefined && Date.now() - this.#lastAttempt >= RECONNECT_RETRY_MS;
+    if (lost || neverUp) await this.#reconnect();
     if (this.#client === undefined) {
       throw this.#error ?? new Error("subagent-mcp host is not connected. Ask the user to run `/mcp` and then reconnect subagent-mcp.");
     }
@@ -392,6 +409,8 @@ export class HostSession {
   }
 
   #attach(client: HostClient): void {
+    // A replaced client must not keep delivering events (or count as another session at the host).
+    if (this.#client !== undefined && this.#client !== client) this.#client.close();
     this.#client = client;
     this.#error = undefined;
     for (const listener of this.#detached) client.onDetached(listener);
@@ -697,7 +716,8 @@ async function handleLine(
     const result = await dispatch(supervisor, method, request["params"], context);
     socket.write(`${JSON.stringify({ id, result })}\n`);
     // A client that makes tool calls has its listeners attached: retry events no one was connected to receive.
-    if (method !== "hello" && method !== "shutdown") context.ensembles?.deliverPending();
+    // tool_catalog is a front end's own startup read, before its MCP client is listening, so it doesn't count.
+    if (method !== "hello" && method !== "shutdown" && method !== "tool_catalog") context.ensembles?.deliverPending();
     if (method === "shutdown") setTimeout(onShutdown, 30);
   } catch (error) {
     const body = error instanceof Error

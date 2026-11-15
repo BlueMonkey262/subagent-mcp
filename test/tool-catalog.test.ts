@@ -89,3 +89,53 @@ test("concurrent refreshes for one build share a single fetch", async () => {
   await Promise.all([catalog.refresh(), catalog.refresh(), catalog.refresh()]);
   assert.equal(host.state.fetches, 1);
 });
+
+test("a fetch for a build the host has since left is dropped, not served", async () => {
+  let release: (value: unknown) => void = () => undefined;
+  let build = "b1";
+  const answers: Record<string, unknown> = {
+    b2: { tools: [...catalogJson(), { name: "b2_tool", description: "", inputSchema: { type: "object" }, format: "pretty" }] },
+  };
+  const catalog = new ServedCatalog({
+    hostBuild: () => build,
+    fetch: () => build === "b1" ? new Promise((resolve) => { release = resolve; }) : Promise.resolve(answers[build]),
+  }, async () => undefined);
+  const slow = catalog.refresh();
+  build = "b2";
+  await catalog.refresh();
+  release({ tools: [{ name: "b1_tool", description: "", inputSchema: { type: "object" }, format: "pretty" }] });
+  await slow;
+  assert.ok(catalog.tools.some((tool) => tool.name === "b2_tool"));
+  assert.ok(!catalog.tools.some((tool) => tool.name === "b1_tool"));
+  assert.equal(catalog.servesHost("b2"), true);
+});
+
+test("a transient fetch failure is retried; a host without tool_catalog gets this build's tools back", async () => {
+  const host = fakeHost();
+  let notices = 0;
+  const catalog = new ServedCatalog(host.source, async () => { notices += 1; });
+  host.state.build = "b1";
+  host.state.answer = { tools: [...catalogJson(), { name: "extra", description: "", inputSchema: { type: "object" }, format: "pretty" }] };
+  await catalog.refresh();
+  assert.equal(notices, 1);
+
+  // Restarted onto a host that predates tool_catalog: the extra tool must go.
+  host.state.build = "old";
+  host.state.fail = true;
+  await catalog.refresh();
+  assert.deepEqual(catalog.tools, catalogJson());
+  assert.equal(notices, 2);
+  const fetches = host.state.fetches;
+  await catalog.refresh();
+  assert.equal(host.state.fetches, fetches, "a host without the method is not asked again");
+
+  // A dropped socket mid-fetch: asked again on the next refresh.
+  const flaky = fakeHost();
+  const other = new ServedCatalog({ hostBuild: flaky.source.hostBuild, fetch: async () => { flaky.state.fetches += 1; if (flaky.state.fetches === 1) throw new Error("subagent-mcp host connection closed"); return { tools: catalogJson() }; } }, async () => undefined);
+  flaky.state.build = "b1";
+  await other.refresh();
+  assert.equal(other.servesHost("b1"), false);
+  await other.refresh();
+  assert.equal(flaky.state.fetches, 2);
+  assert.equal(other.servesHost("b1"), true);
+});

@@ -580,9 +580,13 @@ test("a session whose host another session restarted reconnects on its next call
     const before = await first.call("hello") as { pid: number };
     await second.connect();
     await second.restart(true);
-    const after = await first.call("hello") as { pid: number };
+    // Several calls at once after the drop share one reconnect.
+    const hellos = await Promise.all([first.call("hello"), first.call("hello"), first.call("hello")]) as { pid: number; clients: number }[];
+    const after = hellos[0]!;
     assert.notEqual(after.pid, before.pid, "talking to the new host");
-    assert.equal(attaches, 2, "the reconnect counts as an attach, so the tool list is checked again");
+    assert.ok(hellos.every((hello) => hello.pid === after.pid));
+    assert.equal(attaches, 2, "one reconnect, and it counts as an attach, so the tool list is checked again");
+    assert.equal((await second.call("hello") as { clients: number }).clients, 2, "no orphaned extra connection");
   } finally {
     first.close();
     second.close();
@@ -611,6 +615,10 @@ test("the MCP server lists the catalog, forwards calls, and reports bad argument
     assert.match(bad.content[0]!.text, /Invalid arguments for list_agents/);
     const missing = await client.callTool({ name: "no_such_tool", arguments: {} }) as { isError?: boolean };
     assert.equal(missing.isError, true);
+    // restart_host is answered by the front end, so the front end checks its arguments.
+    const restart = await client.callTool({ name: "restart_host", arguments: { force: "yes" } }) as { isError?: boolean; content: { text: string }[] };
+    assert.equal(restart.isError, true);
+    assert.match(restart.content[0]!.text, /Invalid arguments for restart_host/);
   } finally {
     await client.close().catch(() => undefined);
     await stopDaemon(cwd);
