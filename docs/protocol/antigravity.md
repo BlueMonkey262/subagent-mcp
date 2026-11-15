@@ -20,8 +20,11 @@ resume, `--conversation <conversation-id>`. Do not pass `--dangerously-skip-perm
 
 `--agent` selects an Antigravity custom agent whose Markdown body becomes its system prompt.
 The project config's `antigravityAgent` must name an agent that Antigravity discovers from
-`.agents/agents/<name>.md` or its configured global location. This bridge does not generate
-workspace agent files or lower a system prompt into a user message.
+`.agents/agents/<name>.md` or its configured global location. When that project file is missing but
+the matching `.md.example` template exists in the project or the subagent-mcp install, the adapter
+copies it into place before launch and logs the copy. It never overwrites an existing file. The
+bridge does not otherwise generate workspace agent files or lower a system prompt into a user
+message.
 
 ## Input
 

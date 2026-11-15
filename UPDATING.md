@@ -49,9 +49,18 @@ Releases that change `models.yaml` or agent-config semantics must add a dated no
   gitignored. If `<repo>/.subagents/models.yaml` or a `<repo>/.subagents/<name>.md` has local edits, the swap
   in step 4 refuses to fast-forward, because the release deletes those files. Move each edited file aside
   first (`mv <file> <file>.mine`), merge, then `mv` it back. From then on they are ignored files that no
-  update touches. Unedited copies are removed by the merge, and the templates take over as the fallback.
-  `.agents/agents/subagent-general.md` moved the same way, to `subagent-general.md.example`. `agy` cannot
-  read the template, so if you use Antigravity from `<repo>` itself, copy it back without the suffix.
+  update touches. Agent configs without a real `<name>.md` still fall back to the bundled
+  `<name>.md.example`, but `models.yaml` has no live fallback. An install whose unedited `models.yaml` is
+  removed by this update must copy the example and keep the models it has:
+  `cp .subagents/models.yaml.example .subagents/models.yaml`, then edit it. With no `models.yaml`, the
+  server starts with an empty roster and `list_models` / `spawn_agent` report the paths checked and that
+  same instruction.
+  The example's Claude ids changed: `claude-sonnet-5` → `claude-sonnet-5-5`, `claude-opus-5` →
+  `claude-opus-5-5`, and `claude-haiku-4-5-20251001` → `claude-haiku-5-5`. Update those entries in a
+  copied roster if the CLI offers them.
+  `.agents/agents/subagent-general.md` moved the same way, to `subagent-general.md.example`. The server
+  copies the template into place without the `.example` suffix before launching `agy` when the real file
+  is missing, and never overwrites an existing file; no manual copy is needed.
 
 ## 4. Swap (the one step that touches the live install)
 

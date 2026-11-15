@@ -44,12 +44,15 @@ coverage only.
 ### Configuration
 
 Agents live in `.subagents/<name>.md` (frontmatter + system prompt) and the model roster in
-`.subagents/models.yaml`, in the project you run Claude Code from. If a project has none, the server
-uses this repo's `.subagents/` instead. `.subagents/` belongs to each person and is gitignored here; the repo
-tracks only templates (`<name>.md.example` and `models.yaml.example`, plus the Antigravity agent template
-`.agents/agents/subagent-general.md.example`). Real `<name>.md` configs and a real
-`models.yaml` win, and the templates are the fallback when there are none. The panel's `i` init builds a
-project's own `.subagents/` from them.
+`.subagents/models.yaml`, in the project you run Claude Code from. If a project has no `.subagents/`,
+the server uses this repo's bundled agent templates. `.subagents/` belongs to each person and is
+gitignored here; the repo tracks only templates (`<name>.md.example` and `models.yaml.example`, plus the
+Antigravity agent template `.agents/agents/subagent-general.md.example`). Real `<name>.md` configs win
+over their templates. There is no roster fallback: `models.yaml.example` only shows the format for each
+backend. The roster comes from `SUBAGENT_MCP_MODELS_FILE` when set, then the project's
+`.subagents/models.yaml`, then this install's `.subagents/models.yaml`; with none the server starts with
+an empty roster and `list_models` / `spawn_agent` report the paths checked and how to create it. The
+panel's `i` init builds a project's own `.subagents/` from the templates.
 
 ## Tools
 
