@@ -718,9 +718,11 @@ export class Supervisor {
 
   /** Every state change stamps updated_at, so `since` / `updated_since` see when a queued task settled. */
   #setTaskState(task: PendingTask, state: PendingTask['state']): void {
+    const previous = task.state;
     task.state = state;
     task.updated_at = new Date().toISOString();
     if (state !== 'queued') this.#clearTaskTimer(task.id);
+    if (state === 'blocked' && previous !== 'blocked') this.#emitTaskPing(task);
   }
 
   /** Arm the next readiness check for a delayed task, re-arming in chunks beyond Node's timer limit. */
@@ -768,13 +770,12 @@ export class Supervisor {
     });
   }
 
-  /** Block a task whose start is beyond the grace window and emit its settlement ping. */
+  /** Block a task whose start is beyond the grace window; #setTaskState emits its ping. */
   #blockMissedStart(task: PendingTask, now = Date.now()): boolean {
     const error = this.#missedStart(task, now);
     if (error === undefined) return false;
-    this.#setTaskState(task, 'blocked');
     task.result = { error, missed_start: true };
-    this.#emitTaskPing(task);
+    this.#setTaskState(task, 'blocked');
     return true;
   }
 
@@ -812,11 +813,11 @@ export class Supervisor {
         task.result = { ...result };
         if ((task.state as string) === 'interrupted') { if (result.agent_id) await this.stopAgent(String(result.agent_id)); }
         else this.#setTaskState(task, 'completed');
-      } catch(error) { this.#setTaskState(task, 'blocked'); task.result = { error: String(error) }; }
+      } catch(error) { task.result = { error: String(error) }; this.#setTaskState(task, 'blocked'); }
       await this.#writeSnapshot(); this.#changed();
     };
     const check = () => {
-      const running = run().catch(error => { this.#setTaskState(task, 'blocked'); task.result = { error: String(error) }; this.#changed(); });
+      const running = run().catch(error => { task.result = { error: String(error) }; this.#setTaskState(task, 'blocked'); this.#changed(); });
       this.#taskRuns.add(running);
       void running.finally(() => this.#taskRuns.delete(running));
     };
@@ -1884,7 +1885,7 @@ export class Supervisor {
       .map(ping => ({ ...ping }));
   }
 
-  /** Emit a queued task's own settlement ping (currently only MISSED_START). */
+  /** Emit a queued task's settlement ping when it transitions to blocked. */
   #emitTaskPing(task: PendingTask): void {
     if ((task.notify ?? 'always') === 'never') return;
     try {

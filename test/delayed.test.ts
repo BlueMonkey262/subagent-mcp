@@ -424,6 +424,22 @@ test("a live timer that fires after a suspend applies the scheduled grace window
   assert.equal(settled[0]?.["status"], "blocked");
 });
 
+test("a dependency failure blocks the task and pings according to its notify policy", async () => {
+  const settled: Readonly<Record<string, unknown>>[] = [];
+  const { supervisor, adapter } = fixture({ settled });
+  adapter.queueScript(completeScript("failed", "prerequisite failed"));
+  const dependency = String((await supervisor.spawnAgent(spawn))["agent_id"]);
+  const pinging = await supervisor.spawnAgent({ ...spawn, depends_on: [dependency], notify: "on_failure" });
+  const silent = await supervisor.spawnAgent({ ...spawn, depends_on: [dependency], notify: "never" });
+  const isBlocked = (id: unknown) => supervisor.listAgents().some((agent) =>
+    agent["agent_id"] === id && agent["state"] === "blocked");
+  await waitUntil(() => isBlocked(pinging["task_id"]) && isBlocked(silent["task_id"]));
+
+  const blockedPings = settled.filter((ping) => ping["status"] === "blocked");
+  assert.equal(blockedPings.length, 1, "on_failure pings; never does not");
+  assert.equal(blockedPings[0]?.["task_id"], pinging["task_id"]);
+});
+
 test("notify policy matrix for completed/failed, and needs_approval always pings", async () => {
   const expected: Record<NotifyMode, Record<"completed" | "failed", number>> = {
     always: { completed: 1, failed: 1 },
