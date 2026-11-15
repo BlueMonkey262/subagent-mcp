@@ -25,6 +25,7 @@ function testRegistry(agents: readonly AgentConfig[], roster: Partial<ModelRoste
     antigravity: roster.antigravity ?? [],
     cursor: roster.cursor ?? [],
     copilot: roster.copilot ?? [],
+    vibe: roster.vibe ?? [],
   };
   return new ConfigRegistry(agents, fullRoster, limits);
 }
@@ -1300,7 +1301,7 @@ test("list_models marks blocked models in the live backend catalog", async () =>
     modelPolicy: { blockClaudeModels: false, disabledBackends: [] as Backend[], blockModels: ["codex:*sol"] },
   };
   const supervisor = new Supervisor({
-    registry: new ConfigRegistry([codexAgentConfig()], { claude: [], codex: [{ name: "fake-model" }], opencode: [], antigravity: [], cursor: [], copilot: [] }, limits),
+    registry: new ConfigRegistry([codexAgentConfig()], { claude: [], codex: [{ name: "fake-model" }], opencode: [], antigravity: [], cursor: [], copilot: [], vibe: [] }, limits),
     adapters: new AdapterRegistry([adapter]),
     cwd: "/work",
   });
@@ -1403,7 +1404,7 @@ test("blockClaudeModels refuses Claude spawns and resumes, allows endpoint model
     opencode: [{ name: "opencode/claude-sonnet-5-5" }],
     antigravity: [],
     cursor: [],
-    copilot: [],
+    copilot: [], vibe: [],
   };
   const { model: _pinned, ...unpinned } = codexAgentConfig();
   const agents: AgentConfig[] = [codexAgentConfig(), { ...unpinned, name: "claude-general", backend: "claude" }];
@@ -1459,7 +1460,7 @@ test("endpoint policy checks aliases and structured upstream model ids", async (
     claude: { models: [{ alias: "neutral", id: "meta/llama-4" }] },
   } }));
   try {
-    const roster = await withEndpointModels({ claude: [], codex: [], opencode: [], antigravity: [], cursor: [], copilot: [] }, endpoints);
+    const roster = await withEndpointModels({ claude: [], codex: [], opencode: [], antigravity: [], cursor: [], copilot: [], vibe: [] }, endpoints);
     assert.equal(roster.codex.find((entry) => entry.name === "openrouter/fast")?.upstreamModel, "anthropic/claude-sonnet-4");
     const { model: _pinned, ...unpinned } = codexAgentConfig();
     const limits = {
@@ -1501,7 +1502,7 @@ test("endpoint policy checks aliases and structured upstream model ids", async (
 
 test("the block is re-checked when a queued message is delivered and when a spawn gets its slot", async () => {
   const claude = new FakeAdapter("claude");
-  const roster: ModelRoster = { claude: [{ name: "claude-sonnet-5" }], codex: [{ name: "fake-model" }], opencode: [], antigravity: [], cursor: [], copilot: [] };
+  const roster: ModelRoster = { claude: [{ name: "claude-sonnet-5" }], codex: [{ name: "fake-model" }], opencode: [], antigravity: [], cursor: [], copilot: [], vibe: [] };
   const { model: _pinned, ...unpinned } = codexAgentConfig();
   const agents: AgentConfig[] = [{ ...unpinned, name: "claude-general", backend: "claude" }];
   const limits = { ...defaultServerLimits(), maxConcurrent: 1, modelPolicy: { blockClaudeModels: false, disabledBackends: [] as Backend[], blockModels: [] as string[] } };
@@ -1523,4 +1524,25 @@ test("the block is re-checked when a queued message is delivered and when a spaw
   assert.match(String(await waiting), /blocked in subagent-mcp/, "the waiting spawn is refused once it gets the slot");
   assert.equal(claude.spawnRequests.length, 1);
   assert.equal(supervisor.concurrency().active, 0, "the refused spawn released its slot");
+});
+
+test("a non-fatal error the turn recovers from is dropped on success; one that persists, or a failed turn, keeps it", async () => {
+  const adapter = new FakeAdapter("codex");
+  const supervisor = new Supervisor({
+    registry: testRegistry([codexAgentConfig()]),
+    adapters: new AdapterRegistry([adapter]),
+    cwd: "/work",
+  });
+  const run = async (error: { code: string; persists?: boolean }, status: "completed" | "failed") => {
+    const spawned = await supervisor.spawnAgent({ agent: "general", prompt: "p", description: "d", run_in_background: true });
+    const agentId = spawned["agent_id"] as string;
+    await waitUntil(() => supervisor.listAgents().some((agent) => agent["agent_id"] === agentId && agent["state"] === "running"));
+    adapter.emit(agentId, "error", { code: error.code, message: "m", fatal: false, ...(error.persists ? { persists: true } : {}) });
+    adapter.emit(agentId, "turn.completed", { turnId: `${agentId}-t`, status, finalText: "done" });
+    await waitUntil(() => supervisor.listAgents().some((agent) => agent["agent_id"] === agentId && agent["state"] === status));
+    return (supervisor.getAgentResult(agentId) as { error?: { code: string } }).error?.code;
+  };
+  assert.equal(await run({ code: "OPENCODE_RATE_LIMITED" }, "completed"), undefined, "a retried rate limit is not the outcome");
+  assert.equal(await run({ code: "ANTIGRAVITY_PERMISSION_DENIED", persists: true }, "completed"), "ANTIGRAVITY_PERMISSION_DENIED");
+  assert.equal(await run({ code: "OPENCODE_PROVIDER_ERROR" }, "failed"), "OPENCODE_PROVIDER_ERROR");
 });

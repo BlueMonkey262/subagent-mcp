@@ -35,7 +35,7 @@ function harness() {
   const adapter = new FakeAdapter("codex", new EventBuffer());
   const settled: Readonly<Record<string, unknown>>[] = [];
   const supervisor = new Supervisor({
-    registry: new ConfigRegistry([agentConfig], { claude: [], codex: [{ name: "fake-model" }], opencode: [], antigravity: [], cursor: [], copilot: [] }),
+    registry: new ConfigRegistry([agentConfig], { claude: [], codex: [{ name: "fake-model" }], opencode: [], antigravity: [], cursor: [], copilot: [], vibe: [] }),
     adapters: new AdapterRegistry([adapter]),
     cwd: "/work",
     onDetachedSettled: (result) => settled.push(result),

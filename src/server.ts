@@ -5,7 +5,9 @@ import { z } from "zod";
 
 import { fileURLToPath } from "node:url";
 
-import { CHANNEL_CAPABILITY, CHANNEL_INSTRUCTIONS, createChannelNotifier } from "./channel.js";
+import { CHANNEL_CAPABILITY, CHANNEL_INSTRUCTIONS, createChannelNotifier, createEnsembleChannelNotifier } from "./channel.js";
+import { startEnsembleShape } from "./ensemble/config.js";
+import { getEnsembleSchema } from "./ensemble/manager.js";
 import { BACKENDS, isBackend } from "./core/types.js";
 import { NORMALIZED_EVENT_TYPES } from "./events/schema.js";
 import { HostSession, runHost } from "./host.js";
@@ -27,6 +29,7 @@ async function main(): Promise<void> {
   );
   const host = new HostSession({ cwd, agentsDirectory, modelsFile, scriptPath: fileURLToPath(import.meta.url) });
   host.onDetached(createChannelNotifier(server.server));
+  host.onEnsemble(createEnsembleChannelNotifier(server.server));
   await host.connect();
   const call = async (method: string, params?: unknown, timeoutMs = 0): Promise<unknown> => {
     const result = await host.call(method, params, timeoutMs);
@@ -42,7 +45,7 @@ async function main(): Promise<void> {
       title: "Spawn subagent",
       description:
         "Delegate implementation, research, or exploration work to a fresh subagent (Claude Code, Codex, " +
-        "OpenCode, Antigravity, Cursor, or GitHub Copilot). Mirrors the native Agent tool: the child starts with no parent context, blocks by default " +
+        "OpenCode, Antigravity, Cursor, GitHub Copilot, or Mistral Vibe). Mirrors the native Agent tool: the child starts with no parent context, blocks by default " +
         "until it finishes or needs your approval, and returns a resumable agent_id. The result always includes " +
         "a human-memorable `name` (auto-assigned unless supplied) and `timeout_seconds`: the turn cap in seconds, " +
         "or null when neither this call nor the agent config sets one. Refer to agents by name in later tool calls. " +
@@ -67,8 +70,9 @@ async function main(): Promise<void> {
         model: z.string().optional().describe("Required unless the agent config pins a model"),
         effort: z.string().optional().describe(
           "Reasoning effort for this agent: \"low\"/\"medium\"/\"high\"/\"xhigh\"/\"max\". Applied to Claude " +
-          "(--effort), Codex, Antigravity (low/medium/high), and Copilot (--reasoning-effort). OpenCode and Cursor reject this argument: " +
-          "OpenCode has no effort parameter, and Cursor folds effort into the model id (for example grok-4.7-high). " +
+          "(--effort), Codex, Antigravity (low/medium/high), and Copilot (--reasoning-effort). OpenCode, Cursor and Vibe reject this argument: " +
+          "OpenCode has no effort parameter, Cursor folds effort into the model id (for example grok-4.7-high), " +
+          "and Vibe sets thinking per model alias in its own config. " +
           "Overridable unless the agent config pins it.",
         ),
         backend: z.enum(BACKENDS).optional().describe("Overrides the agent config's backend"),
@@ -125,7 +129,7 @@ async function main(): Promise<void> {
         ),
         effort: z.string().optional().describe(
           "Reasoning effort for this turn (Codex, Antigravity and Copilot per-turn; Claude only when the session must cold-start). " +
-          "OpenCode and Cursor reject it. Defaults to the value used at spawn.",
+          "OpenCode, Cursor and Vibe reject it. Defaults to the value used at spawn.",
         ),
         timeout: z.number().int().positive().optional().describe(
           "Turn cap in seconds for this resume. Overrides the agent config. Echoed back as timeout_seconds.",
@@ -287,6 +291,59 @@ async function main(): Promise<void> {
   );
 
   server.registerTool(
+    "start_ensemble",
+    {
+      title: "Start ensemble",
+      description:
+        "Run several agents (any mix of configs, backends and models) on one task with a single call, and get one " +
+        "aggregated result instead of per-agent reports. Each member is an ordinary spawn under the same config, " +
+        "model-policy and permission checks; all members are validated before any launches. `task` is shared; a " +
+        "member's `instructions` add to it. Modes: parallel; specialist (instructions required); competitive (each " +
+        "member in its own worktree); pipeline (each member gets the previous one's successful result; a member's `depends_on` " +
+        "replaces that link, and on_dependency_failure: continue passes failures on too). isolation: none | worktree " +
+        "(at HEAD) | snapshot (own worktree holding the current working tree, uncommitted changes included; best for " +
+        "reviews). A member may give `select` instead of config/model, or `selection.count` adds members: models are " +
+        "picked from the roster by category, objective, routing profiles, measured history and quota, never past " +
+        "model policy; `dry_run` shows the picks without launching. completion: all | first_valid | quorum | " +
+        "deadline. aggregation (deterministic, no model calls): collect | compare | vote (field/choices) | merge " +
+        "(conflicts reported, never overwritten) | review_findings (built-in findings schema, de-duplicated and " +
+        "ranked with corroboration); aggregation.synthesize opts in to one extra agent's advisory reading. Valid " +
+        "means completed and, when a result schema applies, matching it; a vote or consensus is not proof. " +
+        "`profile` loads a named roster from .subagents/ensembles.yaml. Background by default: returns at once, " +
+        "child notifications are suppressed, and one ensemble event arrives when it finishes (plus one update if " +
+        "members still running then add results); member approval requests still arrive individually " +
+        "(resolve_approval returns immediately for members). Responses are compact JSON within output.max_chars " +
+        "(default 1600).",
+      inputSchema: startEnsembleShape,
+    },
+    async (input) => toCompactContent(await call("start_ensemble", input)),
+  );
+
+  server.registerTool(
+    "get_ensemble",
+    {
+      title: "Get ensemble",
+      description:
+        "Status or aggregated result of an ensemble by id or name. `wait_seconds` (<= 600) blocks until it finishes " +
+        "or a member needs approval. `role` returns one member's full result; `detail: \"members\"` lists member " +
+        "states, errors and usage; `aggregation` re-aggregates current results with another strategy (no model " +
+        "calls). Without `ensemble`, lists recent ensembles and the configured profiles.",
+      inputSchema: getEnsembleSchema.shape,
+    },
+    async (input) => toCompactContent(await call("get_ensemble", input)),
+  );
+
+  server.registerTool(
+    "cancel_ensemble",
+    {
+      title: "Cancel ensemble",
+      description: "Stop an ensemble's running and queued members and finalize it as cancelled with whatever results exist.",
+      inputSchema: { ensemble: z.string().describe("Ensemble id or name") },
+    },
+    async (input) => toCompactContent(await call("cancel_ensemble", input)),
+  );
+
+  server.registerTool(
     "restart_host",
     {
       title: "Restart host",
@@ -319,6 +376,11 @@ async function main(): Promise<void> {
   };
   process.on("SIGINT", shutdown);
   process.on("SIGTERM", shutdown);
+}
+
+/** Ensemble responses are sized to a character budget, so they are sent without indentation. */
+function toCompactContent(value: unknown): { content: { type: "text"; text: string }[] } {
+  return { content: [{ type: "text", text: JSON.stringify(value) }] };
 }
 
 function toContent(value: unknown): { content: { type: "text"; text: string }[] } {

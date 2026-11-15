@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { AppendOnlyJsonlStore } from './storage/jsonl.js';
-import { capabilities, discardWorktree, setupWorktree, intersectPermission, createWorktree, removeWorktree, restrictPermission, validator, type Worktree } from './execution.js';
+import { applySnapshot, capabilities, discardWorktree, setupWorktree, intersectPermission, createWorktree, removeWorktree, restrictPermission, validator, type WorkingTreeSnapshot, type Worktree } from './execution.js';
 import type { PermissionConfig } from './config/schema.js';
 
 interface ExecutionMeta {
@@ -16,6 +16,8 @@ interface ExecutionMeta {
   structured?: unknown;
   validation_errors?: unknown;
   group_id?: string;
+  /** Membership in a managed ensemble; set only by the ensemble manager, never from tool input. */
+  ensemble?: EnsembleMembership;
   /** Captured Antigravity custom-agent definition used for this conversation. */
   agentDefinition?: AgentDefinitionMetadata;
   /** Set when the agent was started from a queued task: the task's id and creation time, which fix its list position. */
@@ -42,6 +44,8 @@ interface AgentDefinitionMetadata {
   /** Antigravity owns tool policy; this bridge only passes --agent. */
   readonly bridge_enforced: false;
 }
+/** Trusted ensemble membership of an agent (see src/ensemble/manager.ts). */
+export interface EnsembleMembership { readonly id: string; readonly role: string }
 type Row = Readonly<Record<string, unknown>>;
 /** Position of a listed row. An agent started from a queued task keeps that task's position, so the task turning into an agent never moves it between pages. */
 const listKey = (r: Row) => ({ at: String(r.queued_at ?? r.created_at), id: String(r.queued_from ?? r.agent_id) });
@@ -88,6 +92,7 @@ import type { Backend, Usage } from "./core/types.js";
 import { BACKENDS } from "./core/types.js";
 import type { ModelConcurrencyRule, ModelEntry, ResolvedAgentConfig } from "./config/schema.js";
 import { AgentCapacity, childDepthEnv, DEFAULT_SCHEDULED_GRACE_MS } from "./core/limits.js";
+import { classifyProviderError, providerOf, type ProviderErrorClass } from "./core/providers.js";
 import { blockReason, describeBlock, isRestrictive, matchesModelPattern, ModelBlockedError } from "./core/model-policy.js";
 import { ConfigInvalidError, ConfigurationError, SubagentError } from "./core/errors.js";
 import { classifyFailure, normalizeFailure, type FailureInfo } from "./core/failure.js";
@@ -96,7 +101,7 @@ import type { EventReadOptions } from "./events/buffer.js";
 import type { AgentEvent, NormalizedEventData } from "./events/schema.js";
 import { scanChildOutput } from "./safety/output.js";
 import { describeToolInput } from "./tool-describe.js";
-import { remainingAllowances, UsageLedger } from "./usage.js";
+import { remainingAllowances, UsageLedger, usageByProvider } from "./usage.js";
 import { MAX_CONTENT_CHARS, truncateText } from "./truncate.js";
 import { compareVersions, currentVersion, updateCheckDisabled } from "./update-check.js";
 
@@ -143,6 +148,10 @@ interface AgentRecord {
     /** Carried so a queued Antigravity resume can accept a changed agent definition. */
     readonly allowDefinitionChange?: boolean;
   };
+  /** Set while a queued message waits out its provider's cooldown; stop_agent calls it to drop the message. */
+  abortCooldownWait?: () => void;
+  /** `lastError` describes how a successful turn went (a denial, for example), so completion must not clear it. */
+  lastErrorPersists?: boolean;
   /** Seconds. Null when neither the call nor the agent config set a cap. */
   timeoutSeconds: number | null;
   timedOut: boolean;
@@ -206,6 +215,29 @@ export interface SpawnAgentInput {
   readonly max_turns?: number | undefined;
   readonly timeout?: number | undefined;
   readonly max_result_chars?: number | undefined;
+  /** Internal: set by the ensemble manager. The host strips it from external spawn_agent calls. */
+  readonly ensemble?: EnsembleMembership | undefined;
+  /** Internal: with isolation worktree, start the worktree from this working-tree snapshot. Stripped like `ensemble`. */
+  readonly worktree_snapshot?: WorkingTreeSnapshot | undefined;
+}
+
+/** Lean per-agent status for the ensemble manager; resolves a queued task to the agent it started. */
+export interface AgentOutcome {
+  readonly id: string;
+  readonly agent_id?: string;
+  readonly name?: string;
+  readonly backend?: Backend;
+  readonly model?: string;
+  readonly state: string;
+  readonly turn?: number;
+  readonly result?: string;
+  readonly structured?: unknown;
+  readonly validation_errors?: unknown;
+  readonly has_schema: boolean;
+  readonly error?: unknown;
+  readonly usage?: Readonly<Record<string, number | null>>;
+  readonly pending_approval?: Readonly<Record<string, unknown>>;
+  readonly updated_at: string;
 }
 
 export interface SendMessageInput {
@@ -250,6 +282,17 @@ export interface SupervisorOptions {
   readonly usage?: UsageLedger;
   /** Update cache written by the host's background release check. */
   readonly updateCachePath?: string;
+}
+
+interface ProviderGate {
+  /** Earliest time a waiter may resume after a rate limit. */
+  cooldownUntil: number;
+  /** Each waiter adds a random share of this to cooldownUntil, so waiters don't resume together. */
+  cooldownSpreadMs: number;
+  rate_limited: number;
+  auth_failures: number;
+  quota_failures: number;
+  last_error?: { readonly class: ProviderErrorClass; readonly message: string; readonly at: string; readonly agent: string };
 }
 
 export class SupervisorError extends SubagentError {
@@ -310,6 +353,8 @@ export class Supervisor {
   readonly #adapters: AdapterRegistry;
   readonly #cwd: string;
   readonly #capacity: AgentCapacity;
+  /** Per-provider cooldown and failure counts (models.yaml `providerLimits`); the slots live in `#capacity`. */
+  readonly #providers = new Map<string, ProviderGate>();
   readonly #approvals: ApprovalCoordinator;
   readonly #agents = new Map<string, AgentRecord>();
   readonly #names = new Map<string, string>();
@@ -335,6 +380,9 @@ export class Supervisor {
   #undeliveredPings: Record<string, unknown>[] = [];
   #pingFlush: Promise<void> = Promise.resolve();
   #changes = new Set<() => void>();
+  readonly #liveUsageListeners = new Set<() => void>();
+  /** When each agent last signaled live usage, for the once-a-second limit. */
+  readonly #liveUsageSignaledAt = new Map<string, number>();
 
   constructor(options: SupervisorOptions) {
     this.#registry = options.registry;
@@ -402,7 +450,7 @@ export class Supervisor {
     }
   }
 
-  /** Replace the per-backend and per-model pools after a live config reload. */
+  /** Replace the per-backend, per-model and per-provider pools after a live config reload. */
   setCapacityConfig(
     perBackend: Readonly<Partial<Record<Backend, number>>>,
     perModel: readonly ModelConcurrencyRule[],
@@ -413,6 +461,9 @@ export class Supervisor {
       if (limit !== undefined) limits[`backend:${backend}`] = limit;
     }
     for (const rule of perModel) limits[`model:${rule.pattern}`] = rule.limit;
+    for (const [provider, limit] of Object.entries(this.#registry.providerLimits())) {
+      if (limit.maxConcurrent !== undefined) limits[`provider:${provider}`] = limit.maxConcurrent;
+    }
     this.#capacity.setPoolLimits(limits);
   }
 
@@ -562,11 +613,13 @@ export class Supervisor {
       models: this.#roster(backend),
       ...(isRestrictive(this.#registry.modelPolicy()) ? { model_policy: this.#policyView() } : {}),
       usage: backend === undefined ? usage : usage[backend],
+      ...(backend === undefined ? { usage_by_provider: usageByProvider(usage) } : {}),
       ...(filteredAllowance === undefined || (backend !== undefined && filteredAllowance === undefined)
         ? {}
         : { allowances: filteredAllowance }),
       ...(filteredRemaining === undefined ? {} : { remaining: filteredRemaining }),
       concurrency: this.concurrency(),
+      ...(() => { const providers = this.providersView(); return Object.keys(providers).length === 0 ? {} : { providers }; })(),
       ...(warning === undefined ? {} : { config_warning: warning }),
     };
   }
@@ -719,6 +772,77 @@ export class Supervisor {
   }
 
   #changed() { for (const listener of this.#changes) listener(); }
+
+  /** Subscribe to agent/task state changes (the same signal wait_for_agents uses). Returns an unsubscribe. */
+  onChange(listener: () => void): () => void {
+    this.#changes.add(listener);
+    return () => { this.#changes.delete(listener); };
+  }
+
+  /** Subscribe to live usage of running turns, at most once a second per agent. Returns an unsubscribe. */
+  onLiveUsage(listener: () => void): () => void {
+    this.#liveUsageListeners.add(listener);
+    return () => { this.#liveUsageListeners.delete(listener); };
+  }
+
+  /** Current outcome of an agent or queued task, by ID or name. */
+  outcome(identifier: string): AgentOutcome {
+    const task = this.#pending.get(identifier);
+    if (task && !task.result?.agent_id) {
+      return { id: task.id, state: task.state, has_schema: task.input.result_schema !== undefined,
+        ...(task.result?.error === undefined ? {} : { error: task.result.error }),
+        ...(task.input.model === undefined ? {} : { model: task.input.model }),
+        ...(task.input.backend === undefined ? {} : { backend: task.input.backend }),
+        updated_at: task.updated_at ?? task.created_at };
+    }
+    const record = this.#requireRecord(identifier);
+    const settled = !['running', 'starting', 'needs_approval'].includes(record.state);
+    return {
+      id: identifier, agent_id: record.id, name: record.name, backend: record.backend, model: record.model,
+      state: record.state, turn: record.meta.turn, has_schema: record.meta.schema !== undefined,
+      ...(settled && record.result !== undefined ? { result: record.result } : {}),
+      ...(settled && record.meta.structured !== undefined ? { structured: record.meta.structured } : {}),
+      ...(settled && record.meta.validation_errors !== undefined ? { validation_errors: record.meta.validation_errors } : {}),
+      ...(record.lastError === undefined ? {} : { error: record.lastError }),
+      usage: this.#totalUsage(record),
+      ...(record.state === 'needs_approval' ? { pending_approval: this.#approvalDetails(record) } : {}),
+      updated_at: record.updatedAt,
+    };
+  }
+
+  /**
+   * Every check spawnAgent makes before it waits for a slot, without launching anything. The
+   * ensemble manager validates all members first so a bad member never leaves a partial launch.
+   */
+  preflightSpawn(input: SpawnAgentInput): { readonly backend: Backend; readonly model: string; readonly agentConfig: string } {
+    this.#assertConfigValid();
+    const resolved = this.#registry.resolveAgent({
+      agent: input.agent,
+      ...(input.model === undefined ? {} : { model: input.model }),
+      ...(input.backend === undefined ? {} : { backend: input.backend }),
+      ...(input.effort === undefined ? {} : { reasoningEffort: input.effort }),
+    });
+    this.#assertModelAllowed(resolved.backend, resolved.model);
+    if (input.result_schema) validator.compile(input.result_schema);
+    if (input.permission && resolved.backend !== 'claude') throw new SupervisorError('This backend cannot enforce per-spawn permission restrictions');
+    restrictPermission(resolved.permission, input.permission);
+    this.#requireAdapter(resolved.backend);
+    if (input.name !== undefined && this.#names.has(input.name)) {
+      throw new SupervisorError(`Agent name "${input.name}" is already in use by an active or completed agent`, { name: input.name });
+    }
+    return { backend: resolved.backend, model: resolved.model, agentConfig: resolved.name };
+  }
+
+  /** Agents (by id) belonging to an ensemble, found from their persisted membership. Used to reconcile after a restart. */
+  ensembleAgents(ensembleId: string): readonly { readonly agent_id: string; readonly role: string; readonly queued_from?: string }[] {
+    const agents = [...this.#agents.values()].filter(record => record.meta.ensemble?.id === ensembleId)
+      .map(record => ({ agent_id: record.id, role: record.meta.ensemble!.role,
+        ...(record.meta.queued_from === undefined ? {} : { queued_from: record.meta.queued_from }) }));
+    const started = new Set(agents.map(agent => agent.queued_from));
+    const tasks = [...this.#pending.values()].filter(task => task.input.ensemble?.id === ensembleId && !started.has(task.id) && !task.result?.agent_id)
+      .map(task => ({ agent_id: task.id, role: task.input.ensemble!.role }));
+    return [...agents, ...tasks];
+  }
 
   async #schedule(input: SpawnAgentInput) {
     const dependencies = (input.depends_on ?? []).map(agent => {
@@ -980,7 +1104,11 @@ export class Supervisor {
     let launched = false;
     let agentDefinition: AgentDefinitionMetadata | undefined;
     try {
-      if (input.isolation === 'worktree') { worktree = await createWorktree(this.#cwd); await setupWorktree(worktree, resolved.worktreeSetup ?? []); }
+      if (input.isolation === 'worktree') {
+        worktree = await createWorktree(this.#cwd, input.worktree_snapshot?.base);
+        if (input.worktree_snapshot) await applySnapshot(worktree, input.worktree_snapshot);
+        await setupWorktree(worktree, resolved.worktreeSetup ?? []);
+      }
       // Config can hot-reload while worktree setup commands run.
       this.#assertConfigValid();
       this.#assertModelAllowed(resolved.backend, resolved.model);
@@ -1000,6 +1128,9 @@ export class Supervisor {
         permission,
         ...(input.max_turns !== undefined ? { maxTurns: input.max_turns } : resolved.maxTurns !== undefined ? { maxTurns: resolved.maxTurns } : {}),
         ...(timeoutSeconds === null ? {} : { timeoutMs: timeoutSeconds * 1000 }),
+        ...(resolved.vibeMaxTokens === undefined ? {} : { vibeMaxTokens: resolved.vibeMaxTokens }),
+        ...(resolved.vibeMaxPriceUsd === undefined ? {} : { vibeMaxPriceUsd: resolved.vibeMaxPriceUsd }),
+        ...(resolved.vibeTransport === undefined ? {} : { vibeTransport: resolved.vibeTransport }),
         ...(resolved.reasoningEffort === undefined ? {} : { reasoningEffort: resolved.reasoningEffort }),
       });
       launched = true;
@@ -1008,7 +1139,9 @@ export class Supervisor {
       const name = picked.name;
       const record: AgentRecord = {
         meta: { turn: 1, history: [], notify, ...(input.permission ? { permission } : {}), ...(worktree ? { worktree } : {}),
-          ...(input.group_id ? { group_id: input.group_id } : {}), ...(input.result_schema ? { schema: input.result_schema } : {}),
+          ...(input.group_id ? { group_id: input.group_id } : {}),
+          ...(input.ensemble ? { ensemble: { id: input.ensemble.id, role: input.ensemble.role } } : {}),
+          ...(input.result_schema ? { schema: input.result_schema } : {}),
           ...(agentDefinition ? { agentDefinition } : {}),
           ...(task ? { queued_from: task.id, queued_at: task.created_at } : {}),
           ...(task?.start_at === undefined ? {} : { start_at: task.start_at }) },
@@ -1177,6 +1310,10 @@ export class Supervisor {
     record.meta.turn += 1;
     delete record.result;
     delete record.usage;
+    // A new turn starts clean: an error from the previous turn (for example a permission denial)
+    // must not stick to this resume, including when #pump delivers a queued message. #deliverResume
+    // already cleared `lastError`/`lastErrorTurn` up front, so only the persistence flag is left.
+    delete record.lastErrorPersists;
     delete record.meta.structured;
     delete record.meta.validation_errors;
     const turn = await adapter.resume({
@@ -1190,6 +1327,8 @@ export class Supervisor {
       env: { ...resolved.env, SUBAGENT_MCP_DEPTH: childEnv.SUBAGENT_MCP_DEPTH ?? "1" },
       permission: intersectPermission(resolved.permission, record.meta.permission),
       ...(resolved.maxTurns === undefined ? {} : { maxTurns: resolved.maxTurns }),
+      ...(resolved.vibeMaxTokens === undefined ? {} : { vibeMaxTokens: resolved.vibeMaxTokens }),
+      ...(resolved.vibeMaxPriceUsd === undefined ? {} : { vibeMaxPriceUsd: resolved.vibeMaxPriceUsd }),
       ...(timeoutSeconds === null ? {} : { timeoutMs: timeoutSeconds * 1000 }),
       ...(resolved.reasoningEffort === undefined ? {} : { reasoningEffort: resolved.reasoningEffort }),
     });
@@ -1205,6 +1344,15 @@ export class Supervisor {
     delete record.pendingApprovalId;
     record.state = "running";
     record.updatedAt = new Date().toISOString();
+    const relayedAsFollowUp = decision === "deny" && message !== undefined && !adapter.relaysDenyMessage;
+    if (record.meta.ensemble !== undefined && !relayedAsFollowUp) {
+      // An ensemble member's outcome belongs to its ensemble's aggregate, not to this call: return
+      // at once and let the next approval or the settled turn route through the ensemble.
+      record.detached = true;
+      this.#changed();
+      return { agent_id: record.id, name: record.name, status: "running", ensemble_id: record.meta.ensemble.id,
+        ensemble_role: record.meta.ensemble.role, hint: "The outcome is reported by the ensemble; use get_ensemble." };
+    }
     await this.#waitForNotableState(record);
     const settledState = this.#currentState(record);
     if (
@@ -1239,7 +1387,12 @@ export class Supervisor {
     // A deliberate stop should not be undone by a message queued before it arrived.
     delete record.pendingMessage;
     record.detached = false; // this call blocks on the outcome itself
-    await adapter.interrupt(record.id);
+    if (record.abortCooldownWait !== undefined) {
+      // No turn is running: a queued message is waiting out a provider cooldown. Dropping it ends the agent.
+      record.abortCooldownWait();
+    } else {
+      await adapter.interrupt(record.id);
+    }
     await this.#waitForNotableState(record);
     return this.#result(record);
   }
@@ -1361,18 +1514,34 @@ export class Supervisor {
             const finished = event.data.turnId !== undefined && record.meta.history.some(h => h.turn_id === event.data.turnId);
             if (!finished && (record.state === "running" || record.state === "needs_approval" || record.state === "starting")) {
               record.liveUsage = { ...event.data.usage };
+              const now = Date.now();
+              if (this.#liveUsageListeners.size > 0 && now - (this.#liveUsageSignaledAt.get(record.id) ?? 0) >= 1_000) {
+                this.#liveUsageSignaledAt.set(record.id, now);
+                for (const listener of this.#liveUsageListeners) listener();
+              }
             }
             continue;
           }
           if (event.type === "turn.completed") {
+            // A turn that ended while an approval was parked (timeout, crash, interrupt) no longer
+            // waits for it: settle it now, so it is not answerable until its watchdog fires.
+            if (record.pendingApprovalId !== undefined) {
+              try { this.#approvals.cancel(record.pendingApprovalId); } catch { /* already settled */ }
+              delete record.pendingApprovalId;
+            }
             // The final usage wins; without one (an interrupt or crash), keep what was observed live.
             const turnUsage = event.data.usage ?? record.liveUsage;
             delete record.liveUsage;
             if (event.data.finalText !== undefined) record.result = scanChildOutput(event.data.finalText);
             if (turnUsage !== undefined) record.usage = { ...turnUsage };
             else delete record.usage;
+            // A failed turn always carries an actionable error, even when the backend only said
+            // `status: "failed"`. A completed turn keeps only the errors that say how the turn went
+            // (`persists: true`, e.g. actions the backend denied) and drops the ones it recovered
+            // from (a rate limit it retried past).
             if (event.data.status === "failed") this.#ensureFailure(record, event.data.finalText);
-            else if (event.data.status === "completed") this.#clearLastError(record);
+            else if (event.data.status === "completed" && record.lastErrorPersists !== true) this.#clearLastError(record);
+            delete record.lastErrorPersists;
             if (record.meta.history.some(h => h.turn_id === event.data.turnId)) continue;
             if (record.meta.schema && event.data.status === 'completed') {
               try {
@@ -1406,6 +1575,16 @@ export class Supervisor {
                 timedOut: record.timedOut,
               });
               record.timedOut = false;
+              const settled = event.data.status === "completed" ? "completed"
+                : event.data.status === "interrupted" ? "interrupted" : "failed";
+              // The agent keeps its slots between turns, but a rate limit (perhaps from this very
+              // turn) still holds back the next one.
+              if (!await this.#waitOutCooldownFor(record)) {
+                record.state = settled;
+                record.release();
+                await this.#notify(record);
+                continue;
+              }
               try {
                 await this.#deliverResume(record, adapter, pending.prompt, pending.effort, pending.timeout,
                   pending.allowDefinitionChange === true);
@@ -1422,8 +1601,7 @@ export class Supervisor {
                   ...(error.details === undefined ? {} : { details: error.details }),
                 }));
                 if (event.data.status === "failed") this.#ensureFailure(record, event.data.finalText);
-                record.state = event.data.status === "completed" ? "completed"
-                  : event.data.status === "interrupted" ? "interrupted" : "failed";
+                record.state = settled;
                 record.release();
                 await this.#notify(record);
               }
@@ -1446,7 +1624,12 @@ export class Supervisor {
             continue;
           }
           if (event.type === "error") {
-            this.#setLastError(record, this.#failureFromEvent(record, event.data));
+            const failure = this.#failureFromEvent(record, event.data);
+            this.#setLastError(record, failure);
+            // Set when the error says how the turn went (a denial, for example) rather than being
+            // something the backend recovered from; a completed turn keeps only the first kind.
+            record.lastErrorPersists = event.data.fatal || event.data.persists === true;
+            this.#noteProviderError(record, event.data.code, failure.message, event.data.details);
             if (/TIMEOUT/.test(event.data.code)) record.timedOut = true;
             if (event.data.fatal) {
               record.state = "failed";
@@ -1482,6 +1665,7 @@ export class Supervisor {
       code: info.code,
       message: info.message,
       fatal: data.fatal,
+      ...(data.persists === true ? { persists: true } : {}),
       category: info.category,
       retryable: info.retryable,
       recommended_action: info.recommended_action,
@@ -1737,6 +1921,7 @@ export class Supervisor {
       storage_error: this.#storageError,
       turn: record.meta.turn,
       group_id: record.meta.group_id,
+      ...(record.meta.ensemble === undefined ? {} : { ensemble_id: record.meta.ensemble.id, ensemble_role: record.meta.ensemble.role }),
       worktree: record.meta.worktree,
       filesystem_boundary_enforced: false,
       structured_result: record.meta.structured,
@@ -1833,6 +2018,7 @@ export class Supervisor {
     return {
       turn: record.meta.turn,
       group_id: record.meta.group_id,
+      ...(record.meta.ensemble === undefined ? {} : { ensemble_id: record.meta.ensemble.id, ensemble_role: record.meta.ensemble.role }),
       worktree: record.meta.worktree,
       filesystem_boundary_enforced: false,
       result_validation: record.meta.schema ? record.meta.validation_errors ? "invalid" : record.meta.structured !== undefined ? "valid" : "pending" : undefined,
@@ -2187,6 +2373,134 @@ export class Supervisor {
     }
   }
 
+  /**
+   * One capacity guard covers the global cap and every named pool this spawn belongs to:
+   * `backend:<name>`, `model:<glob>` (models.yaml `perBackendConcurrency`/`perModelConcurrency`)
+   * and `provider:<id>` (models.yaml `providerLimits`). A provider in cooldown after a rate limit
+   * is waited out before it takes a slot, and a slot grabbed just before a rate limit is handed
+   * back so the next turn waits too. Queued spawns hold no global slot, so a throttled provider
+   * never blocks backends that are not throttled.
+   */
+  #capacityKeys(backend: Backend, model: string): readonly string[] {
+    const keys: string[] = [];
+    if (this.#registry.perBackendConcurrency()[backend] !== undefined) keys.push(`backend:${backend}`);
+    for (const rule of this.#registry.perModelConcurrency()) {
+      if (matchesModelPattern(rule.pattern, backend, model)) keys.push(`model:${rule.pattern}`);
+    }
+    const provider = providerOf(backend, model);
+    if (provider !== undefined && this.#registry.providerLimits()[provider]?.maxConcurrent !== undefined) {
+      keys.push(`provider:${provider}`);
+    }
+    return keys;
+  }
+
+  async #acquireCapacity(backend: Backend, model: string): Promise<() => void> {
+    const keys = this.#capacityKeys(backend, model);
+    const provider = providerOf(backend, model);
+    if (provider === undefined) return this.#capacity.acquireWhenFree(`pending-${randomUUID()}`, keys);
+    const gate = this.#gate(provider);
+    for (;;) {
+      await this.#waitOutCooldown(gate);
+      const release = await this.#capacity.acquireWhenFree(`pending-${randomUUID()}`, keys);
+      // A rate limit hit while this call queued for a slot starts a cooldown it must also wait out.
+      if (gate.cooldownUntil <= Date.now()) return release;
+      release();
+    }
+  }
+
+  /**
+   * Sleeps until the gate's cooldown is over. Each waiter adds its own share of the jitter window,
+   * so agents held back by one rate limit don't all resume in one burst. Resolves false if `signal` fires.
+   */
+  async #waitOutCooldown(gate: ProviderGate, signal?: { onAbort?: () => void }): Promise<boolean> {
+    while (gate.cooldownUntil > Date.now()) {
+      const wait = gate.cooldownUntil - Date.now() + Math.random() * gate.cooldownSpreadMs;
+      const finished = await new Promise<boolean>((resolve) => {
+        const timer = setTimeout(() => resolve(true), wait);
+        if (signal !== undefined) signal.onAbort = () => { clearTimeout(timer); resolve(false); };
+      });
+      if (!finished) return false;
+    }
+    return true;
+  }
+
+  /** For a queued message: waits out the agent's provider cooldown. False when stop_agent dropped the message meanwhile. */
+  async #waitOutCooldownFor(record: AgentRecord): Promise<boolean> {
+    const provider = providerOf(record.backend, record.model);
+    if (provider === undefined) return true;
+    const gate = this.#gate(provider);
+    if (gate.cooldownUntil <= Date.now()) return true;
+    const signal: { onAbort?: () => void } = {};
+    record.abortCooldownWait = () => signal.onAbort?.();
+    try {
+      return await this.#waitOutCooldown(gate, signal);
+    } finally {
+      delete record.abortCooldownWait;
+    }
+  }
+
+  #gate(provider: string): ProviderGate {
+    let gate = this.#providers.get(provider);
+    if (gate === undefined) {
+      gate = { cooldownUntil: 0, cooldownSpreadMs: 0, rate_limited: 0, auth_failures: 0, quota_failures: 0 };
+      this.#providers.set(provider, gate);
+    }
+    return gate;
+  }
+
+  /** Count a classified provider failure; a rate limit starts the provider's configured cooldown. */
+  #noteProviderError(record: AgentRecord, code: string, message: string, details: Readonly<Record<string, unknown>> | undefined): void {
+    const provider = providerOf(record.backend, record.model);
+    if (provider === undefined) return;
+    const declared = details?.["class"];
+    const kind: ProviderErrorClass | undefined = declared === "rate_limit" || declared === "auth" || declared === "quota"
+      ? declared
+      : code.startsWith("OPENCODE_") ? classifyProviderError(message, typeof details?.["statusCode"] === "number" ? details["statusCode"] : undefined) : undefined;
+    if (kind === undefined) return;
+    const gate = this.#gate(provider);
+    const at = new Date().toISOString();
+    gate.last_error = { class: kind, message: message.slice(0, 300), at, agent: record.name };
+    if (kind === "auth") { gate.auth_failures += 1; return; }
+    if (kind === "quota") { gate.quota_failures += 1; return; }
+    gate.rate_limited += 1;
+    const seconds = this.#registry.providerLimits()[provider]?.cooldownSeconds;
+    if (seconds === undefined) return;
+    // The gate opens at 80% of the cooldown; each waiter adds its own share of the remaining 40%
+    // (#waitOutCooldown), so waiters resume spread over 80-120% instead of in one burst.
+    const until = Date.now() + seconds * 1000 * 0.8;
+    gate.cooldownUntil = Math.max(gate.cooldownUntil, until);
+    gate.cooldownSpreadMs = seconds * 1000 * 0.4;
+  }
+
+  /** Provider gates for list_models: slots come from the shared capacity guard, plus cooldown and failure counts. */
+  providersView(): Readonly<Record<string, unknown>> {
+    const limits = this.#registry.providerLimits();
+    const names = new Set([...Object.keys(limits), ...this.#providers.keys()]);
+    const pools = this.#capacity.poolViews();
+    const view: Record<string, unknown> = {};
+    for (const provider of [...names].sort()) {
+      const gate = this.#providers.get(provider);
+      const limit = limits[provider];
+      const pool = limit?.maxConcurrent === undefined
+        ? undefined
+        : pools.find((entry) => entry.key === `provider:${provider}`);
+      view[provider] = {
+        ...(limit?.maxConcurrent === undefined ? {} : {
+          limit: limit.maxConcurrent,
+          active: pool?.active ?? 0,
+          waiting: pool?.waiting ?? 0,
+        }),
+        ...(limit?.cooldownSeconds === undefined ? {} : { cooldown_seconds: limit.cooldownSeconds }),
+        ...(gate !== undefined && gate.cooldownUntil > Date.now() ? { cooling_down_until: new Date(gate.cooldownUntil).toISOString() } : {}),
+        rate_limited: gate?.rate_limited ?? 0,
+        auth_failures: gate?.auth_failures ?? 0,
+        quota_failures: gate?.quota_failures ?? 0,
+        ...(gate?.last_error === undefined ? {} : { last_error: gate.last_error }),
+      };
+    }
+    return view;
+  }
+
   async #resolveAntigravityDefinition(
     resolved: Pick<ResolvedAgentConfig, "backend" | "antigravityAgent" | "antigravityAgentFile">,
     cwd: string,
@@ -2254,20 +2568,6 @@ export class Supervisor {
       ...(snapshotPath === undefined ? {} : { snapshotPath }),
       bridge_enforced: false,
     };
-  }
-
-  #capacityKeys(backend: Backend, model: string): readonly string[] {
-    const keys: string[] = [];
-    if (this.#registry.perBackendConcurrency()[backend] !== undefined) keys.push(`backend:${backend}`);
-    for (const rule of this.#registry.perModelConcurrency()) {
-      if (matchesModelPattern(rule.pattern, backend, model)) keys.push(`model:${rule.pattern}`);
-    }
-    return keys;
-  }
-
-  #acquireCapacity(backend: Backend, model: string): Promise<() => void> {
-    const placeholder = `pending-${randomUUID()}`;
-    return this.#capacity.acquireWhenFree(placeholder, this.#capacityKeys(backend, model));
   }
 }
 

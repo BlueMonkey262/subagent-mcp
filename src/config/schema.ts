@@ -32,6 +32,18 @@ export interface AgentConfig {
   readonly reasoningEffort?: string;
   /** Antigravity-only custom-agent name, passed to `agy --agent`. */
   readonly antigravityAgent?: string;
+  /**
+   * Vibe only: `cli` (default) runs headless `vibe -p`, which cannot ask for approval; `acp` runs
+   * `vibe-acp` and routes each tool permission through the approval flow. Fixed per agent at spawn.
+   */
+  readonly vibeTransport?: "cli" | "acp";
+  /** Vibe only: per-turn cap on prompt + completion tokens (`vibe --max-tokens`). */
+  readonly vibeMaxTokens?: number;
+  /**
+   * Vibe only: per-turn cap in US dollars (`vibe --max-price`). Approximate: Vibe prices calls from
+   * its own model price table, which Mistral notes may be missing or stale. Not a billing guarantee.
+   */
+  readonly vibeMaxPriceUsd?: number;
   /** Optional repo-relative definition file; resolved and audited before launch. */
   readonly antigravityAgentFile?: string;
   readonly description: string;
@@ -70,6 +82,17 @@ export interface Allowance {
   readonly maxCostUsd?: number;
 }
 
+/**
+ * Per-provider guard for models routed through OpenCode (`provider/model` ids), separate from the
+ * global agent cap and from any backend's own plan limits.
+ */
+export interface ProviderLimit {
+  /** Active agents using this provider at once; further spawns and resumes wait for a slot. */
+  readonly maxConcurrent?: number;
+  /** After a turn fails on a recognized rate limit, new turns for this provider wait this long. */
+  readonly cooldownSeconds?: number;
+}
+
 export interface ServerLimits {
   readonly maxConcurrent: number;
   readonly codexResumeIdleMs: number;
@@ -85,6 +108,8 @@ export interface ServerLimits {
   readonly allowances: Readonly<Partial<Record<Backend, Allowance>>>;
   /** Which backends and models are refused (see core/model-policy.ts). */
   readonly modelPolicy: ModelPolicy;
+  /** Keyed by provider id (the part of an OpenCode model id before the first `/`). */
+  readonly providerLimits: Readonly<Record<string, ProviderLimit>>;
 }
 
 export interface ModelConcurrencyRule {

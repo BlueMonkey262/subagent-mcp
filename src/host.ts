@@ -13,6 +13,7 @@ import { ClaudeAdapter } from "./adapters/claude/adapter.js";
 import { CodexAdapter } from "./adapters/codex/adapter.js";
 import { CursorAdapter } from "./adapters/cursor/adapter.js";
 import { CopilotAdapter } from "./adapters/copilot/adapter.js";
+import { VibeAdapter } from "./adapters/vibe/adapter.js";
 import { OpenCodeAdapter } from "./adapters/opencode/adapter.js";
 import { LiveConfig } from "./config/live.js";
 import { isBackend } from "./core/types.js";
@@ -20,6 +21,8 @@ import type { EventReadOptions } from "./events/buffer.js";
 import type { NormalizedEventType } from "./events/schema.js";
 import type { ListAgentsInput, AgentSnapshot, SendMessageInput, SpawnAgentInput, Supervisor } from "./supervisor.js";
 import { Supervisor as SupervisorClass } from "./supervisor.js";
+import { EnsembleManager } from "./ensemble/manager.js";
+import { RoutingHistory } from "./routing/history.js";
 import { ensureProjectMemoryIgnored } from "./storage/routing.js";
 import { checkForUpdate } from "./update-check.js";
 import { UsageLedger } from "./usage.js";
@@ -229,6 +232,7 @@ export interface RunningHost {
 export async function serveHost(options: {
   readonly socketPath: string;
   readonly supervisor: Supervisor;
+  readonly ensembles?: EnsembleManager;
   readonly onClients?: (count: number) => void;
   readonly onShutdown?: () => void;
   /** Set once the host begins shutting down; no further mutating RPCs are accepted. */
@@ -329,7 +333,8 @@ export async function serveHost(options: {
           shuttingDown = true;
           options.onShutdown?.();
         }, { clients: () => sockets.size, attached: () => attached.size, attach: () => attach(socket),
-          shuttingDown: () => shuttingDown || options.shuttingDown?.() === true });
+          shuttingDown: () => shuttingDown || options.shuttingDown?.() === true,
+          ...(options.ensembles === undefined ? {} : { ensembles: options.ensembles }) });
       }
     });
     const drop = (): void => {
@@ -432,6 +437,7 @@ export class HostSession {
   #attachInFlight: Promise<unknown> | undefined;
   #attachFailureLogged = false;
   readonly #detached: ((data: Readonly<Record<string, unknown>>) => void)[] = [];
+  readonly #ensemble: ((data: Readonly<Record<string, unknown>>) => void)[] = [];
 
   constructor(readonly options: Parameters<typeof connectHost>[0]) {}
 
@@ -461,6 +467,12 @@ export class HostSession {
   onDetached(listener: (data: Readonly<Record<string, unknown>>) => void): void {
     this.#detached.push(listener);
     this.#client?.onDetached(listener);
+  }
+
+  /** A background ensemble finalized (one consolidated event per ensemble). */
+  onEnsemble(listener: (data: Readonly<Record<string, unknown>>) => void): void {
+    this.#ensemble.push(listener);
+    this.#client?.onEnsemble(listener);
   }
 
   async call(method: string, params?: unknown, timeoutMs = 0): Promise<unknown> {
@@ -551,6 +563,7 @@ export class HostSession {
     this.#attached = false;
     this.#attachInFlight = undefined;
     for (const listener of this.#detached) client.onDetached(listener);
+    for (const listener of this.#ensemble) client.onEnsemble(listener);
     if (this.#wantsAttach) {
       // The replacement host restored queued pings; consume them on this connection too.
       void this.#startAttach(client).catch(() => undefined);
@@ -683,13 +696,15 @@ export async function runHost(): Promise<void> {
   const antigravity = new AntigravityAdapter();
   const cursor = new CursorAdapter();
   const copilot = new CopilotAdapter();
+  const vibe = new VibeAdapter({ catalogCachePath: join(paths.directory, "vibe-models.json") });
   let endpoint: RunningHost | undefined;
+  let ensembles: EnsembleManager | undefined;
   const notifierTasks = new Set<Promise<unknown>>();
   /** Last time a completion notifier was added or settled; shutdown's drain waits for it to go quiet. */
   let notifierActivity = Date.now();
   const supervisor = new SupervisorClass({
     registry: live,
-    adapters: new AdapterRegistry([claude, codex, opencode, antigravity, cursor, copilot]),
+    adapters: new AdapterRegistry([claude, codex, opencode, antigravity, cursor, copilot, vibe]),
     cwd,
     usage,
     updateCachePath: join(paths.directory, "update.json"),
@@ -697,6 +712,8 @@ export async function runHost(): Promise<void> {
     staleAgentMs: live.staleAgentMs(),
     scheduledGraceMs: live.scheduledGraceMs(),
     onDetachedSettled: (result) => {
+      // Managed ensemble members report through their ensemble's single consolidated event.
+      if (ensembles?.routeDetached(result) === true) return;
       // A probe/CLI socket is not a consumer; only an attached session counts. If none are
       // attached (or the writes failed), persist the ping for the next attach_session instead.
       const task = (async () => {
@@ -739,6 +756,21 @@ export async function runHost(): Promise<void> {
   supervisor.enablePersistence(paths.snapshotPath);
   await supervisor.recoverResults();
   await supervisor.flushSnapshot();
+  const history = new RoutingHistory(join(paths.directory, "routing-history.jsonl"));
+  await history.load().catch((error) => process.stderr.write(`subagent-mcp: routing history unreadable: ${String(error)}\n`));
+  ensembles = new EnsembleManager({
+    supervisor,
+    cwd,
+    history,
+    directory: join(paths.directory, "ensembles"),
+    onSettled: async (event) => {
+      // A probe/CLI socket is not a consumer; only an attached session can receive the event.
+      // Returning false leaves the record's notification pending for the next attach_session.
+      if (endpoint === undefined || endpoint.attached === 0) return false;
+      return (await endpoint.notify({ event: "ensemble", data: event })) > 0;
+    },
+  });
+  await ensembles.restore().catch((error) => process.stderr.write(`subagent-mcp: ensemble restore failed: ${String(error)}\n`));
 
   const runUpdateCheck = (): void => {
     void checkForUpdate({ memoryDirectory: paths.directory }).catch(() => undefined);
@@ -768,6 +800,7 @@ export async function runHost(): Promise<void> {
       antigravity.closeAll(),
       cursor.closeAll(),
       copilot.closeAll(),
+      vibe.closeAll(),
     ]).catch(() => undefined);
     await drainNotifierTasks(notifierTasks, NOTIFIER_DRAIN_TIMEOUT_MS, NOTIFIER_SETTLE_MS, () => notifierActivity);
     const ownsPaths = await ownsHostPaths(paths, process.pid);
@@ -794,7 +827,7 @@ export async function runHost(): Promise<void> {
     if (clients > 0 || shuttingDown) return;
     idleTimer = setTimeout(() => {
       supervisor.checkLiveness();
-      if (hasLiveWork(supervisor)) return;
+      if (hasLiveWork(supervisor) || ensembles?.hasActive() === true) return;
       void shutdown();
     }, IDLE_EXIT_MS);
   };
@@ -802,6 +835,7 @@ export async function runHost(): Promise<void> {
   endpoint = await serveHost({
     socketPath: paths.socketPath,
     supervisor,
+    ensembles,
     onClients: scheduleIdle,
     onShutdown: () => void shutdown(),
     shuttingDown: () => shuttingDown,
@@ -816,6 +850,7 @@ export class HostClient {
   readonly #socket: Socket;
   readonly #pending = new Map<number, { resolve: (value: unknown) => void; reject: (error: Error) => void }>();
   readonly #detached: Array<(data: Readonly<Record<string, unknown>>) => void> = [];
+  readonly #ensemble: Array<(data: Readonly<Record<string, unknown>>) => void> = [];
   #buffer = "";
   #nextId = 1;
   #closed = false;
@@ -853,6 +888,10 @@ export class HostClient {
 
   onDetached(listener: (data: Readonly<Record<string, unknown>>) => void): void {
     this.#detached.push(listener);
+  }
+
+  onEnsemble(listener: (data: Readonly<Record<string, unknown>>) => void): void {
+    this.#ensemble.push(listener);
   }
 
   call(method: string, params?: unknown, timeoutMs = 0): Promise<unknown> {
@@ -895,6 +934,10 @@ export class HostClient {
       if (!isRecord(message)) continue;
       if (message["event"] === "detached" && isRecord(message["data"])) {
         for (const listener of this.#detached) listener(message["data"]);
+        continue;
+      }
+      if (message["event"] === "ensemble" && isRecord(message["data"])) {
+        for (const listener of this.#ensemble) listener(message["data"]);
         continue;
       }
       if (typeof message["id"] !== "number") continue;
@@ -949,6 +992,8 @@ async function handleLine(
   try {
     const result = await dispatch(supervisor, method, request["params"], context);
     socket.write(`${JSON.stringify({ id, result })}\n`);
+    // A client that makes tool calls has its listeners attached: retry events no one was connected to receive.
+    if (method !== "hello" && method !== "shutdown") void context.ensembles?.deliverPending();
     if (method === "shutdown") setTimeout(onShutdown, 30);
   } catch (error) {
     const body = error instanceof Error
@@ -970,6 +1015,7 @@ interface DispatchContext {
   readonly attach: () => Promise<Readonly<Record<string, unknown>>>;
   /** True once the host is shutting down and must not accept more state changes. */
   readonly shuttingDown: () => boolean;
+  readonly ensembles?: EnsembleManager;
 }
 
 async function dispatch(supervisor: Supervisor, method: string, params: unknown, context: DispatchContext): Promise<unknown> {
@@ -989,8 +1035,17 @@ async function dispatch(supervisor: Supervisor, method: string, params: unknown,
       };
     case "attach_session":
       return context.attach();
-    case "spawn_agent":
-      return supervisor.spawnAgent(input as unknown as SpawnAgentInput);
+    case "spawn_agent": {
+      // Ensemble membership is trusted state the ensemble manager sets in-process, never tool input.
+      const { ensemble: _ensemble, worktree_snapshot: _snapshot, ...spawn } = input;
+      return supervisor.spawnAgent(spawn as unknown as SpawnAgentInput);
+    }
+    case "start_ensemble":
+      return requireEnsembles(context).start(input);
+    case "get_ensemble":
+      return requireEnsembles(context).get(input);
+    case "cancel_ensemble":
+      return requireEnsembles(context).cancel(requiredString(input, "ensemble"));
     case "send_message":
       return supervisor.sendMessage(input as unknown as SendMessageInput);
     case "list_agents":
@@ -1271,6 +1326,11 @@ function requiredString(record: Readonly<Record<string, unknown>>, key: string):
   const value = record[key];
   if (typeof value !== "string" || value.trim() === "") throw new Error(`${key} must be a non-empty string`);
   return value;
+}
+
+function requireEnsembles(context: DispatchContext): EnsembleManager {
+  if (context.ensembles === undefined) throw new Error("This subagent-mcp host does not run ensembles");
+  return context.ensembles;
 }
 
 function requiredDecision(value: unknown): "allow" | "allow_for_session" | "deny" {

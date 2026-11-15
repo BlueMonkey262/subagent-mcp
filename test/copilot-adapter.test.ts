@@ -475,7 +475,7 @@ test("a background Copilot turn pushes the settled channel event on completion, 
     env: {},
     sourcePath: "test-fixture",
   };
-  const roster: ModelRoster = { claude: [], codex: [], opencode: [], antigravity: [], cursor: [], copilot: [{ name: "auto" }] };
+  const roster: ModelRoster = { claude: [], codex: [], opencode: [], antigravity: [], cursor: [], copilot: [{ name: "auto" }], vibe: [] };
 
   async function harness(): Promise<{ adapter: CopilotAdapter; supervisor: Supervisor; settled: Readonly<Record<string, unknown>>[] }> {
     const adapter = fixtureAdapter();

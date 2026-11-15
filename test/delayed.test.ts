@@ -34,6 +34,7 @@ function testRegistry(limits = defaultServerLimits()): ConfigRegistry {
     antigravity: [],
     cursor: [],
     copilot: [],
+    vibe: [],
   };
   return new ConfigRegistry([agent], roster, limits);
 }

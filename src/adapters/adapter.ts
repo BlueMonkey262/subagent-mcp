@@ -5,6 +5,8 @@ import type { AgentEvent } from "../events/schema.js";
 
 export interface SpawnRequest {
   readonly prompt: string;
+  /** Vibe only: which transport a new agent uses. A resumed agent keeps its own (see the Vibe adapter). */
+  readonly vibeTransport?: "cli" | "acp";
   readonly description: string;
   /** Always resolved and roster-validated before reaching an adapter. */
   readonly model: string;
@@ -19,6 +21,10 @@ export interface SpawnRequest {
   readonly permission: PermissionConfig;
   readonly maxTurns?: number;
   readonly timeoutMs?: number;
+  /** Vibe only: per-turn token cap (`--max-tokens`). */
+  readonly vibeMaxTokens?: number;
+  /** Vibe only: approximate per-turn dollar cap (`--max-price`), from Vibe's own price table. */
+  readonly vibeMaxPriceUsd?: number;
   /**
    * Reasoning effort (e.g. "low"/"medium"/"high"/"xhigh"/"max"). Claude maps it to `--effort` at
    * launch; Codex, Antigravity and Copilot apply it per turn. The registry rejects it for OpenCode and
@@ -43,6 +49,10 @@ export interface ResumeRequest {
   readonly permission: PermissionConfig;
   readonly maxTurns?: number;
   readonly timeoutMs?: number;
+  /** Vibe only: per-turn token cap (`--max-tokens`). */
+  readonly vibeMaxTokens?: number;
+  /** Vibe only: approximate per-turn dollar cap (`--max-price`), from Vibe's own price table. */
+  readonly vibeMaxPriceUsd?: number;
   /**
    * Reasoning effort (e.g. "low"/"medium"/"high"/"xhigh"/"max"). Claude maps it to `--effort` at
    * launch; Codex, Antigravity and Copilot apply it per turn. The registry rejects it for OpenCode and

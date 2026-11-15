@@ -102,6 +102,7 @@ test("spawn captures the real Antigravity definition, snapshots it, and refuses 
     antigravity: [{ name: "gemini-fixture" }],
     cursor: [],
     copilot: [],
+    vibe: [],
   };
   const registry = new ConfigRegistry([agent], roster, defaultServerLimits());
   const adapter = new FakeAdapter("antigravity");
@@ -175,6 +176,7 @@ test("a queued send_message keeps allow_agent_definition_change and classifies d
     antigravity: [{ name: "gemini-fixture" }],
     cursor: [],
     copilot: [],
+    vibe: [],
   };
   const registry = new ConfigRegistry([agent], roster, defaultServerLimits());
   const adapter = new FakeAdapter("antigravity");
@@ -253,6 +255,7 @@ test("a task does not launch if shutdown begins during agent-definition capture"
     antigravity: [{ name: "gemini-fixture" }],
     cursor: [],
     copilot: [],
+    vibe: [],
   };
   const adapter = new FakeAdapter("antigravity");
   const resolver = new FileAntigravityAgentResolver();
