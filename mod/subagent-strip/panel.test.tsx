@@ -508,3 +508,40 @@ test('desktop ensembles draw a card with one row per member', async ($, on) => {
   expect(await ui.find({ type: 'Text', text: /^Ensembles$/ })).toBeTruthy()
   await ui.unmount()
 })
+
+// Kept last: the models.yaml path the server reports is remembered for the rest of the session.
+test('a project without its own models.yaml edits the bundled file the server reports', async ($, on) => {
+  const bundled = '/opt/subagent-mcp/.subagents/models.yaml'
+  let file = 'disabledBackends: []\nmodels:\n'
+  const reads: string[] = []
+  const writes: { path: string; text: string }[] = []
+  on('mcp.call', (_, e) => {
+    const body = e.tool === 'list_models' ? { models_file: bundled } : e.tool === 'list_agents' ? { agents: [] } : {}
+    return { value: { content: [{ type: 'text', text: JSON.stringify(body) }], structuredContent: body } }
+  })
+  on('command.register', () => ({ value: { command: 'subagent-mcp' } }))
+  on('ui.open', () => ({ value: { isPlaced: true } }))
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+  on('fs.read', (_, e) => {
+    const path = String((e as { path?: string }).path)
+    reads.push(path)
+    if (path === bundled) return { value: file }
+    if (path.endsWith('models.yaml')) throw new Error('E')
+    return { value: '{}' }
+  })
+  on('fs.write', (_, e) => {
+    const { path, text } = e as { path?: string; text?: string }
+    writes.push({ path: String(path), text: String(text) })
+    if (path === bundled) file = String(text)
+    return { value: undefined }
+  })
+  await $.session.start({ cwd: '/Users/me/MeshCore', surface: 'terminal', isInteractive: true })
+  await $.command.run({ command: 'subagent-mcp', args: '' })
+
+  const ui = await $.ui.mount(PANE)
+  await ui.press({ key: 'backend-cursor' })
+  expect(writes.map(w => w.path)).toEqual([`${bundled}.bak`, bundled])
+  expect(file).toContain('disabledBackends: [cursor]')
+  expect(reads.some(path => path.startsWith('/Users/me/MeshCore/.subagents/models.yaml'))).toBe(false)
+  await ui.unmount()
+})

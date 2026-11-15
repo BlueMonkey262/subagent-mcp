@@ -542,3 +542,18 @@ test("the host runs ensembles over the socket, strips forged membership and push
     await rm(paths.socketPath, { force: true });
   }
 });
+
+test("list_models names the models.yaml the host loaded", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "subagent-host-"));
+  const supervisor = new Supervisor({ registry: registry(), adapters: new AdapterRegistry([new FakeAdapter("codex")]), cwd });
+  const paths = hostPaths(cwd);
+  const endpoint = await serveHost({ socketPath: paths.socketPath, supervisor, modelsFile: "/bundled/.subagents/models.yaml" });
+  try {
+    const client = await HostClient.connect(paths.socketPath);
+    const models = await client.call("list_models") as { models_file?: string };
+    assert.equal(models.models_file, "/bundled/.subagents/models.yaml");
+    client.close();
+  } finally {
+    await endpoint.close();
+  }
+});

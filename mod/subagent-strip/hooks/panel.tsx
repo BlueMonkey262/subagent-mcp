@@ -161,6 +161,17 @@ function digest(d: Record<string, unknown>): string[] {
 let projectDir = ''
 const inProject = (path: string) => (projectDir === '' ? path : `${projectDir.replace(/\/$/, '')}/${path}`)
 
+// The models.yaml the server loaded, from list_models. A project without its own runs on the bundled one
+// (bin/run-server.sh), so the project path alone would point at a file that doesn't exist.
+let serverModelsFile: string | undefined
+const modelsFile = () => serverModelsFile ?? inProject(MODELS_FILE)
+const sharedModelsFile = () => serverModelsFile !== undefined && projectDir !== '' && !serverModelsFile.startsWith(`${projectDir.replace(/\/$/, '')}/`)
+
+function noteModelsFile(models: Record<string, unknown>) {
+  const reported = models['models_file']
+  if (typeof reported === 'string' && reported !== '') serverModelsFile = reported
+}
+
 /** Called from the one session.start hook in register.tsx. */
 export function declarePanelCommand($: EngineInterface, cwd?: string) {
   if (cwd !== undefined && cwd !== '') projectDir = cwd
@@ -178,13 +189,14 @@ async function loadPolicy($: EngineInterface) {
   let file: string[] = []
   try {
     const models = await callTool($, 'list_models')
+    noteModelsFile(models)
     const policy = (models['model_policy'] ?? {}) as Record<string, unknown>
     live = ((policy['disabled_backends'] as unknown[] | undefined) ?? []).map(str)
   } catch {
     // keep what the file says
   }
   try {
-    file = readDisabled(await $.fs.read(inProject(MODELS_FILE))) ?? []
+    file = readDisabled(await $.fs.read(modelsFile())) ?? []
   } catch {
     file = []
   }
@@ -479,7 +491,8 @@ export const registerPanel = (on: On) => {
     }
     const toggle = async (backend: string) => {
       try {
-        const text = await $.fs.read(inProject(MODELS_FILE))
+        if (serverModelsFile === undefined) noteModelsFile(await callTool($, 'list_models').catch(() => ({})))
+        const text = await $.fs.read(modelsFile())
         const now = readDisabled(text)
         if (now === null) return say('disabledBackends in models.yaml is not a one-line list; edit it by hand')
         // The file is the truth for what it lists: a backend it disables can always be turned back on here.
@@ -487,8 +500,8 @@ export const registerPanel = (on: On) => {
         const next = now.includes(backend) ? now.filter(b => b !== backend) : [...now, backend]
         const edit = writeDisabled(text, next)
         if (!edit.ok) return say(edit.reason)
-        await $.fs.write(inProject(`${MODELS_FILE}.bak`), text)
-        await $.fs.write(inProject(MODELS_FILE), edit.text)
+        await $.fs.write(`${modelsFile()}.bak`, text)
+        await $.fs.write(modelsFile(), edit.text)
         // Show the file's new list now; the server reloads models.yaml a moment after the write, so asking it
         // straight away would still report the old list (and mark the backend env-locked). Ask again shortly.
         await update($, panel, s => {
@@ -496,9 +509,10 @@ export const registerPanel = (on: On) => {
           return { ...s, disabled: [...new Set([...next, ...locked])], locked }
         })
         $.clock.after(1500, () => loadPolicy($))
-        await say(`${backend} ${next.includes(backend) ? 'disabled' : 'enabled'} (models.yaml reloads live; previous copy in models.yaml.bak)`)
+        const where = sharedModelsFile() ? `the bundled ${modelsFile()}, shared by projects without their own; i gives this one its own` : 'models.yaml reloads live'
+        await say(`${backend} ${next.includes(backend) ? 'disabled' : 'enabled'} (${where}; previous copy in models.yaml.bak)`)
       } catch (error) {
-        await say(`Could not change models.yaml: ${str((error as Error).message).slice(0, 80)} (is there a project .subagents/models.yaml? run i)`)
+        await say(`Could not change ${modelsFile()}: ${str((error as Error).message).slice(0, 80)} (run i to give this project its own .subagents/models.yaml)`)
       }
     }
 
