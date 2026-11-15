@@ -86,9 +86,10 @@ const candidateId = (candidate: Candidate) => `${candidate.backend}/${candidate.
 /**
  * Every runnable (config, model) pair the criteria allow. A config that pins a model offers only that
  * model; an unpinned config offers every unblocked roster model of its backend. When several configs
- * offer the same backend/model, the first in `criteria.configs` order (else by name) represents it.
+ * offer the same backend/model, the first in `criteria.configs` order (else by name) represents it,
+ * and the others are kept in that order under `alternates` (keyed by `backend/model`) as fallbacks.
  */
-export function gatherCandidates(source: CandidateSource, criteria: SelectionCriteria): { candidates: Candidate[]; rejected: { candidate: string; reason: string }[] } {
+export function gatherCandidates(source: CandidateSource, criteria: SelectionCriteria): { candidates: Candidate[]; alternates: Map<string, string[]>; rejected: { candidate: string; reason: string }[] } {
   const rejected: { candidate: string; reason: string }[] = [];
   const configOrder = criteria.configs ?? [];
   const configs = [...source.configs()]
@@ -98,6 +99,7 @@ export function gatherCandidates(source: CandidateSource, criteria: SelectionCri
       return rank(a.name) - rank(b.name) || a.name.localeCompare(b.name);
     });
   const seen = new Map<string, Candidate>();
+  const alternates = new Map<string, string[]>();
   for (const config of configs) {
     if (criteria.backends !== undefined && !criteria.backends.includes(config.backend)) continue;
     if (criteria.exclude_backends?.includes(config.backend)) continue;
@@ -116,7 +118,12 @@ export function gatherCandidates(source: CandidateSource, criteria: SelectionCri
     for (const entry of models) {
       const candidate = { config: config.name, backend: config.backend, model: entry.name };
       const id = candidateId(candidate);
-      if (seen.has(id)) continue;
+      if (seen.has(id)) {
+        const others = alternates.get(id);
+        if (others === undefined) alternates.set(id, [config.name]);
+        else if (!others.includes(config.name)) others.push(config.name);
+        continue;
+      }
       if (entry.blocked === true) { rejected.push({ candidate: id, reason: "blocked by model policy" }); continue; }
       if (criteria.exclude_models?.some((pattern) => pattern === entry.name || pattern === id)) {
         rejected.push({ candidate: id, reason: "excluded by criteria" });
@@ -125,7 +132,7 @@ export function gatherCandidates(source: CandidateSource, criteria: SelectionCri
       seen.set(id, candidate);
     }
   }
-  return { candidates: [...seen.values()], rejected };
+  return { candidates: [...seen.values()], alternates, rejected };
 }
 
 /**
@@ -327,18 +334,31 @@ export async function selectModels(
   const gathered = gatherCandidates(source, criteria);
   const backends = [...new Set(gathered.candidates.map((candidate) => candidate.backend))];
   const notes: string[] = [];
-  let candidates = gathered.candidates;
   const rejected = [...gathered.rejected];
-  if (criteria.live_quota === true) {
-    const unoffered = await unofferedModels(source, backends);
-    candidates = candidates.filter((candidate) => {
-      const missing = unoffered.byConfig.get(candidate.config) ?? unoffered.byBackend;
-      if (!missing.has(candidateId(candidate))) return true;
-      rejected.push({ candidate: candidateId(candidate), reason: "not offered by the backend's live catalog" });
-      return false;
-    });
-  }
+  const unoffered = criteria.live_quota === true ? await unofferedModels(source, backends) : undefined;
   const quotas = await quotaStates(source, backends, criteria);
+  // Why a config cannot run this candidate's model now: its account's catalog lacks it, or its
+  // account (or the backend) has no quota left.
+  const blocker = (config: string, candidate: Candidate): string | undefined => {
+    const missing = unoffered === undefined ? undefined : unoffered.byConfig.get(config) ?? unoffered.byBackend;
+    if (missing?.has(candidateId(candidate))) return "not offered by the backend's live catalog";
+    const quota = quotas.get(`config:${config}`) ?? quotas.get(candidate.backend);
+    return quota?.state === "exhausted" ? quota.detail : undefined;
+  };
+  // Another config offering the same model (for example one on a second signed-in account) takes
+  // over when the representative's account is out of quota or lacks the model.
+  const candidates = gathered.candidates.flatMap((candidate) => {
+    const id = candidateId(candidate);
+    const reason = blocker(candidate.config, candidate);
+    if (reason === undefined) return [candidate];
+    const fallback = (gathered.alternates.get(id) ?? []).find((config) => blocker(config, candidate) === undefined);
+    if (fallback === undefined) {
+      rejected.push({ candidate: id, reason });
+      return [];
+    }
+    notes.push(`${id}: ${candidate.config} skipped (${reason}); using ${fallback}`);
+    return [{ ...candidate, config: fallback }];
+  });
   const { scored, rejected: scoreRejected } = scoreCandidates(candidates, criteria, {
     ...(options.profiles === undefined ? {} : { profiles: options.profiles }),
     ...(options.history === undefined ? {} : { history: options.history }),

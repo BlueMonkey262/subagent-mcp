@@ -103,6 +103,36 @@ test("live_quota judges a config on another signed-in account by that account, n
   assert.match(offered.rejected.find((entry) => entry.candidate === "codex/big")!.reason, /not offered/);
 });
 
+test("a config whose account is exhausted or lacks the model falls back to the next config offering it", async () => {
+  const configs = () => [
+    { name: "codex-general", backend: "codex" as const },
+    { name: "codex-alt", backend: "codex" as const },
+  ];
+  const live = (main: number, alt: Readonly<Record<string, unknown>>) => source({
+    configs,
+    live: async (backend: Backend) => backend === "codex"
+      ? { usage_limits: { plan: { weekly: { remaining_percent: main } } }, roster_not_offered: [], accounts: [{ account: "/alt", agents: ["codex-alt"], ...alt }] }
+      : undefined,
+  });
+  const criteria = { live_quota: true, backends: ["codex" as Backend], configs: ["codex-alt", "codex-general"] };
+
+  const altSpent = await selectModels(live(60, { usage_limits: { plan: { weekly: { remaining_percent: 1 } } } }), criteria, 2, { profiles });
+  assert.deepEqual(altSpent.picks.map((pick) => pick.config), ["codex-general", "codex-general"]);
+  assert.match(altSpent.notes.join("\n"), /codex\/big: codex-alt skipped \(live plan usage has 1% left \(< 5%\)\); using codex-general/);
+
+  const mainSpent = await selectModels(live(1, { usage_limits: { plan: { weekly: { remaining_percent: 80 } } } }),
+    { ...criteria, configs: ["codex-general", "codex-alt"] }, 2, { profiles });
+  assert.deepEqual(mainSpent.picks.map((pick) => pick.config), ["codex-alt", "codex-alt"]);
+
+  const bothSpent = await selectModels(live(1, { usage_limits: { plan: { weekly: { remaining_percent: 2 } } } }), criteria, 2, { profiles });
+  assert.deepEqual(bothSpent.picks, []);
+  assert.match(bothSpent.rejected.find((entry) => entry.candidate === "codex/big")!.reason, /2% left/, "reports the preferred config's reason");
+
+  const altLacksBig = await selectModels(live(60, { usage_limits: { plan: { weekly: { remaining_percent: 80 } } }, roster_not_offered: ["big"] }), criteria, 2, { profiles });
+  const byModel = Object.fromEntries(altLacksBig.picks.map((pick) => [pick.model, pick.config]));
+  assert.deepEqual(byModel, { big: "codex-general", small: "codex-alt" });
+});
+
 test("diversity: distinct models by default, distinct backends on request", async () => {
   const byModel = await selectModels(source(), { category: "review", objective: "quality" }, 2, { profiles });
   assert.notEqual(byModel.picks[0]!.model, byModel.picks[1]!.model);

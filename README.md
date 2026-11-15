@@ -260,7 +260,9 @@ Each candidate gets an explainable score from:
 - **Quota**: a backend whose `allowances` in `models.yaml` are used up is excluded. With
   `live_quota`, so is a backend whose live plan usage (`list_models` live) is below the threshold,
   and a model its live catalog does not offer. A config on another signed-in account
-  (`live.accounts`) is judged by that account's usage and catalog instead. With neither, quota is reported as unknown, not as
+  (`live.accounts`) is judged by that account's usage and catalog instead. When the config picked
+  for a model is out of quota or its account lacks the model, the next config offering the same
+  model (in `configs` order, else by name) takes over, and the selection notes say so. With neither, quota is reported as unknown, not as
   unlimited.
 - **Load**: a small penalty per agent already active on the backend.
 
