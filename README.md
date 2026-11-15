@@ -259,7 +259,8 @@ Each candidate gets an explainable score from:
   ranks below a declared `medium` tier; it is never treated as free.
 - **Quota**: a backend whose `allowances` in `models.yaml` are used up is excluded. With
   `live_quota`, so is a backend whose live plan usage (`list_models` live) is below the threshold,
-  and a model its live catalog does not offer. With neither, quota is reported as unknown, not as
+  and a model its live catalog does not offer. A config on another signed-in account
+  (`live.accounts`) is judged by that account's usage and catalog instead. With neither, quota is reported as unknown, not as
   unlimited.
 - **Load**: a small penalty per agent already active on the backend.
 
@@ -324,7 +325,8 @@ against the repository, tests, and the operator's actual request.
   added to the app-server's environment on spawn and cold resume, so `env: { CODEX_HOME:
   /Users/you/.codex-alt }` runs that agent under a second Codex home and its signed-in account
   (sign it in once with `CODEX_HOME=~/.codex-alt codex login`; use an absolute path in `env`, since
-  `~` is not expanded). Live usage in `list_models` still reads the default home. **Important,
+  `~` is not expanded). `list_models` live reports that account's usage under `live.accounts`, and
+  ensemble `live_quota` judges the config by it. **Important,
   discovered by testing against the
   real binary rather than assumed from docs:** on this development host, Codex's
   `workspaceWrite` sandbox does not actually confine writes to the declared `writableRoots`,
@@ -505,7 +507,10 @@ against the repository, tests, and the operator's actual request.
   OpenCode Go rolling/weekly/monthly usage, and workspace budgets. The `codex` section, from a
   short-lived `codex app-server`, covers the model catalog (reasoning efforts, default, hidden
   models), the ChatGPT plan's rate-limit windows (5-hour and weekly) and credits, and recent daily
-  token totals. Each usage window reports `percent_used`, `remaining_percent` and `resets_at`.
+  token totals. When an agent config's `env` sets a `CODEX_HOME` other than the default, that
+  second account's plan limits and token totals appear under `live.accounts`, one entry per
+  account with the configs on it (`agents`). Each usage window reports `percent_used`,
+  `remaining_percent` and `resets_at`.
   `roster_not_offered` lists roster entries the backend doesn't offer, except entries routed to a
   custom `provider`. These numbers come from the vendor's own account records and don't include
   quotas on external API keys. If one section fails (for example, Codex plan limits under API-key

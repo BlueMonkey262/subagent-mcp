@@ -182,6 +182,24 @@ test("spawn() and a cold resume() launch Codex with the agent definition's env",
   }
 });
 
+test("accountOf names a non-default CODEX_HOME, and providerInfo queries that home", async () => {
+  const adapter = new CodexAdapter({ env: { CODEX_HOME: "/homes/main" } });
+  assert.equal(adapter.accountOf({}), undefined);
+  assert.equal(adapter.accountOf({ CODEX_HOME: "/homes/main/" }), undefined, "the default home is the default account");
+  assert.equal(adapter.accountOf({ CODEX_HOME: "/homes/alt" }), "/homes/alt");
+
+  let launched: NodeJS.ProcessEnv | undefined;
+  const probe = new CodexAdapter({
+    env: { CODEX_HOME: "/homes/main" },
+    spawnProcess: (_command, _args, options) => { launched = options.env; return fakeCodexServer().child; },
+    initTimeoutMs: 2_000,
+    liveSectionTimeoutMs: 200,
+    probeReapGraceMs: 10,
+  });
+  await probe.providerInfo(undefined, { CODEX_HOME: "/homes/alt" });
+  assert.equal(launched?.CODEX_HOME, "/homes/alt");
+});
+
 test("spawn() sends reasoningEffort on turn/start when provided", async () => {
   const server = fakeCodexServer();
   const adapter = new CodexAdapter({ spawnProcess: () => server.child, initTimeoutMs: 2_000 });

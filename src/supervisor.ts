@@ -518,6 +518,8 @@ export class Supervisor {
    * Roster, local usage, allowances and concurrency. With `live` (default: on when one `backend` is
    * named), also asks each backend that has a live API (`providerInfo`: OpenCode, Codex) for the
    * models it can run and its own plan usage, and flags roster entries the backend does not offer.
+   * Agent configs whose `env:` selects another signed-in account (Codex: `CODEX_HOME`) get that
+   * account's plan usage under `live.accounts`, one entry per account naming the configs on it.
    */
   async listModels(backend?: Backend, live: boolean = backend !== undefined): Promise<Readonly<Record<string, unknown>>> {
     const local = { ...this.#localModels(backend), ...await this.#updateNotice() };
@@ -528,7 +530,7 @@ export class Supervisor {
     const adapters = this.#adapters.list().filter((adapter) => adapter.providerInfo !== undefined
       && !disabled.includes(adapter.backend) && (backend === undefined || adapter.backend === backend));
     const entries = await Promise.all(adapters.map(async (adapter) =>
-      [adapter.backend, await this.#liveInfo(adapter)] as const));
+      [adapter.backend, await this.#liveWithAccounts(adapter)] as const));
     if (entries.length === 0) return local;
     const byBackend = Object.fromEntries(entries);
     return { ...local, live: backend === undefined ? byBackend : byBackend[backend] };
@@ -550,7 +552,33 @@ export class Supervisor {
     }
   }
 
-  async #liveInfo(adapter: BackendAdapter): Promise<Readonly<Record<string, unknown>>> {
+  /** The default account's live info, plus `accounts` for agent configs that select another one. */
+  async #liveWithAccounts(adapter: BackendAdapter): Promise<Readonly<Record<string, unknown>>> {
+    const accounts = new Map<string, { agents: string[]; env: Readonly<Record<string, string>> }>();
+    if (adapter.accountOf !== undefined) {
+      for (const config of this.#registry.listAgents()) {
+        if (config.backend !== adapter.backend) continue;
+        const account = adapter.accountOf(config.env);
+        if (account === undefined) continue;
+        const entry = accounts.get(account);
+        if (entry === undefined) accounts.set(account, { agents: [config.name], env: config.env });
+        else entry.agents.push(config.name);
+      }
+    }
+    const [base, ...others] = await Promise.all([
+      this.#liveInfo(adapter),
+      ...[...accounts.values()].map((entry) => this.#liveInfo(adapter, entry.env)),
+    ]);
+    if (accounts.size === 0) return base!;
+    // The catalog is the backend's; each account adds its own plan usage and what its plan lacks.
+    const perAccount = [...accounts.entries()].map(([account, entry], index) => {
+      const { models: _models, ...info } = others[index]!;
+      return { account, agents: entry.agents, ...info };
+    });
+    return { ...base, accounts: perAccount };
+  }
+
+  async #liveInfo(adapter: BackendAdapter, env?: Readonly<Record<string, string>>): Promise<Readonly<Record<string, unknown>>> {
     const controller = new AbortController();
     let timer: NodeJS.Timeout | undefined;
     // Race as well as abort: an adapter stuck on a child that never started may not observe the signal.
@@ -563,7 +591,7 @@ export class Supervisor {
       timer.unref();
     });
     try {
-      const info = await Promise.race([adapter.providerInfo!(controller.signal), timedOut]);
+      const info = await Promise.race([adapter.providerInfo!(controller.signal, env), timedOut]);
       if (info.models === undefined) return info;
       const policy = this.#registry.modelPolicy();
       const models = info.models.map((model) => {

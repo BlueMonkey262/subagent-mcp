@@ -1,4 +1,6 @@
 import { spawn as nodeSpawn, type ChildProcessWithoutNullStreams, type SpawnOptionsWithoutStdio } from "node:child_process";
+import { homedir } from "node:os";
+import { join, resolve } from "node:path";
 
 import { signalProcessGroup } from "../../process-group.js";
 
@@ -267,9 +269,9 @@ export class CodexAdapter implements BackendAdapter {
    * mode (`account/read`). Each section fails on its own: with API-key auth there are no plan limits,
    * and that shows up under `errors` while the model list still comes back.
    */
-  async providerInfo(signal?: AbortSignal): Promise<ProviderInfo> {
+  async providerInfo(signal?: AbortSignal, env?: Readonly<Record<string, string>>): Promise<ProviderInfo> {
     signal?.throwIfAborted();
-    const session = this.#launch({ cwd: process.cwd(), model: "" });
+    const session = this.#launch({ cwd: process.cwd(), model: "", ...(env === undefined ? {} : { env }) });
     const abort = (): void => this.#terminate(session);
     signal?.addEventListener("abort", abort, { once: true });
     try {
@@ -307,6 +309,15 @@ export class CodexAdapter implements BackendAdapter {
       signal?.removeEventListener("abort", abort);
       await this.#reap(session);
     }
+  }
+
+  /** Codex keeps its ChatGPT login in `CODEX_HOME`, so a different home is a different account. */
+  accountOf(env: Readonly<Record<string, string>>): string | undefined {
+    const home = env["CODEX_HOME"];
+    if (home === undefined || home.trim() === "") return undefined;
+    const defaultHome = this.#options.env?.["CODEX_HOME"] ?? process.env["CODEX_HOME"] ?? join(homedir(), ".codex");
+    const account = resolve(home);
+    return account === resolve(defaultHome) ? undefined : account;
   }
 
   /**

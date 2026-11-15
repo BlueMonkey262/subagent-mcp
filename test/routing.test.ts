@@ -78,6 +78,31 @@ test("quota: exhausted allowances and low live plan usage exclude a backend; mis
   assert.match(none.notes.join(" "), /no quota information/);
 });
 
+test("live_quota judges a config on another signed-in account by that account, not the default one", async () => {
+  const configs = () => [
+    { name: "codex-general", backend: "codex" as const },
+    { name: "codex-alt", backend: "codex" as const },
+  ];
+  const live = (alt: Readonly<Record<string, unknown>>) => source({
+    configs,
+    live: async (backend: Backend) => backend === "codex"
+      ? { usage_limits: { plan: { weekly: { remaining_percent: 60 } } }, roster_not_offered: [], accounts: [{ account: "/alt", agents: ["codex-alt"], ...alt }] }
+      : undefined,
+  });
+
+  const lowAlt = live({ usage_limits: { plan: { weekly: { remaining_percent: 1 } } }, roster_not_offered: [] });
+  const onAlt = await selectModels(lowAlt, { live_quota: true, configs: ["codex-alt"] }, 2, { profiles });
+  assert.deepEqual(onAlt.picks, [], "the second account is exhausted");
+  assert.match(onAlt.rejected.find((entry) => entry.candidate === "codex/big")!.reason, /1% left/);
+  const onDefault = await selectModels(lowAlt, { live_quota: true, configs: ["codex-general"] }, 2, { profiles });
+  assert.equal(onDefault.picks.length, 2, "the second account's usage does not count against the default one");
+
+  const smallerPlan = live({ usage_limits: { plan: { weekly: { remaining_percent: 90 } } }, roster_not_offered: ["big"] });
+  const offered = await selectModels(smallerPlan, { live_quota: true, configs: ["codex-alt"] }, 2, { profiles });
+  assert.deepEqual(offered.picks.map((pick) => pick.model), ["small"]);
+  assert.match(offered.rejected.find((entry) => entry.candidate === "codex/big")!.reason, /not offered/);
+});
+
 test("diversity: distinct models by default, distinct backends on request", async () => {
   const byModel = await selectModels(source(), { category: "review", objective: "quality" }, 2, { profiles });
   assert.notEqual(byModel.picks[0]!.model, byModel.picks[1]!.model);

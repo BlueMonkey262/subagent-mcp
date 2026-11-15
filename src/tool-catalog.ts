@@ -266,7 +266,8 @@ export const TOOL_CATALOG: readonly ToolDefinition[] = [
       "With `live` (on by default when one `backend` is named), adds a `live` section from the backend's own API. " +
       "OpenCode >= 2: every model the server can run (context, max output, USD cost per million tokens), its default " +
       "model, OpenCode Go rolling/weekly/monthly usage and workspace budgets. Codex: the model catalog (reasoning " +
-      "efforts, default), the ChatGPT plan's rate-limit windows and credits, and recent account token totals. Usage " +
+      "efforts, default), the ChatGPT plan's rate-limit windows and credits, and recent account token totals; agent " +
+      "configs whose env sets another CODEX_HOME get that account's limits and totals under `accounts`. Usage " +
       "windows report `percent_used`, `remaining_percent` and `resets_at`. `roster_not_offered` lists roster entries " +
       "the backend does not offer; `errors` names any section that failed. Live usage is what the vendor's own " +
       "account tracks, not quotas of external API keys. It may start `opencode serve` or a short-lived `codex app-server`.",

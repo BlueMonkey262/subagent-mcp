@@ -107,9 +107,16 @@ export interface BackendAdapter {
   liveness?(agentId: string): AdapterLiveness;
   /**
    * Optional live view of what the backend itself reports: models it can run and plan/quota usage.
-   * Only backends with a queryable API implement it (OpenCode today); `list_models` surfaces it.
+   * Only backends with a queryable API implement it (OpenCode, Codex); `list_models` surfaces it.
+   * `env` is an agent config's `env:`; a backend that implements `accountOf` reports the account
+   * that env selects instead of its default one.
    */
-  providerInfo?(signal?: AbortSignal): Promise<ProviderInfo>;
+  providerInfo?(signal?: AbortSignal, env?: Readonly<Record<string, string>>): Promise<ProviderInfo>;
+  /**
+   * The signed-in account an agent config's `env:` selects, as a stable key, or undefined when it
+   * selects the backend's default account. Codex: a `CODEX_HOME` other than the default home.
+   */
+  accountOf?(env: Readonly<Record<string, string>>): string | undefined;
 }
 
 /** A model the backend reports as runnable, as `provider/model` (OpenCode) or the backend's own id. */
