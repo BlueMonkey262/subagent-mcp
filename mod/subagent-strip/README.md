@@ -40,4 +40,4 @@ has focus:
 | `l` | show or hide older finished agents (the list keeps running agents and the 5 most recent) |
 | `u` | when an update is available, close the pane and ask Claude to follow `UPDATING.md` (asks first) |
 
-Tests: `claude plugin test mod/subagent-strip` (mocked server). Design: `docs/specs/control-panel.md`.
+Tests: `claude plugin test mod/subagent-strip` (mocked server).

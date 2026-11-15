@@ -313,3 +313,38 @@ Work.
   await writeFile(models, `blockModels: grok\n${roster}`);
   await assert.rejects(load(), /blockModels must be an array/);
 });
+
+test("agent configs fall back to *.md.example only when no *.md config exists", async () => {
+  const { agents, models } = await fixture();
+  const agent = (name: string, description: string) => `---
+name: ${name}
+backend: claude
+description: ${description}
+maxTurns: 10
+timeout: 60
+---
+Prompt.
+`;
+  await writeFile(join(agents, "bundled.md.example"), agent("bundled", "From the example"));
+  const fromExample = await loadConfigRegistry({ agentsDirectory: agents, modelsFile: models });
+  assert.equal(fromExample.getAgent("bundled").description, "From the example");
+
+  await writeFile(join(agents, "mine.md"), agent("mine", "My own config"));
+  const fromOwn = await loadConfigRegistry({ agentsDirectory: agents, modelsFile: models });
+  assert.equal(fromOwn.getAgent("mine").description, "My own config");
+  assert.throws(() => fromOwn.getAgent("bundled"), ConfigurationError);
+});
+
+test("an example config's name must match its filename without .md.example", async () => {
+  const { agents, models } = await fixture();
+  await writeFile(join(agents, "bundled.md.example"), `---
+name: other
+backend: claude
+description: Mismatch
+maxTurns: 10
+timeout: 60
+---
+Prompt.
+`);
+  await assert.rejects(loadConfigRegistry({ agentsDirectory: agents, modelsFile: models }), /must match filename "bundled.md"/);
+});

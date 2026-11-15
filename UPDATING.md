@@ -44,12 +44,12 @@ person's own files only with their yes, show diffs, and keep their comments and 
 
 Releases that change `models.yaml` or agent-config semantics must add a dated note here:
 
-- *2026-11-14, `models.yaml` is no longer tracked.* The bundled roster moved to
-  `.subagents/models.yaml.example` and `.subagents/models.yaml` is gitignored. If `<repo>/.subagents/models.yaml`
-  has local edits, the swap in step 4 refuses to fast-forward, because the release deletes that file. Move it
-  aside first and put it back after: `mv <repo>/.subagents/models.yaml <repo>/.subagents/models.yaml.mine`, merge,
-  then `mv` it back. From then on it is an ignored file that no update touches. An unedited copy is removed by
-  the merge, and the launcher falls back to the example.
+- *2026-11-14, `.subagents/` is no longer tracked.* The repo now ships only templates
+  (`.subagents/<name>.md.example`, `.subagents/models.yaml.example`), and the rest of `.subagents/` is
+  gitignored. If `<repo>/.subagents/models.yaml` or a `<repo>/.subagents/<name>.md` has local edits, the swap
+  in step 4 refuses to fast-forward, because the release deletes those files. Move each edited file aside
+  first (`mv <file> <file>.mine`), merge, then `mv` it back. From then on they are ignored files that no
+  update touches. Unedited copies are removed by the merge, and the templates take over as the fallback.
 
 ## 4. Swap (the one step that touches the live install)
 

@@ -1,4 +1,4 @@
-// The /subagent-mcp control panel (docs/specs/control-panel.md). Reads the subagent-mcp server over
+// The /subagent-mcp control panel (see mod/subagent-strip/README.md). Reads the subagent-mcp server over
 // MCP, acts only on keys the person presses, and hands `i` / `u` to Claude as prompts.
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, On } from 'claude-code'
@@ -32,8 +32,11 @@ const panel = atom(
 const INIT_PROMPT =
   'Run the subagent-mcp setup interview for this project. Call list_models (live) and list_agent_configs, ' +
   'then use question menus to ask which backends to enable, which models go in the roster, which bundled ' +
-  '.subagents/*.md agent configs to copy in, and whether to set disabledBackends / blockModels / ' +
-  'blockClaudeModels. If .subagents/models.yaml exists, propose edits as a diff, save models.yaml.bak, ' +
+  'agent configs to copy in, and whether to set disabledBackends / blockModels / blockClaudeModels. ' +
+  'The subagent-mcp install (the checkout `subagent-mcp` on PATH links into) ships only templates: ' +
+  '.subagents/*.md.example and .subagents/models.yaml.example. ' +
+  'Build this project\'s own .subagents/<name>.md and .subagents/models.yaml from them (drop the .example ' +
+  'suffix). If .subagents/models.yaml exists, propose edits as a diff, save models.yaml.bak, ' +
   'and write only after I say yes; keep my hand-written entries and comments. Do not build, change ' +
   '~/.claude, or touch MCP registration.'
 

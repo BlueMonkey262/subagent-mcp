@@ -1,5 +1,5 @@
 import { readdir, readFile } from "node:fs/promises";
-import { basename, extname, resolve } from "node:path";
+import { basename, resolve } from "node:path";
 import { parse } from "yaml";
 
 import { withEndpointModels } from "./endpoints.js";
@@ -173,6 +173,9 @@ export async function loadConfigRegistry(options: RegistryLoadOptions): Promise<
   return new ConfigRegistry(agents, await withEndpointModels(models.roster), models.limits);
 }
 
+const AGENT_CONFIG_SUFFIX = ".md";
+const AGENT_EXAMPLE_SUFFIX = ".md.example";
+
 export async function loadAgentConfigs(directory: string): Promise<readonly AgentConfig[]> {
   let entries;
   try {
@@ -182,11 +185,14 @@ export async function loadAgentConfigs(directory: string): Promise<readonly Agen
       cause: error instanceof Error ? error.message : String(error),
     });
   }
-  const files = entries
-    .filter((entry) => entry.isFile() && extname(entry.name) === ".md")
+  // Real `<name>.md` configs win. A directory with none (this repo's bundled `.subagents/`) falls back to
+  // the tracked `<name>.md.example` files that seed a person's own config.
+  const pick = (suffix: string) => entries
+    .filter((entry) => entry.isFile() && entry.name.endsWith(suffix))
     .map((entry) => resolve(directory, entry.name))
     .sort();
-  return Promise.all(files.map(loadAgentConfig));
+  const configs = pick(AGENT_CONFIG_SUFFIX);
+  return Promise.all((configs.length > 0 ? configs : pick(AGENT_EXAMPLE_SUFFIX)).map(loadAgentConfig));
 }
 
 export async function loadAgentConfig(path: string): Promise<AgentConfig> {
@@ -194,7 +200,10 @@ export async function loadAgentConfig(path: string): Promise<AgentConfig> {
   const { frontmatter, body } = splitFrontmatter(text, path);
   const value = parseYamlObject(frontmatter, path);
   const name = requiredString(value, "name", path);
-  const expectedName = basename(path, ".md");
+  const fileName = basename(path);
+  const expectedName = fileName.endsWith(AGENT_EXAMPLE_SUFFIX)
+    ? fileName.slice(0, -AGENT_EXAMPLE_SUFFIX.length)
+    : basename(path, AGENT_CONFIG_SUFFIX);
   if (name !== expectedName) {
     throw new ConfigurationError(`Agent name "${name}" must match filename "${expectedName}.md"`, {
       path,

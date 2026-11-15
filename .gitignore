@@ -1,8 +1,11 @@
 node_modules/
 dist/
+# .subagents/ is each person's own config; only the *.example files that seed it are tracked.
+.subagents/*
+!.subagents/*.example
+# Redundant with the rule above, but the host appends this exact line to .gitignore when it is missing.
 .subagents/memory/
 .codex/config.toml
-.claude/agents/orchestrator.md
+.claude/agents/
+.claude/worktrees/
 .codex/agents/orchestrator.toml
-.subagents/models.yaml
-.subagents/models.yaml.bak
