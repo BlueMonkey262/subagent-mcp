@@ -105,7 +105,8 @@ Scope: roster, agent configs and policy. Project-level only: it writes `<project
 2. Question menus, one decision each:
    - Which backends to enable. Backends found not installed or not logged in are shown as such.
    - For each enabled backend, which models go in the roster, with the live list as the choices.
-   - Which bundled agent configs (`.subagents/*.md`) to copy into the project.
+   - Which bundled agent templates (`.subagents/*.md.example`) to copy into the project as
+     `.subagents/<name>.md`.
    - Policy: `disabledBackends`, `blockModels`, `blockClaudeModels`. Only offered when the running
      server supports them (PR #7 merged); otherwise skipped silently.
 3. Existing `.subagents/models.yaml`: Claude proposes edits against the current file, shows the

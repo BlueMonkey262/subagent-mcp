@@ -435,7 +435,7 @@ test("models.yaml may omit vibe, and a vibe roster and agent config load", async
 
   const agents = path.join(dir, "agents");
   await mkdir(agents);
-  await writeFile(path.join(agents, "vibe-general.md"), await readFile(path.join(process.cwd(), ".subagents", "vibe-general.md"), "utf8"));
+  await writeFile(path.join(agents, "vibe-general.md"), await readFile(path.join(process.cwd(), ".subagents", "vibe-general.md.example"), "utf8"));
   const config = await loadAgentConfig(path.join(agents, "vibe-general.md"));
   assert.equal(config.backend, "vibe");
   assert.deepEqual(config.permission.allow, []);

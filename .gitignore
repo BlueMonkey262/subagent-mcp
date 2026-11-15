@@ -1,6 +1,16 @@
-node_modules/
+node_modules
 dist/
+# .subagents/ is each person's own config; only the *.example files that seed it are tracked.
+.subagents/*
+!.subagents/*.example
+# Redundant with the rule above, but the host appends this exact line to .gitignore when it is missing.
 .subagents/memory/
 .codex/config.toml
-.claude/agents/orchestrator.md
+# .agents/ (Antigravity custom agents) works the same way: only the templates are tracked.
+.agents/*
+!.agents/agents/
+.agents/agents/*
+!.agents/agents/*.example
+.claude/agents/
+.claude/worktrees/
 .codex/agents/orchestrator.toml

@@ -1,0 +1,127 @@
+# Example model roster for subagent-mcp.
+#
+# This is an example, not a live roster and not a fallback. The server never loads this file as a
+# roster. Copy it to `.subagents/models.yaml` in your project (or in this repo to use it as the
+# install's own roster), then keep only the models you actually have access to.
+#
+# If no models.yaml exists, the server starts with an empty roster. list_models and spawn_agent
+# then report which paths were checked and how to create the file.
+#
+# The ids below are concrete examples of the value each CLI accepts; they show the format for each
+# backend, not which model to use.
+#   claude       `claude --model <id>`
+#   codex        `codex` model ids (`provider:` picks a [model_providers.*] entry in ~/.codex/config.toml)
+#   opencode     "provider/model", from `opencode models`
+#   antigravity  `agy models`
+#   cursor       `agent --list-models`
+#   copilot      `copilot --model` (which ids run depends on your Copilot plan)
+#   vibe         `vibe` then /model (aliases; Vibe keeps its own login and model config)
+# The file hot-reloads. An invalid edit pauses new spawns until it is fixed.
+
+# ---- Server limits (all optional) -------------------------------------------------------------
+# maxConcurrent: 12               # agents running at once, across all backends (default 12)
+# codexResumeIdleSeconds: 1800    # resuming a Codex thread idle longer than this needs
+#                                 # allow_expensive_resume (default 1800)
+# staleAgentSeconds: 300          # an agent with no heartbeat or live backend probe this long is
+#                                 # reported stale (default 300)
+# sendMessageWaitSeconds: 30      # default bounded wait before send_message returns "running" (default 30)
+# scheduledGraceSeconds: 60       # how late a delayed agent may start before it is blocked as
+#                                 # MISSED_START (default 60)
+#
+# Per-backend allowances. list_models reports what is left of each one.
+# allowances:
+#   cursor:
+#     maxSpawns: 20
+#     maxCostUsd: 5
+#   codex:
+#     maxInputTokens: 2000000
+#     maxOutputTokens: 200000
+#
+# Caps per backend or per model, in addition to maxConcurrent (README: "Concurrency").
+# perBackendConcurrency:
+#   codex: 4
+# perModelConcurrency:
+#   "codex:gpt-5.6-sol": 2
+#   "model:*grok*": 1
+#
+# Per-provider guard for OpenCode `provider/model` ids (README: "Provider limits"): at most
+# maxConcurrent agents on that provider at once, and after a turn fails on a recognized rate limit,
+# new turns for it wait cooldownSeconds (±20% jitter). OpenCode retries single requests itself.
+# providerLimits:
+#   mistral:
+#     maxConcurrent: 2
+#     cooldownSeconds: 60
+
+# ---- Policy: refuse agents before they start (README: "Blocking backends and models") --------
+# Each setting also has an environment variable for every project: SUBAGENT_MCP_DISABLED_BACKENDS,
+# SUBAGENT_MCP_BLOCK_MODELS, SUBAGENT_MCP_BLOCK_CLAUDE_MODELS.
+# disabledBackends: [antigravity]                  # the panel's 1-7 keys edit this line
+# blockModels: ["*grok*", "codex:gpt-5.6-sol"]     # globs, optionally "backend:" prefixed
+# blockClaudeModels: true                          # Claude subagents use Claude Code's own Agent tool
+
+models:
+  claude:
+    - name: claude-sonnet-5-5
+      description: Claude model id passed through `claude --model`
+    - name: claude-opus-5-5
+      description: Claude model id passed through `claude --model`
+    - name: claude-haiku-5-5
+      description: Claude model id passed through `claude --model`
+
+  codex:
+    - name: gpt-5.6-sol
+      description: Codex model id passed to the Codex app-server
+    - name: gpt-5.6-luna
+      description: Codex model id passed to the Codex app-server
+    # A model served by a custom provider from ~/.codex/config.toml:
+    # - name: my-model
+    #   provider: my-provider
+    #   description: Served through [model_providers.my-provider]
+    #
+    # Mistral API (pay-as-you-go) runs through OpenCode, not Codex; see the opencode section.
+    # Endpoint models (NVIDIA NIM, any OpenAI-compatible URL) are added automatically by
+    # `subagent-mcp endpoint add ...` as "<endpoint>/<alias>" in the claude, codex and opencode rosters.
+    # Policy checks both that alias and the endpoint's upstream model id.
+
+  opencode:
+    - name: opencode/deepseek-v4.1-flash-free
+      description: OpenCode Zen free-tier model id in `provider/model` form
+    - name: opencode-go/deepseek-v4.1-flash
+      description: OpenCode Go model id in `provider/model` form
+    - name: ollama-cloud/gpt-oss:20b
+      description: Ollama Cloud model id in `provider/model` form
+    # A model you serve yourself. Define the provider in opencode.json, then list it here:
+    # - name: local/qwen3-coder:30b
+    #   description: Local model through an Ollama provider named "local"
+    #
+    # Mistral API models (pay-as-you-go) after connecting Mistral in OpenCode; `opencode models`
+    # lists the `mistral/...` ids your key can run. Limit them with `providerLimits.mistral`. E.g.:
+    # - name: mistral/mistral-medium-latest
+    # - name: mistral/codestral-latest
+
+  antigravity:
+    - name: gemini-3.8-flash-low
+      description: Gemini 3.8 Flash low tier, as listed by `agy models`
+    - name: gemini-3.8-flash-medium
+      description: Gemini 3.8 Flash medium tier, as listed by `agy models`
+    - name: gemini-3.8-flash-high
+      description: Gemini 3.8 Flash high tier, as listed by `agy models`
+
+  cursor:
+    # Effort is part of the id in Cursor (for example grok-4.7-high).
+    - name: auto
+      description: Cursor Agent CLI model id from `agent --list-models`
+
+  copilot:
+    # GitHub Copilot CLI model ids as `copilot --model` accepts them. Which ones run depends on your
+    # Copilot plan and model settings; `auto` routes to a model your plan allows.
+    - name: auto
+      description: Copilot model id passed through `copilot --model` (`auto` lets Copilot choose)
+
+  vibe:
+    # Mistral Vibe model aliases. Vibe keeps its own login (`vibe --setup`) and model table; these
+    # aliases are the values Vibe accepts, and thinking is set per alias rather than by effort.
+    - name: mistral-medium-3.5
+      description: Mistral Medium 3.5 alias through Vibe (plan or API key)
+    - name: zai-glm-5-3-flash
+      description: GLM-5.3 Flash hosted by Mistral, as a Vibe model alias

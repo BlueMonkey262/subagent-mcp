@@ -14,6 +14,8 @@ export interface SpawnRequest {
   readonly modelProvider?: string;
   /** Antigravity custom-agent name. Only Antigravity honors this. */
   readonly antigravityAgent?: string;
+  /** Antigravity explicit definition file (`antigravityAgentFile`); seeded from its template if missing. */
+  readonly antigravityAgentFile?: string;
   readonly cwd: string;
   /** Resolved agent execution config; empty values are explicit, never backend defaults. */
   readonly systemPrompt: string;
@@ -43,6 +45,8 @@ export interface ResumeRequest {
   readonly modelProvider?: string;
   /** Antigravity custom-agent name. Only Antigravity honors this. */
   readonly antigravityAgent?: string;
+  /** Antigravity explicit definition file (`antigravityAgentFile`); seeded from its template if missing. */
+  readonly antigravityAgentFile?: string;
   /** Re-resolved from the named config so a restarted adapter preserves execution policy. */
   readonly systemPrompt: string;
   readonly env: Readonly<Record<string, string>>;

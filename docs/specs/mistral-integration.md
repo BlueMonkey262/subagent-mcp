@@ -357,7 +357,7 @@ Update:
 - `src/config/registry.ts`: resolve Vibe model aliases and transport settings.
 - `src/execution.ts`: expose CLI capabilities.
 - `.subagents/models.yaml`: include an empty or explicitly configured Vibe roster.
-- `.subagents/vibe-general.md`: add a sample agent configuration.
+- `.subagents/vibe-general.md.example`: add a sample agent configuration.
 - `README.md`: document setup and execution.
 - `docs/protocol/vibe.md`: document the verified protocol.
 

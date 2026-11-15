@@ -7,10 +7,10 @@ import { ORCHESTRATOR_AUTHORITY_NOTICE } from "../src/prompt-policy.js";
 
 const root = process.cwd();
 const promptFiles = [
-  ".subagents/general.md",
-  ".subagents/codex-general.md",
-  ".subagents/opencode-general.md",
-  ".subagents/cursor-general.md",
+  ".subagents/general.md.example",
+  ".subagents/codex-general.md.example",
+  ".subagents/opencode-general.md.example",
+  ".subagents/cursor-general.md.example",
 ] as const;
 
 const advisoryExamples = [

@@ -92,8 +92,15 @@ Two separate routes, booked separately in usage:
 ### Configuration
 
 Agents live in `.subagents/<name>.md` (frontmatter + system prompt) and the model roster in
-`.subagents/models.yaml`, in the project you run Claude Code from. If a project has none, the server
-uses the examples bundled in this repo's `.subagents/`.
+`.subagents/models.yaml`, in the project you run Claude Code from. If a project has no `.subagents/`,
+the server uses this repo's bundled agent templates. `.subagents/` belongs to each person and is
+gitignored here; the repo tracks only templates (`<name>.md.example` and `models.yaml.example`, plus the
+Antigravity agent template `.agents/agents/subagent-general.md.example`). Real `<name>.md` configs win
+over their templates. There is no roster fallback: `models.yaml.example` only shows the format for each
+backend. The roster comes from `SUBAGENT_MCP_MODELS_FILE` when set, then the project's
+`.subagents/models.yaml`, then this install's `.subagents/models.yaml`; with none the server starts with
+an empty roster and `list_models` / `spawn_agent` report the paths checked and how to create it. The
+panel's `i` init builds a project's own `.subagents/` from the templates.
 
 Useful `models.yaml` limits (all optional):
 
@@ -342,7 +349,9 @@ against the repository, tests, and the operator's actual request.
   The real system prompt and tool list live in the `agy` custom agent, not in `.subagents/`.
   Before launch the bridge resolves the definition project-first
   (`.agents/agents/<name>.md`), then the global `~/.gemini/agents/<name>.md`, or an explicit
-  `antigravityAgentFile` in the config. It validates the frontmatter name, records the SHA-256,
+  `antigravityAgentFile` in the config. A missing project definition is first copied from its
+  tracked `.example` template (the project's, then the install's); an existing file is never
+  overwritten. It validates the frontmatter name, records the SHA-256,
   source path, tools and portability in the agent result/listing, and writes an exact copy to
   `.subagents/memory/antigravity-agents/<sha256>.md`. A definition that changes between turns
   refuses resume with `ANTIGRAVITY_AGENT_CHANGED` unless `allow_agent_definition_change: true`
@@ -390,7 +399,7 @@ against the repository, tests, and the operator's actual request.
   sends SIGTERM to Vibe itself (it stops its tools and writes the export), then kills the
   process group after a grace period. See [`docs/protocol/vibe.md`](docs/protocol/vibe.md).
 
-- **Vibe over ACP** (`vibeTransport: acp` in the agent config; sample `.subagents/vibe-acp.md`):
+- **Vibe over ACP** (`vibeTransport: acp` in the agent config; sample `.subagents/vibe-acp.md.example`):
   runs `vibe-acp` (Agent Client Protocol), one warm process per agent, and bridges Vibe's
   permission requests into the normal approval flow: the agent's `allow`/`deny` rules, the
   safety heuristics and `permission.default` decide, and anything escalated waits for

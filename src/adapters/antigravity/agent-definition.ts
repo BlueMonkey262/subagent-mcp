@@ -1,10 +1,14 @@
+import { constants } from "node:fs";
+import { copyFile, mkdir, readFile, stat } from "node:fs/promises";
 import { createHash } from "node:crypto";
-import { readFile, stat } from "node:fs/promises";
 import { homedir } from "node:os";
-import { basename, isAbsolute, join, relative, resolve } from "node:path";
+import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { parse } from "yaml";
 
 import { SubagentError } from "../../core/errors.js";
+import { installRoot } from "../../install-paths.js";
+
+export const ANTIGRAVITY_AGENTS_DIRECTORY = join(".agents", "agents");
 
 export type AntigravityDefinitionSource = "explicit" | "project" | "global";
 
@@ -32,10 +36,36 @@ export interface ResolveAntigravityAgentInput {
   readonly cwd: string;
   /** Test/installation override for the global `agy` agent directory. */
   readonly globalDirectory?: string;
+  /** Install checkout that ships the bundled `.example` templates. Defaults to this package's root. */
+  readonly installDirectory?: string;
+  /**
+   * Copy a missing definition from its tracked `.example` template before reading it (default true).
+   * Set false for a pure read-only resolution, such as an audit that must not create files.
+   */
+  readonly prepare?: boolean;
 }
 
 export interface AntigravityAgentResolver {
   resolve(input: ResolveAntigravityAgentInput): Promise<AntigravityAgentDefinition>;
+}
+
+export interface EnsureAntigravityAgentOptions {
+  /** Directory `agy` will run in; project agent definitions live under it. */
+  readonly cwd: string;
+  /** Value of the config's `antigravityAgent` (the custom-agent name). */
+  readonly name: string;
+  /** Explicit `antigravityAgentFile`; the definition path `agy` will actually read. */
+  readonly file?: string;
+  /** Install checkout that ships the bundled `.example` templates. Defaults to this package's root. */
+  readonly installDirectory?: string;
+}
+
+export interface EnsuredAntigravityAgent {
+  /** The definition path `agy` reads: `<cwd>/.agents/agents/<name>.md` or the explicit `file`. */
+  readonly path: string;
+  /** The template that was copied, when a copy happened. */
+  readonly copiedFrom?: string;
+  readonly copied: boolean;
 }
 
 export class AntigravityAgentDefinitionError extends SubagentError {
@@ -45,9 +75,51 @@ export class AntigravityAgentDefinitionError extends SubagentError {
 }
 
 /**
+ * `agy --agent <name>` reads `<cwd>/.agents/agents/<name>.md` (or the config's explicit
+ * `antigravityAgentFile`) and cannot read the tracked `.example` template. When the real file is
+ * missing, copy the project's template (or the install's bundled one) into place. Never overwrite
+ * an existing file: the person's edits always win.
+ */
+export async function ensureAntigravityAgent(
+  options: EnsureAntigravityAgentOptions,
+): Promise<EnsuredAntigravityAgent> {
+  const directory = join(options.cwd, ANTIGRAVITY_AGENTS_DIRECTORY);
+  const path = options.file === undefined || options.file.trim() === ""
+    ? join(directory, `${options.name}.md`)
+    : expandHome(options.file, options.cwd);
+  if (await exists(path)) return { path, copied: false };
+
+  const install = options.installDirectory ?? installRoot();
+  // The explicit target's own template comes first, then the project's by-name template, then the
+  // install's bundled one. Deduplicate, because the default target repeats the project template.
+  const examples = [...new Set([
+    `${path}.example`,
+    join(directory, `${options.name}.md.example`),
+    join(install, ANTIGRAVITY_AGENTS_DIRECTORY, `${options.name}.md.example`),
+  ])];
+  for (const example of examples) {
+    if (!await exists(example)) continue;
+    await mkdir(dirname(path), { recursive: true });
+    try {
+      await copyFile(example, path, constants.COPYFILE_EXCL);
+      return { path, copiedFrom: example, copied: true };
+    } catch (error) {
+      // Another process may have created it between the check and the copy; that file wins.
+      if (isErrno(error, "EEXIST")) return { path, copied: false };
+      throw error;
+    }
+  }
+  return { path, copied: false };
+}
+
+/**
  * Resolve the real `agy --agent <name>` definition: explicit file, then project
  * `.agents/agents/<name>.md`, then the global `~/.gemini/agents/<name>.md`. The body is the
  * system prompt; frontmatter tools/permissions are native Antigravity policy, not bridge policy.
+ *
+ * A missing project definition is first seeded from its `.example` template (see
+ * `ensureAntigravityAgent`), so a fresh checkout plus a copied agent config can spawn without a
+ * manual copy step.
  */
 export class FileAntigravityAgentResolver implements AntigravityAgentResolver {
   async resolve(input: ResolveAntigravityAgentInput): Promise<AntigravityAgentDefinition> {
@@ -61,6 +133,28 @@ export class FileAntigravityAgentResolver implements AntigravityAgentResolver {
         path: join(input.globalDirectory ?? join(homedir(), ".gemini", "agents"), `${input.name}.md`),
         source: "global",
       });
+    }
+
+    if (input.prepare !== false) {
+      const primary = candidates[0]!;
+      // Only seed from a template when the first candidate is absent; an existing (possibly
+      // mismatched) definition must be read and reported, never replaced.
+      if (!await exists(primary.path)) {
+        try {
+          await ensureAntigravityAgent({
+            cwd: input.cwd,
+            name: input.name,
+            ...(input.file === undefined ? {} : { file: input.file }),
+            ...(input.installDirectory === undefined ? {} : { installDirectory: input.installDirectory }),
+          });
+        } catch (error) {
+          throw new AntigravityAgentDefinitionError(
+            `Unable to prepare Antigravity agent definition ${primary.path}: ${error instanceof Error ? error.message : String(error)}`,
+            "ANTIGRAVITY_AGENT_INVALID",
+            { path: primary.path },
+          );
+        }
+      }
     }
 
     for (const candidate of candidates) {
@@ -146,6 +240,16 @@ function parseDefinition(text: string, path: string, expectedName: string): Omit
     ...(tools === undefined ? {} : { tools }),
     ...(frontmatter["permission"] === undefined ? {} : { permission: frontmatter["permission"] }),
   };
+}
+
+async function exists(path: string): Promise<boolean> {
+  try {
+    await stat(path);
+    return true;
+  } catch (error) {
+    if (isErrno(error, "ENOENT")) return false;
+    throw error;
+  }
 }
 
 function expandHome(value: string, cwd: string): string {

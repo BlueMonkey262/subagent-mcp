@@ -1,4 +1,4 @@
-// The /subagent-mcp control panel (docs/specs/control-panel.md). Reads the subagent-mcp server over
+// The /subagent-mcp control panel (see mod/subagent-strip/README.md). Reads the subagent-mcp server over
 // MCP, acts only on keys the person presses, and hands `i` / `u` to Claude as prompts.
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, On } from 'claude-code'
@@ -35,8 +35,12 @@ const panel = atom(
 const INIT_PROMPT =
   'Run the subagent-mcp setup interview for this project. Call list_models (live) and list_agent_configs, ' +
   'then use question menus to ask which backends to enable, which models go in the roster, which bundled ' +
-  '.subagents/*.md agent configs to copy in, and whether to set disabledBackends / blockModels / ' +
-  'blockClaudeModels. If .subagents/models.yaml exists, propose edits as a diff, save models.yaml.bak, ' +
+  'agent configs to copy in, and whether to set disabledBackends / blockModels / blockClaudeModels. ' +
+  'The subagent-mcp install (the checkout `subagent-mcp` on PATH links into) ships only templates: ' +
+  '.subagents/*.md.example, .subagents/models.yaml.example and .agents/agents/*.md.example. ' +
+  'Build this project\'s own .subagents/<name>.md, .subagents/models.yaml and, for Antigravity, ' +
+  '.agents/agents/<name>.md from them (drop the .example suffix). ' +
+  'If .subagents/models.yaml exists, propose edits as a diff, save models.yaml.bak, ' +
   'and write only after I say yes; keep my hand-written entries and comments. Do not build, change ' +
   '~/.claude, or touch MCP registration.'
 
@@ -52,7 +56,6 @@ const ago = (iso: string) => {
   return s < 60 ? `${s}s` : s < 3600 ? `${Math.floor(s / 60)}m` : `${Math.floor(s / 3600)}h`
 }
 const RECENT = 5
-const MODELS_FILE = '.subagents/models.yaml'
 const isRunning = (a: PanelAgent) => RUNNING.includes(a.state)
 const OPEN_ENSEMBLE = ['launching', 'running', 'synthesizing']
 // A server that predates get_dashboard answers with a protocol error naming the tool.
@@ -192,10 +195,11 @@ function digest(d: Record<string, unknown>): string[] {
 let projectDir = ''
 const inProject = (path: string) => (projectDir === '' ? path : `${projectDir.replace(/\/$/, '')}/${path}`)
 
-// The models.yaml the server loaded, from list_models. A project without its own runs on the bundled one
-// (bin/run-server.sh), so the project path alone would point at a file that doesn't exist.
+// The models.yaml the server loaded, from list_models. The server resolves it in one place
+// (SUBAGENT_MCP_MODELS_FILE, then the project, then the install), so the panel never guesses:
+// it edits exactly the file the resolver picked and says so if the server does not report one.
 let serverModelsFile: string | undefined
-const modelsFile = () => serverModelsFile ?? inProject(MODELS_FILE)
+const modelsFile = () => serverModelsFile
 const sharedModelsFile = () => serverModelsFile !== undefined && projectDir !== '' && !serverModelsFile.startsWith(`${projectDir.replace(/\/$/, '')}/`)
 
 function noteModelsFile(models: Record<string, unknown>) {
@@ -231,7 +235,8 @@ async function loadPolicy($: EngineInterface) {
     // keep what the file says
   }
   try {
-    file = readDisabled(await $.fs.read(modelsFile())) ?? []
+    const path = modelsFile()
+    if (path !== undefined) file = readDisabled(await $.fs.read(path)) ?? []
   } catch {
     file = []
   }
@@ -528,7 +533,9 @@ export const registerPanel = (on: On) => {
     const toggle = async (backend: string) => {
       try {
         if (serverModelsFile === undefined) noteModelsFile(await callTool($, 'list_models').catch(() => ({})))
-        const text = await $.fs.read(modelsFile())
+        const path = modelsFile()
+        if (path === undefined) return say('The server did not report which models.yaml it loaded; reconnect subagent-mcp and try again')
+        const text = await $.fs.read(path)
         const now = readDisabled(text)
         if (now === null) return say('disabledBackends in models.yaml is not a one-line list; edit it by hand')
         // The file is the truth for what it lists: a backend it disables can always be turned back on here.
@@ -536,8 +543,8 @@ export const registerPanel = (on: On) => {
         const next = now.includes(backend) ? now.filter(b => b !== backend) : [...now, backend]
         const edit = writeDisabled(text, next)
         if (!edit.ok) return say(edit.reason)
-        await $.fs.write(`${modelsFile()}.bak`, text)
-        await $.fs.write(modelsFile(), edit.text)
+        await $.fs.write(`${path}.bak`, text)
+        await $.fs.write(path, edit.text)
         // Show the file's new list now; the server reloads models.yaml a moment after the write, so asking it
         // straight away would still report the old list (and mark the backend env-locked). Ask again shortly.
         await update($, panel, s => {
@@ -548,10 +555,10 @@ export const registerPanel = (on: On) => {
         if (!next.includes(backend) && envDisabled.includes(backend)) {
           return say(`${backend} removed from models.yaml, but the environment still disables it; change it where the server starts`)
         }
-        const where = sharedModelsFile() ? `the bundled ${modelsFile()}, shared by projects without their own; i gives this one its own` : 'models.yaml reloads live'
+        const where = sharedModelsFile() ? `the ${path} the server resolved for projects without their own; i gives this one its own` : 'models.yaml reloads live'
         await say(`${backend} ${next.includes(backend) ? 'disabled' : 'enabled'} (${where}; previous copy in models.yaml.bak)`)
       } catch (error) {
-        await say(`Could not change ${modelsFile()}: ${str((error as Error).message).slice(0, 80)} (run i to give this project its own .subagents/models.yaml)`)
+        await say(`Could not change ${modelsFile() ?? 'models.yaml'}: ${str((error as Error).message).slice(0, 80)} (run i to give this project its own .subagents/models.yaml)`)
       }
     }
 

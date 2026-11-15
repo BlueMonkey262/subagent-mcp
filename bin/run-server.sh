@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Starts the subagent-mcp MCP server (this is what `claude mcp add` points at).
 #
-# - Falls back to the bundled .subagents config when the current project has none.
+# - Falls back to the bundled .subagents agent configs when the current project has none.
+# - The server itself resolves models.yaml (project, then this install); there is no example fallback.
 # - If endpoints are configured (see nim/README.md), starts the local litellm proxy for them.
 set -euo pipefail
 
@@ -15,9 +16,6 @@ if [[ ! -f "$ROOT/dist/src/server.js" ]]; then
     exit 1
 fi
 
-if [[ -z "${SUBAGENT_MCP_MODELS_FILE:-}" && ! -f "$PWD/.subagents/models.yaml" ]]; then
-    export SUBAGENT_MCP_MODELS_FILE="$ROOT/.subagents/models.yaml"
-fi
 if [[ -z "${SUBAGENT_MCP_AGENTS_DIR:-}" && ! -d "$PWD/.subagents" ]]; then
     export SUBAGENT_MCP_AGENTS_DIR="$ROOT/.subagents"
 fi

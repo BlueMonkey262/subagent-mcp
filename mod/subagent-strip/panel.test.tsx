@@ -35,7 +35,7 @@ const server = (on: Parameters<Parameters<typeof test>[1]>[1], agents: Record<st
   const calls: { tool: string; args: Record<string, unknown> }[] = []
   on('mcp.call', (_, e) => {
     calls.push({ tool: e.tool, args: e.args })
-    const body = e.tool === 'list_agents' ? { agents } : {}
+    const body = e.tool === 'list_agents' ? { agents } : e.tool === 'list_models' ? { models_file: '/project/.subagents/models.yaml' } : {}
     return { value: { content: [{ type: 'text', text: JSON.stringify(body) }], structuredContent: body } }
   })
   on('command.register', () => ({ value: { command: 'subagent-mcp' } }))
@@ -230,7 +230,7 @@ test('a backend turned off can be turned back on while the server still reports 
   const writes: string[] = []
   on('mcp.call', (_, e) => {
     // The server has not reloaded models.yaml yet: it still reports cursor as disabled.
-    const body = e.tool === 'list_models' ? { model_policy: { disabled_backends: ['cursor'] } } : e.tool === 'list_agents' ? { agents: [] } : {}
+    const body = e.tool === 'list_models' ? { models_file: '/project/.subagents/models.yaml', model_policy: { disabled_backends: ['cursor'] } } : e.tool === 'list_agents' ? { agents: [] } : {}
     return { value: { content: [{ type: 'text', text: JSON.stringify(body) }], structuredContent: body } }
   })
   on('command.register', () => ({ value: { command: 'subagent-mcp' } }))
@@ -517,7 +517,7 @@ test('splitDiff unquotes the paths git quotes', () => {
 })
 
 // Kept last: the models.yaml path the server reports is remembered for the rest of the session.
-test('a project without its own models.yaml edits the bundled file the server reports', async ($, on) => {
+test('a project without its own models.yaml edits the file the server resolved', async ($, on) => {
   const bundled = '/opt/subagent-mcp/.subagents/models.yaml'
   let file = 'disabledBackends: []\nmodels:\n'
   const reads: string[] = []
@@ -558,7 +558,7 @@ test('a backend the environment also disables is not reported as enabled when it
   const said: string[] = []
   on('mcp.call', (_, e) => {
     const body = e.tool === 'list_models'
-      ? { model_policy: { disabled_backends: ['cursor'], disabled_backends_env: ['cursor'] } }
+      ? { models_file: '/project/.subagents/models.yaml', model_policy: { disabled_backends: ['cursor'], disabled_backends_env: ['cursor'] } }
       : e.tool === 'list_agents' ? { agents: [] } : {}
     return { value: { content: [{ type: 'text', text: JSON.stringify(body) }], structuredContent: body } }
   })

@@ -1,5 +1,5 @@
 import { readdir, readFile } from "node:fs/promises";
-import { basename, extname, resolve } from "node:path";
+import { basename, resolve } from "node:path";
 import { parse } from "yaml";
 
 import { withEndpointModels } from "./endpoints.js";
@@ -231,13 +231,50 @@ export function defaultServerLimits(): ServerLimits {
   };
 }
 
+export interface RegistryLoadStatus {
+  readonly registry: ConfigRegistry;
+  /** True when the roster was loaded empty because no models file existed. */
+  readonly modelsFileMissing: boolean;
+}
+
+export interface RegistryLoadOverrides extends RegistryLoadOptions {
+  /** Load an empty roster instead of failing when `modelsFile` does not exist. */
+  readonly allowMissingModels?: boolean;
+}
+
 export async function loadConfigRegistry(options: RegistryLoadOptions): Promise<ConfigRegistry> {
+  return (await loadConfigRegistryWithStatus(options)).registry;
+}
+
+export async function loadConfigRegistryWithStatus(options: RegistryLoadOverrides): Promise<RegistryLoadStatus> {
   const [agents, models] = await Promise.all([
     loadAgentConfigs(options.agentsDirectory),
-    loadModelsFile(options.modelsFile),
+    loadModelsFileMaybe(options.modelsFile, options.allowMissingModels === true),
   ]);
-  return new ConfigRegistry(agents, await withEndpointModels(models.roster), models.limits);
+  // With no models.yaml there is no roster to add endpoint models to either.
+  const roster = models.missing ? models.file.roster : await withEndpointModels(models.file.roster);
+  return { registry: new ConfigRegistry(agents, roster, models.file.limits), modelsFileMissing: models.missing };
 }
+
+async function loadModelsFileMaybe(path: string, allowMissing: boolean): Promise<{ file: ModelsFile; missing: boolean }> {
+  try {
+    return { file: await loadModelsFile(path), missing: false };
+  } catch (error) {
+    if (!allowMissing || !isErrno(error, "ENOENT")) throw error;
+    return { file: { roster: emptyRoster(), limits: defaultServerLimits() }, missing: true };
+  }
+}
+
+function emptyRoster(): ModelRoster {
+  return { claude: [], codex: [], opencode: [], antigravity: [], cursor: [], copilot: [], vibe: [] };
+}
+
+function isErrno(error: unknown, code: string): boolean {
+  return typeof error === "object" && error !== null && "code" in error && error.code === code;
+}
+
+const AGENT_CONFIG_SUFFIX = ".md";
+const AGENT_EXAMPLE_SUFFIX = ".md.example";
 
 export async function loadAgentConfigs(directory: string): Promise<readonly AgentConfig[]> {
   let entries;
@@ -248,11 +285,14 @@ export async function loadAgentConfigs(directory: string): Promise<readonly Agen
       cause: error instanceof Error ? error.message : String(error),
     });
   }
-  const files = entries
-    .filter((entry) => entry.isFile() && extname(entry.name) === ".md")
+  // Real `<name>.md` configs win. A directory with none (this repo's bundled `.subagents/`) falls back to
+  // the tracked `<name>.md.example` files that seed a person's own config.
+  const pick = (suffix: string) => entries
+    .filter((entry) => entry.isFile() && entry.name.endsWith(suffix))
     .map((entry) => resolve(directory, entry.name))
     .sort();
-  return Promise.all(files.map(loadAgentConfig));
+  const configs = pick(AGENT_CONFIG_SUFFIX);
+  return Promise.all((configs.length > 0 ? configs : pick(AGENT_EXAMPLE_SUFFIX)).map(loadAgentConfig));
 }
 
 export async function loadAgentConfig(path: string): Promise<AgentConfig> {
@@ -260,7 +300,10 @@ export async function loadAgentConfig(path: string): Promise<AgentConfig> {
   const { frontmatter, body } = splitFrontmatter(text, path);
   const value = parseYamlObject(frontmatter, path);
   const name = requiredString(value, "name", path);
-  const expectedName = basename(path, ".md");
+  const fileName = basename(path);
+  const expectedName = fileName.endsWith(AGENT_EXAMPLE_SUFFIX)
+    ? fileName.slice(0, -AGENT_EXAMPLE_SUFFIX.length)
+    : basename(path, AGENT_CONFIG_SUFFIX);
   if (name !== expectedName) {
     throw new ConfigurationError(`Agent name "${name}" must match filename "${expectedName}.md"`, {
       path,

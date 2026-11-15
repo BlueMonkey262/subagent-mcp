@@ -18,6 +18,12 @@ import { CopilotAdapter } from "./adapters/copilot/adapter.js";
 import { VibeAdapter } from "./adapters/vibe/adapter.js";
 import { OpenCodeAdapter } from "./adapters/opencode/adapter.js";
 import { LiveConfig } from "./config/live.js";
+import {
+  MODELS_FILE_CHECKED_ENV,
+  MODELS_FILE_ENV,
+  parseModelsFileChecked,
+  resolveModelsFile,
+} from "./config/models-file.js";
 import { isBackend } from "./core/types.js";
 import type { EventReadOptions } from "./events/buffer.js";
 import type { NormalizedEventType } from "./events/schema.js";
@@ -392,6 +398,7 @@ export async function connectHost(options: {
   readonly cwd: string;
   readonly agentsDirectory: string;
   readonly modelsFile: string;
+  readonly modelsFileChecked?: readonly string[];
   readonly scriptPath: string;
 }): Promise<HostClient> {
   const paths = hostPaths(options.cwd);
@@ -718,7 +725,8 @@ export async function drainNotifierTasks(
 export async function runHost(): Promise<void> {
   const cwd = process.cwd();
   const agentsDirectory = process.env.SUBAGENT_MCP_AGENTS_DIR ?? join(cwd, ".subagents");
-  const modelsFile = process.env.SUBAGENT_MCP_MODELS_FILE ?? join(cwd, ".subagents", "models.yaml");
+  const models = resolveModelsFile({ cwd });
+  const modelsFileChecked = parseModelsFileChecked(process.env[MODELS_FILE_CHECKED_ENV]) ?? models.checked;
   const paths = hostPaths(cwd);
   await mkdir(paths.directory, { recursive: true });
 
@@ -743,7 +751,11 @@ export async function runHost(): Promise<void> {
   }
   await rm(paths.socketPath, { force: true }).catch(() => undefined);
 
-  const live = new LiveConfig({ agentsDirectory, modelsFile });
+  const live = new LiveConfig({
+    agentsDirectory,
+    modelsFile: models.path,
+    modelsFileChecked,
+  });
   await live.reload();
   // Sessions, the lock and the usage ledger live in .subagents/memory; keep it out of the user's git.
   await ensureProjectMemoryIgnored(cwd).catch(() => undefined);
@@ -895,7 +907,7 @@ export async function runHost(): Promise<void> {
     socketPath: paths.socketPath,
     supervisor,
     ensembles,
-    modelsFile,
+    modelsFile: models.path,
     onClients: scheduleIdle,
     onShutdown: () => void shutdown(),
     shuttingDown: () => shuttingDown,
@@ -1164,7 +1176,7 @@ async function dispatch(supervisor: Supervisor, method: string, params: unknown,
         isBackend(input["backend"]) ? input["backend"] : undefined,
         ...(typeof input["live"] === "boolean" ? [input["live"]] : []),
       );
-      // A project without its own models.yaml runs on the bundled one (bin/run-server.sh); name the file in use.
+      // Name the exact models.yaml the resolver picked, so the panel edits that file.
       return context.modelsFile === undefined ? models : { ...models, models_file: context.modelsFile };
     }
     case "shutdown": {
@@ -1180,7 +1192,13 @@ async function dispatch(supervisor: Supervisor, method: string, params: unknown,
 }
 
 async function startDaemon(
-  options: { readonly cwd: string; readonly agentsDirectory: string; readonly modelsFile: string; readonly scriptPath: string },
+  options: {
+    readonly cwd: string;
+    readonly agentsDirectory: string;
+    readonly modelsFile: string;
+    readonly modelsFileChecked?: readonly string[];
+    readonly scriptPath: string;
+  },
   paths: HostPaths,
 ): Promise<void> {
   const acquired = await acquireHostLock(paths.lockPath, process.pid);
@@ -1194,7 +1212,8 @@ async function startDaemon(
       SUBAGENT_MCP_HOST: "1",
       SUBAGENT_MCP_STARTER_PID: String(process.pid),
       SUBAGENT_MCP_AGENTS_DIR: options.agentsDirectory,
-      SUBAGENT_MCP_MODELS_FILE: options.modelsFile,
+      [MODELS_FILE_ENV]: options.modelsFile,
+      [MODELS_FILE_CHECKED_ENV]: JSON.stringify(options.modelsFileChecked ?? [options.modelsFile]),
     },
   });
   child.unref();

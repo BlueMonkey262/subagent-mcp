@@ -5,7 +5,13 @@ import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprot
 
 import { fileURLToPath } from "node:url";
 
-import { CHANNEL_CAPABILITY, CHANNEL_INSTRUCTIONS, createChannelNotifier, createEnsembleChannelNotifier } from "./channel.js";
+import {
+  CHANNEL_CAPABILITY,
+  CHANNEL_INSTRUCTIONS,
+  createChannelNotifier,
+  createEnsembleChannelNotifier,
+} from "./channel.js";
+import { resolveModelsFile } from "./config/models-file.js";
 import { HostSession, runHost } from "./host.js";
 import { attachSessionAfterInitialize } from "./session.js";
 import { ServedCatalog, TOOL_CATALOG, validateToolInput } from "./tool-catalog.js";
@@ -17,13 +23,19 @@ async function main(): Promise<void> {
   }
   const cwd = process.cwd();
   const agentsDirectory = process.env.SUBAGENT_MCP_AGENTS_DIR ?? `${cwd}/.subagents`;
-  const modelsFile = process.env.SUBAGENT_MCP_MODELS_FILE ?? `${cwd}/.subagents/models.yaml`;
+  const models = resolveModelsFile({ cwd });
 
   const server = new McpServer(
     { name: "subagent-mcp", version: "0.1.0" },
     { capabilities: { experimental: { [CHANNEL_CAPABILITY]: {} } }, instructions: CHANNEL_INSTRUCTIONS },
   );
-  const host = new HostSession({ cwd, agentsDirectory, modelsFile, scriptPath: fileURLToPath(import.meta.url) });
+  const host = new HostSession({
+    cwd,
+    agentsDirectory,
+    modelsFile: models.path,
+    modelsFileChecked: models.checked,
+    scriptPath: fileURLToPath(import.meta.url),
+  });
   host.onDetached(createChannelNotifier(server.server));
   host.onEnsemble(createEnsembleChannelNotifier(server.server));
   await host.connect();

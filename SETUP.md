@@ -81,16 +81,23 @@ twice. The MCP server registered in step 3 is available to desktop sessions too.
 
 ## 5. Configure agents and models
 
-Without a `.subagents/` directory in your project, the server uses the examples bundled in this repo.
-To customize, copy `<repo>/.subagents` into your project and edit `models.yaml` so it lists the models
-you actually have access to (`agent --list-models`, `opencode models`, and so on). Changes under
-`.subagents/` hot-reload.
+Without a `.subagents/` directory in your project, the server uses the agent templates bundled in this
+repo. There is no model-roster fallback: the server reads `SUBAGENT_MCP_MODELS_FILE` if set, then the
+project's `.subagents/models.yaml`, then the install's `.subagents/models.yaml`; with none it starts with
+an empty roster and says which paths it checked.
+To customize, run `/subagent-mcp` then `i`, or by hand: copy the templates from `<repo>/.subagents`
+(`*.md.example`, `models.yaml.example`) into your project's `.subagents/`, drop the `.example` suffix, and
+edit `models.yaml` so it lists the models you actually have access to (`agent --list-models`,
+`opencode models`, and so on). Changes under `.subagents/` hot-reload.
 
 Antigravity (`agy`) agents carry their system prompt in an `agy` custom agent, not in the
-`.subagents/` file. The bundled `antigravity-general` config points at `subagent-general`, which lives
-in `<repo>/.agents/agents/subagent-general.md`; copy `.agents/` into your project along with
-`.subagents/` (or put an agent file of that name in `~/.gemini/agents/`). `agy` finds project agents
-from the directory it runs in, though `agy agents` only lists the global ones.
+`.subagents/` file. The bundled `antigravity-general` config points at `subagent-general`, whose template
+is `<repo>/.agents/agents/subagent-general.md.example`. When the real
+`.agents/agents/subagent-general.md` is missing, the server copies that template into place before
+launching `agy`, in your project or in the install checkout; it never overwrites an existing file and
+logs the copy. You can also copy it yourself, or put an agent file of that name in
+`~/.gemini/agents/`. `agy` finds project agents from the directory it runs in, though `agy agents` only
+lists the global ones.
 
 To make the definition explicit and repo-owned, set `antigravityAgentFile` in the agent config:
 

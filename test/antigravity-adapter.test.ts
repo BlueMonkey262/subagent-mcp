@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, realpath } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, realpath, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -83,6 +83,25 @@ test("buildAntigravityArguments is explicit, validates effort, and resumes by co
   assert.throws(() => buildAntigravityArguments({ model: "gemini-x", antigravityAgent: "reviewer", reasoningEffort: "xhigh" }), AntigravityAdapterError);
   assert.throws(() => buildAntigravityArguments({ model: "", antigravityAgent: "reviewer" }), AntigravityAdapterError);
   assert.throws(() => buildAntigravityArguments({ model: "gemini-x" }), AntigravityAdapterError);
+});
+
+test("spawn copies a missing Antigravity agent definition from the .example template", async () => {
+  const cwd = await realpath(await mkdtemp(path.join(os.tmpdir(), "antigravity-adapter-agent-file-")));
+  await mkdir(path.join(cwd, ".agents", "agents"), { recursive: true });
+  const definition = `---
+name: fixture-agent
+description: Fixture agent
+---
+Do the fixture work.
+`;
+  await writeFile(path.join(cwd, ".agents", "agents", "fixture-agent.md.example"), definition);
+  const adapter = fixtureAdapter(cwd);
+  try {
+    await adapter.spawn(spawnRequest(cwd, "FIRST"));
+    assert.equal(await readFile(path.join(cwd, ".agents", "agents", "fixture-agent.md"), "utf8"), definition);
+  } finally {
+    await adapter.closeAll();
+  }
 });
 
 test("persistent process normalizes events and warm-resumes the same conversation", async () => {

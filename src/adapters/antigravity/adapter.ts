@@ -11,6 +11,7 @@ import { EventBuffer } from "../../events/buffer.js";
 import type { AgentEvent, NewAgentEvent, NormalizedEventData, NormalizedEventType } from "../../events/schema.js";
 import { scanChildOutput } from "../../safety/output.js";
 import type { AdapterLiveness, AdapterTurn, BackendAdapter, EventOptions, ResumeRequest, SpawnRequest } from "../adapter.js";
+import { ensureAntigravityAgent } from "./agent-definition.js";
 
 const DEFAULT_INIT_TIMEOUT_MS = 15_000;
 const DEFAULT_INTERRUPT_GRACE_MS = 2_000;
@@ -123,6 +124,7 @@ export class AntigravityAdapter implements BackendAdapter {
 
   async spawn(request: SpawnRequest): Promise<AdapterTurn> {
     validateRequest(request);
+    await this.#prepareAgentDefinition(request.cwd, request.antigravityAgent, request.antigravityAgentFile);
     const turnId = randomUUID();
     const session = this.#launch(request, turnId);
     const agentId = await session.ready.promise;
@@ -150,6 +152,7 @@ export class AntigravityAdapter implements BackendAdapter {
     }
 
     const turnId = randomUUID();
+    await this.#prepareAgentDefinition(request.cwd, request.antigravityAgent, request.antigravityAgentFile);
     const session = this.#launch({
       model: request.model,
       ...(request.antigravityAgent === undefined ? {} : { antigravityAgent: request.antigravityAgent }),
@@ -230,6 +233,27 @@ export class AntigravityAdapter implements BackendAdapter {
   async closeAll(): Promise<void> {
     for (const session of this.#sessions.values()) this.#terminate(session);
     for (const launch of this.#launches) this.#terminate(launch);
+  }
+
+  async #prepareAgentDefinition(cwd: string, agentName: string | undefined, agentFile?: string): Promise<void> {
+    const name = requireAgentName(agentName);
+    try {
+      const ensured = await ensureAntigravityAgent({
+        cwd,
+        name,
+        ...(agentFile === undefined ? {} : { file: agentFile }),
+      });
+      if (ensured.copied && ensured.copiedFrom !== undefined) {
+        process.stderr.write(
+          `subagent-mcp: Antigravity agent "${name}" was missing; copied ${ensured.copiedFrom} to ${ensured.path}\n`,
+        );
+      }
+    } catch (error) {
+      throw new AntigravityAdapterError(
+        `Unable to prepare the Antigravity agent definition "${name}": ${error instanceof Error ? error.message : String(error)}`,
+        { agent: name, cwd },
+      );
+    }
   }
 
   #launch(request: Pick<SpawnRequest, "cwd" | "model" | "antigravityAgent" | "env" | "maxTurns" | "reasoningEffort" | "timeoutMs">, turnId: string, expectedAgentId?: string): AntigravitySession {
