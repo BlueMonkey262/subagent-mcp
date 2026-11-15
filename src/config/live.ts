@@ -41,7 +41,7 @@ export function missingConfigMessage(input: {
     "   A YAML roster of models spawn_agent is allowed to use. Example:",
     "   models:",
     "     claude:",
-    "       - name: claude-sonnet-5",
+    "       - name: claude-sonnet-5-5",
     "     codex:",
     "       - name: gpt-5.6-sol",
     "     opencode: []",

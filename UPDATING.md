@@ -56,6 +56,9 @@ Releases that change `models.yaml` or agent-config semantics must add a dated no
   fallback: with no `models.yaml` the server starts with an empty roster, and `list_models` /
   `spawn_agent` report the paths checked and that same instruction. Agent configs without a real
   `<name>.md` still fall back to the bundled `<name>.md.example`.
+  The example's Claude ids changed: `claude-sonnet-5` → `claude-sonnet-5-5`, `claude-opus-5` →
+  `claude-opus-5-5`, and `claude-haiku-4-5-20251001` → `claude-haiku-5-5`. Update those entries in a
+  copied roster if the CLI offers them.
   `.agents/agents/subagent-general.md` moved the same way, to `subagent-general.md.example`. The server
   copies the template into place without the `.example` suffix before launching `agy` when the real file
   is missing, and never overwrites an existing file; no manual copy is needed.

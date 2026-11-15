@@ -61,11 +61,11 @@
 
 models:
   claude:
-    - name: claude-sonnet-5
+    - name: claude-sonnet-5-5
       description: Claude model id passed through `claude --model`
-    - name: claude-opus-5
+    - name: claude-opus-5-5
       description: Claude model id passed through `claude --model`
-    - name: claude-haiku-4-5-20251001
+    - name: claude-haiku-5-5
       description: Claude model id passed through `claude --model`
 
   codex:
