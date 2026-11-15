@@ -22,6 +22,14 @@ The `mod/subagent-strip` plugin, which `bin/subagent-mcp` already loads through
 with the launcher. The MCP server stays registered at user scope (SETUP.md step 3), so a plain
 `claude` session can still call its tools but has no panel.
 
+Desktop app (added later): its Code-tab sessions never run the launcher, so SETUP.md step 4b names
+the mod folder in the `env` block of `~/.claude/settings.json` (`CLAUDE_CODE_PLUGIN_DIRS`), which
+Claude Code reads for sessions the desktop app starts; the launcher skips the folder when it is already
+listed. Bundling the server into the plugin was not done, for the reason below (the channel flag needs
+the user-scope server by name), and desktop sessions get no channel events anyway, so the mod's poller
+raises toasts for finished agents, approvals and finished ensembles instead. The pane draws a glance
+when the desktop app shows it as a widget (`placement: "widget"`, or `/subagent-mcp widget`).
+
 Decided: the earlier requirement that plain `claude` have no server either is dropped. It would need
 the launcher to supply the server, and that was tried: a server passed with `--mcp-config` connects,
 but `--dangerously-load-development-channels server:<name>` reports "no MCP server configured with

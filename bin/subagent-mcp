@@ -32,7 +32,12 @@ esac
 
 command -v claude >/dev/null || { echo "subagent-mcp: 'claude' not found on PATH" >&2; exit 1; }
 
-# Load the status-line mod (append to any existing plugin dirs).
-export CLAUDE_CODE_PLUGIN_DIRS="$ROOT/mod/subagent-strip${CLAUDE_CODE_PLUGIN_DIRS:+:$CLAUDE_CODE_PLUGIN_DIRS}"
+# Load the status-line mod (append to any existing plugin dirs), unless it is already listed: the
+# desktop app setup in SETUP.md puts the same folder in ~/.claude/settings.json.
+MOD="$ROOT/mod/subagent-strip"
+case ":${CLAUDE_CODE_PLUGIN_DIRS:-}:" in
+*":$MOD:"*) ;;
+*) export CLAUDE_CODE_PLUGIN_DIRS="$MOD${CLAUDE_CODE_PLUGIN_DIRS:+:$CLAUDE_CODE_PLUGIN_DIRS}" ;;
+esac
 
 exec claude --dangerously-load-development-channels server:subagent-mcp "$@"

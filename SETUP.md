@@ -53,8 +53,31 @@ is split into new and cached where the backend allows it; otherwise the row show
 When a newer release is available, the status line also shows one dim update notice (see README
 "Update notifications").
 
-If you already have a `statusLine`, decide whether to replace it or skip this step. Don't set
-`CLAUDE_CODE_PLUGIN_DIRS` in `settings.json`; the launcher does it.
+If you already have a `statusLine`, decide whether to replace it or skip this step. For terminal
+sessions you don't need `CLAUDE_CODE_PLUGIN_DIRS` in `settings.json`; the launcher sets it. Step 4b
+puts it there for the desktop app.
+
+## 4b. Desktop app (optional)
+
+The Claude desktop app starts its Code-tab sessions itself, so the launcher never runs and the mod
+is not loaded. To get the `/subagent-mcp` panel, the desktop widget and the completion toasts
+there, name the mod folder in the `env` block of `~/.claude/settings.json` (merge, don't replace):
+
+```json
+"env": { "CLAUDE_CODE_PLUGIN_DIRS": "<repo>/mod/subagent-strip" }
+```
+
+Then start a new Code-tab session. The launcher sees the folder already listed and doesn't add it
+twice. The MCP server registered in step 3 is available to desktop sessions too.
+
+- Desktop sessions get no channel events (the launcher's
+  `--dangerously-load-development-channels` flag is terminal-only), so Claude is not woken when a
+  background agent finishes. The mod's toasts tell you instead: an agent finished or failed, an
+  agent needs approval, an ensemble completed. Turn them off with the mod's `toasts` option
+  (`/config`) if the terminal's channel events are enough.
+- `/subagent-mcp widget` opens the panel as the desktop app's small floating widget: running and
+  waiting counts and what each running agent is doing. Run `/subagent-mcp` for the full panel.
+- The desktop app has no status line, so step 4's rows don't apply there.
 
 ## 5. Configure agents and models
 
