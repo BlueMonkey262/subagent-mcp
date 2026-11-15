@@ -17,16 +17,27 @@ const host = new HostSession({ cwd, agentsDirectory: process.env.SUBAGENT_MCP_AG
 const rl = createInterface({ input: stdin, output: stdout });
 await host.connect();
 let dashboardUnavailable = false;
+let dashboardRetryAt = 0;
 let showOlder = false;
 let selected;
+let lastUpdate;
 async function dashboard(since) {
   try {
-    if (dashboardUnavailable) return await host.call('list_agents', {}, 10000);
-    return await host.call('get_dashboard', { ...(since ? { since } : {}), recent: showOlder ? 50 : 10 }, 10000);
+    if (dashboardUnavailable && Date.now() < dashboardRetryAt) return await host.call('list_agents', {}, 10000);
+    dashboardUnavailable = false;
+    let updateAvailable;
+    try { const update = JSON.parse(await readFile(resolve(cwd, '.subagents/memory/update.json'), 'utf8')); if (update.available) updateAvailable = update.latest ?? true; }
+    catch { /* No cached update status yet. */ }
+    const changed = updateAvailable !== lastUpdate;
+    lastUpdate = updateAvailable;
+    const result = await host.call('get_dashboard', { ...(since && !changed ? { since } : {}), recent: showOlder ? 50 : 10 }, 10000);
+    if (updateAvailable && !result.unchanged) result.update_available = updateAvailable;
+    return result;
   }
   catch (error) {
     if (!/unknown|not found/i.test(error.message)) throw error;
     dashboardUnavailable = true;
+    dashboardRetryAt = Date.now() + 5 * 60_000;
     console.log('Older host: showing agents without dashboard details.');
     return host.call('list_agents', {}, 10000);
   }
@@ -51,6 +62,7 @@ function display(result) {
     }
   }
   if (Array.isArray(result.approvals)) for (const approval of result.approvals) console.log(`  Approval ${approval.request_id}: ${approval.name ?? approval.agent_id} ${approval.tool_name ?? ''} ${approval.command ?? ''} ${approval.reason ?? ''}`);
+  if (result.update_available) console.log(`Update available: ${result.update_available === true ? 'see update' : result.update_available}`);
   if (host.warning()) console.log(`Host: ${host.warning()}`);
 }
 console.log('subagent-mcp companion. Type help for commands.');
@@ -154,7 +166,9 @@ try {
       const result = method === 'get_dashboard' ? await dashboard() : await host.call(method, input, 10000);
       if (method === 'get_dashboard') display(result);
       else if (cmd === 'diff' && typeof result.patch === 'string' && stdout.isTTY) {
-        const pages = result.patch.match(/[\s\S]{1,4000}/g) ?? ['No changes.'];
+        const files = result.patch.split(/(?=^diff --git )/m).filter(Boolean);
+        const pages = files.flatMap(file => file.match(/[\s\S]{1,4000}/g) ?? []);
+        if (!pages.length) pages.push('No changes.');
         for (let i = 0; i < pages.length; i++) {
           console.log(pages[i]);
           if (i + 1 < pages.length && (await rl.question(`Page ${i + 1}/${pages.length}; Enter for next, q to stop: `)).trim().toLowerCase() === 'q') break;
