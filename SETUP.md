@@ -64,9 +64,10 @@ edit `models.yaml` so it lists the models you actually have access to (`agent --
 `.subagents/` hot-reload.
 
 Antigravity (`agy`) agents carry their system prompt in an `agy` custom agent, not in the
-`.subagents/` file. The bundled `antigravity-general` config points at `subagent-general`, which lives
-in `<repo>/.agents/agents/subagent-general.md`; copy `.agents/` into your project along with
-`.subagents/` (or put an agent file of that name in `~/.gemini/agents/`). `agy` finds project agents
+`.subagents/` file. The bundled `antigravity-general` config points at `subagent-general`, whose template
+is `<repo>/.agents/agents/subagent-general.md.example`. Copy it to your project's
+`.agents/agents/subagent-general.md` along with the `.subagents/` templates (or put an agent file of that
+name in `~/.gemini/agents/`). `agy` does not read the `.example` file itself. `agy` finds project agents
 from the directory it runs in, though `agy agents` only lists the global ones.
 
 ## 6. Optional: custom endpoints

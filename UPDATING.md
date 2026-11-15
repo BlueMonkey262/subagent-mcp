@@ -50,6 +50,8 @@ Releases that change `models.yaml` or agent-config semantics must add a dated no
   in step 4 refuses to fast-forward, because the release deletes those files. Move each edited file aside
   first (`mv <file> <file>.mine`), merge, then `mv` it back. From then on they are ignored files that no
   update touches. Unedited copies are removed by the merge, and the templates take over as the fallback.
+  `.agents/agents/subagent-general.md` moved the same way, to `subagent-general.md.example`. `agy` cannot
+  read the template, so if you use Antigravity from `<repo>` itself, copy it back without the suffix.
 
 ## 4. Swap (the one step that touches the live install)
 

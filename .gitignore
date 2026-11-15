@@ -6,6 +6,11 @@ dist/
 # Redundant with the rule above, but the host appends this exact line to .gitignore when it is missing.
 .subagents/memory/
 .codex/config.toml
+# .agents/ (Antigravity custom agents) works the same way: only the templates are tracked.
+.agents/*
+!.agents/agents/
+.agents/agents/*
+!.agents/agents/*.example
 .claude/agents/
 .claude/worktrees/
 .codex/agents/orchestrator.toml

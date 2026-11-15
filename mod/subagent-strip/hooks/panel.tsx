@@ -34,9 +34,10 @@ const INIT_PROMPT =
   'then use question menus to ask which backends to enable, which models go in the roster, which bundled ' +
   'agent configs to copy in, and whether to set disabledBackends / blockModels / blockClaudeModels. ' +
   'The subagent-mcp install (the checkout `subagent-mcp` on PATH links into) ships only templates: ' +
-  '.subagents/*.md.example and .subagents/models.yaml.example. ' +
-  'Build this project\'s own .subagents/<name>.md and .subagents/models.yaml from them (drop the .example ' +
-  'suffix). If .subagents/models.yaml exists, propose edits as a diff, save models.yaml.bak, ' +
+  '.subagents/*.md.example, .subagents/models.yaml.example and .agents/agents/*.md.example. ' +
+  'Build this project\'s own .subagents/<name>.md, .subagents/models.yaml and, for Antigravity, ' +
+  '.agents/agents/<name>.md from them (drop the .example suffix). ' +
+  'If .subagents/models.yaml exists, propose edits as a diff, save models.yaml.bak, ' +
   'and write only after I say yes; keep my hand-written entries and comments. Do not build, change ' +
   '~/.claude, or touch MCP registration.'
 
