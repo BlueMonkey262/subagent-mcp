@@ -20,7 +20,10 @@ const permission = { allow: [], deny: [], default: "escalate" as const };
 const config = (name: string, backend: AgentConfig["backend"]): AgentConfig =>
   ({ name, backend, description: name, systemPrompt: "", permission, env: {}, sourcePath: `/configs/${name}.md` });
 
-function fixture(options: { maxConcurrent?: number; directory?: string; supervisorPath?: string } = {}) {
+function fixture(options: {
+  maxConcurrent?: number; directory?: string; supervisorPath?: string;
+  onSettled?: (event: Readonly<Record<string, unknown>>) => boolean | Promise<boolean>;
+} = {}) {
   const codex = new FakeAdapter("codex");
   const opencode = new FakeAdapter("opencode");
   const registry = new ConfigRegistry([config("codex-general", "codex"), config("opencode-general", "opencode")], {
@@ -38,7 +41,7 @@ function fixture(options: { maxConcurrent?: number; directory?: string; supervis
     supervisor, cwd: "/repo", launchWaitMs: 200,
     ...(options.directory === undefined ? {} : { directory: options.directory }),
     profileSources: [],
-    onSettled: (event) => { events.push({ ...event }); return true; },
+    onSettled: options.onSettled ?? ((event) => { events.push({ ...event }); return true; }),
   });
   return { codex, opencode, supervisor, manager, detached, events };
 }
@@ -342,4 +345,23 @@ test("ordinary spawn_agent results are unchanged and still notify", async () => 
   complete(f.codex, String(result.agent_id), "done");
   await until(() => f.detached.length === 1);
   assert.equal(f.detached[0]!.status, "completed");
+});
+
+test("a retry while the first push is still in flight does not send the event twice", async () => {
+  const sent: Record<string, unknown>[] = [];
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  const f = fixture({ onSettled: async (event) => { sent.push({ ...event }); await gate; return true; } });
+  const started = await f.manager.start({ task: "t", agents: roster.slice(0, 1) });
+  const [only] = await memberIds(f.manager, String(started.ensemble_id));
+  complete(f.codex, only!.agent_id, "answer");
+  await until(() => sent.length === 1);
+  // A tool call arriving now retries pending events; the first push has not resolved yet.
+  await Promise.race([f.manager.deliverPending(), new Promise((resolve) => setTimeout(resolve, 20))]);
+  release();
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  await f.manager.deliverPending();
+  assert.equal(sent.length, 1);
+  const view = await f.manager.get({ ensemble: String(started.ensemble_id) });
+  assert.notEqual((view as Record<string, unknown>).undelivered, true);
 });

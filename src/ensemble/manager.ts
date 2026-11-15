@@ -118,6 +118,8 @@ export class EnsembleManager {
   #refreshing = false;
   #refreshAgain = false;
   #delivering = false;
+  /** Pushes in flight, keyed by record and kind, so a concurrent retry cannot send the same event twice. */
+  readonly #emitting = new Set<string>();
 
   constructor(options: EnsembleManagerOptions) {
     this.#supervisor = options.supervisor;
@@ -657,7 +659,8 @@ export class EnsembleManager {
       record.usage = this.#usagePublic(record);
       this.#warnIncompleteCost(record);
       if (record.late_update?.state === "pending" && record.members.every((member) => this.#terminal(member))) {
-        void this.#emitLateUpdate(record);
+        // Delivery settles after this refresh persists, so persist again once it changes the record.
+        void this.#emitLateUpdate(record).then((delivered) => (delivered ? this.#persist(record) : undefined)).catch(() => undefined);
       }
     }
     if (changed) {
@@ -840,6 +843,9 @@ export class EnsembleManager {
   /** Push the consolidated event. Returns true when it was delivered and the delivery state changed. */
   async #emit(record: EnsembleRecord, update: boolean): Promise<boolean> {
     if (this.#onSettled === undefined) return false;
+    const key = `${record.id}:${update ? "update" : "final"}`;
+    if (this.#emitting.has(key)) return false;
+    this.#emitting.add(key);
     try {
       const delivered = await this.#onSettled({
         ensemble_id: record.id, name: record.name, status: record.status, reason: record.reason,
@@ -848,6 +854,8 @@ export class EnsembleManager {
       if (delivered !== true) return false;
     } catch {
       return false;
+    } finally {
+      this.#emitting.delete(key);
     }
     if (update) record.late_update = { state: "delivered" };
     else record.notification = { required: true, state: "delivered", at: new Date().toISOString() };
