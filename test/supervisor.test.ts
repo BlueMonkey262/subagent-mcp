@@ -24,6 +24,7 @@ function testRegistry(agents: readonly AgentConfig[], roster: Partial<ModelRoste
     opencode: roster.opencode ?? [],
     antigravity: roster.antigravity ?? [],
     cursor: roster.cursor ?? [],
+    copilot: roster.copilot ?? [],
   };
   return new ConfigRegistry(agents, fullRoster, limits);
 }
@@ -682,6 +683,49 @@ test("sendMessage queues while an agent is busy and delivers it once the current
   assert.equal(final?.["queued"], undefined);
 });
 
+test("a queued resume clears the previous turn's non-fatal error", async () => {
+  const adapter = new FakeAdapter("codex");
+  const supervisor = new Supervisor({
+    registry: testRegistry([codexAgentConfig()]),
+    adapters: new AdapterRegistry([adapter]),
+    cwd: "/work",
+  });
+
+  const spawned = await supervisor.spawnAgent({
+    agent: "general",
+    prompt: "first turn",
+    description: "queued error reset",
+    run_in_background: true,
+  });
+  const agentId = spawned["agent_id"] as string;
+  await waitUntil(() => supervisor.listAgents().some((agent) => agent["agent_id"] === agentId && agent["state"] === "running"));
+  await supervisor.sendMessage({ agent: agentId, prompt: "second turn", run_in_background: true });
+
+  adapter.queueScript([{
+    create: (context) => ({
+      type: "turn.completed",
+      agentId: context.agentId,
+      backend: context.backend,
+      data: { turnId: context.turnId, status: "completed" as const, finalText: "second turn done" },
+    }),
+  }]);
+
+  // A non-fatal error on turn 1 sticks to record.lastError unless the queued resume clears it.
+  adapter.emit(agentId, "error", {
+    code: "ANTIGRAVITY_PERMISSION_DENIED",
+    message: "Antigravity headless mode auto-denied: command (RunCommand)",
+    fatal: false,
+  });
+  adapter.emit(agentId, "turn.completed", { turnId: "first-turn", status: "completed", finalText: "first turn done" });
+
+  await waitUntil(() => adapter.resumeRequests.length === 1);
+  await waitUntil(() => supervisor.listAgents().some((agent) => agent["agent_id"] === agentId && agent["state"] === "completed"));
+
+  const result = supervisor.getAgentResult(agentId) as { error?: { code: string }; result?: string };
+  assert.equal(result.error, undefined, "the successful queued turn must not inherit turn 1's denial");
+  assert.equal(result.result, "second turn done");
+});
+
 test("a completed background agent frees its capacity slot (no leak past MAX_CONCURRENT_AGENTS)", async () => {
   const adapter = new FakeAdapter("codex");
   const supervisor = new Supervisor({
@@ -1256,7 +1300,7 @@ test("list_models marks blocked models in the live backend catalog", async () =>
     modelPolicy: { blockClaudeModels: false, disabledBackends: [] as Backend[], blockModels: ["codex:*sol"] },
   };
   const supervisor = new Supervisor({
-    registry: new ConfigRegistry([codexAgentConfig()], { claude: [], codex: [{ name: "fake-model" }], opencode: [], antigravity: [], cursor: [] }, limits),
+    registry: new ConfigRegistry([codexAgentConfig()], { claude: [], codex: [{ name: "fake-model" }], opencode: [], antigravity: [], cursor: [], copilot: [] }, limits),
     adapters: new AdapterRegistry([adapter]),
     cwd: "/work",
   });
@@ -1359,6 +1403,7 @@ test("blockClaudeModels refuses Claude spawns and resumes, allows endpoint model
     opencode: [{ name: "opencode/claude-sonnet-5-5" }],
     antigravity: [],
     cursor: [],
+    copilot: [],
   };
   const { model: _pinned, ...unpinned } = codexAgentConfig();
   const agents: AgentConfig[] = [codexAgentConfig(), { ...unpinned, name: "claude-general", backend: "claude" }];
@@ -1414,7 +1459,7 @@ test("endpoint policy checks aliases and structured upstream model ids", async (
     claude: { models: [{ alias: "neutral", id: "meta/llama-4" }] },
   } }));
   try {
-    const roster = await withEndpointModels({ claude: [], codex: [], opencode: [], antigravity: [], cursor: [] }, endpoints);
+    const roster = await withEndpointModels({ claude: [], codex: [], opencode: [], antigravity: [], cursor: [], copilot: [] }, endpoints);
     assert.equal(roster.codex.find((entry) => entry.name === "openrouter/fast")?.upstreamModel, "anthropic/claude-sonnet-4");
     const { model: _pinned, ...unpinned } = codexAgentConfig();
     const limits = {
@@ -1456,7 +1501,7 @@ test("endpoint policy checks aliases and structured upstream model ids", async (
 
 test("the block is re-checked when a queued message is delivered and when a spawn gets its slot", async () => {
   const claude = new FakeAdapter("claude");
-  const roster: ModelRoster = { claude: [{ name: "claude-sonnet-5" }], codex: [{ name: "fake-model" }], opencode: [], antigravity: [], cursor: [] };
+  const roster: ModelRoster = { claude: [{ name: "claude-sonnet-5" }], codex: [{ name: "fake-model" }], opencode: [], antigravity: [], cursor: [], copilot: [] };
   const { model: _pinned, ...unpinned } = codexAgentConfig();
   const agents: AgentConfig[] = [{ ...unpinned, name: "claude-general", backend: "claude" }];
   const limits = { ...defaultServerLimits(), maxConcurrent: 1, modelPolicy: { blockClaudeModels: false, disabledBackends: [] as Backend[], blockModels: [] as string[] } };

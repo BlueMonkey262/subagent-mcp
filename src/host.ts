@@ -12,6 +12,7 @@ import { AntigravityAdapter } from "./adapters/antigravity/adapter.js";
 import { ClaudeAdapter } from "./adapters/claude/adapter.js";
 import { CodexAdapter } from "./adapters/codex/adapter.js";
 import { CursorAdapter } from "./adapters/cursor/adapter.js";
+import { CopilotAdapter } from "./adapters/copilot/adapter.js";
 import { OpenCodeAdapter } from "./adapters/opencode/adapter.js";
 import { LiveConfig } from "./config/live.js";
 import { isBackend } from "./core/types.js";
@@ -681,13 +682,14 @@ export async function runHost(): Promise<void> {
   const opencode = new OpenCodeAdapter();
   const antigravity = new AntigravityAdapter();
   const cursor = new CursorAdapter();
+  const copilot = new CopilotAdapter();
   let endpoint: RunningHost | undefined;
   const notifierTasks = new Set<Promise<unknown>>();
   /** Last time a completion notifier was added or settled; shutdown's drain waits for it to go quiet. */
   let notifierActivity = Date.now();
   const supervisor = new SupervisorClass({
     registry: live,
-    adapters: new AdapterRegistry([claude, codex, opencode, antigravity, cursor]),
+    adapters: new AdapterRegistry([claude, codex, opencode, antigravity, cursor, copilot]),
     cwd,
     usage,
     updateCachePath: join(paths.directory, "update.json"),
@@ -765,6 +767,7 @@ export async function runHost(): Promise<void> {
       opencode.closeAll(),
       antigravity.closeAll(),
       cursor.closeAll(),
+      copilot.closeAll(),
     ]).catch(() => undefined);
     await drainNotifierTasks(notifierTasks, NOTIFIER_DRAIN_TIMEOUT_MS, NOTIFIER_SETTLE_MS, () => notifierActivity);
     const ownsPaths = await ownsHostPaths(paths, process.pid);

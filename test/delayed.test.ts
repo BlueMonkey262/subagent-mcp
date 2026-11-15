@@ -33,6 +33,7 @@ function testRegistry(limits = defaultServerLimits()): ConfigRegistry {
     opencode: [],
     antigravity: [],
     cursor: [],
+    copilot: [],
   };
   return new ConfigRegistry([agent], roster, limits);
 }

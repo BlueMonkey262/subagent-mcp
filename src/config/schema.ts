@@ -25,7 +25,7 @@ export interface AgentConfig {
   /** Pinned when present. Omission intentionally forces a model at spawn time. */
   readonly model?: string;
   /**
-   * Pinned when present. Claude, Codex, and Antigravity honor supported effort levels.
+   * Pinned when present. Claude, Codex, Antigravity, and Copilot honor supported effort levels.
    * OpenCode and Cursor reject it: OpenCode has no effort parameter, and Cursor folds effort
    * into the model id.
    */
