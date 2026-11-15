@@ -283,7 +283,8 @@ test("the timeout backstop fails the turn with a timeout error", async () => {
   const cwd = await tempDir("timeout");
   const { adapter } = await fixtureAdapter();
   try {
-    const turn = await adapter.spawn(spawnRequest(cwd, "HANG", { timeoutMs: 200 }));
+    // Long enough for the fixture to open its session under a loaded parallel test run; HANG never ends on its own.
+    const turn = await adapter.spawn(spawnRequest(cwd, "HANG", { timeoutMs: 1_500 }));
     const events = await eventsThrough(adapter, turn.agentId, completedTurn);
     const error = events.find((event) => event.type === "error");
     assert.equal(error?.type === "error" ? error.data.code : undefined, "VIBE_TURN_TIMEOUT");

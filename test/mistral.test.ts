@@ -100,9 +100,11 @@ test("usage is grouped by provider so Mistral API and Vibe plan usage stay apart
   assert.equal(grouped.mistral?.opencode?.spawns, 1);
   assert.equal(grouped.mistral?.vibe?.estimatedCostUsd, 0.02, "Vibe's estimate stays an estimate");
   assert.equal(grouped.mistral?.vibe?.costUsd, 0);
-  // A ledger written before provider grouping still loads.
-  await writeFile(file, JSON.stringify({ opencode: { turns: 3, models: {} } }));
-  const old = new UsageLedger(file);
+  // A ledger written before provider grouping still loads. Its own file: the first ledger's queued
+  // writes could otherwise land after this one.
+  const oldFile = path.join(dir, "old-usage.json");
+  await writeFile(oldFile, JSON.stringify({ opencode: { turns: 3, models: {} } }));
+  const old = new UsageLedger(oldFile);
   await old.load();
   assert.equal(old.snapshot().opencode.turns, 3);
   assert.deepEqual(old.snapshot().opencode.providers, {});
@@ -191,4 +193,49 @@ test("a recognized rate limit puts the provider in cooldown; auth failures are c
   f.adapter.emit(String(other.agent_id), "error", { code: "OPENCODE_AUTH_FAILED", message: "Unauthorized", fatal: false, details: { statusCode: 401, class: "auth" } });
   await until(() => ((f.supervisor.providersView().other as Record<string, unknown>)?.auth_failures) === 1);
   assert.equal((f.supervisor.providersView().other as Record<string, unknown>).cooling_down_until, undefined);
+});
+
+test("a rate limit hit while a spawn waits for the provider slot still holds that spawn back", async () => {
+  const f = opencodeSupervisor({ mistral: { maxConcurrent: 1, cooldownSeconds: 1 } });
+  const first = await f.spawn("mistral/a");
+  const id = String(first.agent_id);
+  let startedAt: number | undefined;
+  const second = f.spawn("mistral/a").then((result) => { startedAt = Date.now(); return result; });
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  const limitedAt = Date.now();
+  f.adapter.emit(id, "error", { code: "OPENCODE_RATE_LIMITED", message: "Too many requests", fatal: false, details: { statusCode: 429, class: "rate_limit" } });
+  f.adapter.emit(id, "turn.completed", { turnId: `${id}-t`, status: "failed" });
+  await second;
+  assert.ok(startedAt! - limitedAt >= 700, `the queued spawn started ${startedAt! - limitedAt}ms after the rate limit`);
+  assert.equal(f.adapter.spawnRequests.length, 2);
+});
+
+test("a queued message waits out a rate limit from the turn before it; stop_agent drops it meanwhile", async () => {
+  const f = opencodeSupervisor({ mistral: { cooldownSeconds: 1 } });
+  const rateLimit = (id: string) => {
+    f.adapter.emit(id, "error", { code: "OPENCODE_RATE_LIMITED", message: "Too many requests", fatal: false, details: { statusCode: 429, class: "rate_limit" } });
+    f.adapter.emit(id, "turn.completed", { turnId: `${id}-t`, status: "failed" });
+  };
+  const state = (id: string) => f.supervisor.listAgents().find((agent) => agent["agent_id"] === id)?.["state"];
+
+  const first = String((await f.spawn("mistral/a")).agent_id);
+  await until(() => state(first) === "running");
+  await f.supervisor.sendMessage({ agent: first, prompt: "next", run_in_background: true });
+  const limitedAt = Date.now();
+  rateLimit(first);
+  await until(() => f.adapter.resumeRequests.length === 1);
+  assert.ok(Date.now() - limitedAt >= 700, `the queued turn was delivered ${Date.now() - limitedAt}ms after the rate limit`);
+  f.adapter.emit(first, "turn.completed", { turnId: `${first}-t2`, status: "completed", finalText: "ok" });
+  await until(() => state(first) === "completed");
+
+  await new Promise((resolve) => setTimeout(resolve, 1_300));
+  const second = String((await f.spawn("mistral/a")).agent_id);
+  await until(() => state(second) === "running");
+  await f.supervisor.sendMessage({ agent: second, prompt: "next", run_in_background: true });
+  rateLimit(second);
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  await f.supervisor.stopAgent(second);
+  assert.equal(state(second), "failed", "the agent ends on the turn that hit the rate limit");
+  await new Promise((resolve) => setTimeout(resolve, 1_300));
+  assert.equal(f.adapter.resumeRequests.length, 1, "the dropped message is never delivered");
 });

@@ -1,10 +1,15 @@
 import assert from "node:assert/strict";
+import type { ChildProcessWithoutNullStreams } from "node:child_process";
+import { EventEmitter } from "node:events";
+import { existsSync, readFileSync } from "node:fs";
 import { mkdtemp, readFile, realpath } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { PassThrough } from "node:stream";
 import test from "node:test";
 
 import { CopilotAdapter, CopilotAdapterError, buildCopilotArguments, translateRules } from "../src/adapters/copilot/adapter.js";
+import type { CopilotAdapterOptions } from "../src/adapters/copilot/adapter.js";
 import { AdapterRegistry } from "../src/adapters/adapter.js";
 import type { ResumeRequest, SpawnRequest } from "../src/adapters/adapter.js";
 import type { AgentConfig, ModelRoster } from "../src/config/schema.js";
@@ -43,13 +48,17 @@ function resumeRequest(request: SpawnRequest, agentId: string, prompt: string): 
   };
 }
 
-function fixtureAdapter(extraEnv: Record<string, string> = {}): CopilotAdapter {
+function fixtureAdapter(
+  extraEnv: Record<string, string> = {},
+  options: Partial<CopilotAdapterOptions> = {},
+): CopilotAdapter {
   return new CopilotAdapter({
     executable: process.execPath,
     executableArgs: [fixture],
     initTimeoutMs: 2_000,
     interruptGraceMs: 300,
     env: extraEnv,
+    ...options,
   });
 }
 
@@ -82,6 +91,53 @@ async function waitUntil(predicate: () => boolean, timeoutMs = 4_000): Promise<v
   }
 }
 
+function processIsAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+interface FakeChild {
+  readonly child: ChildProcessWithoutNullStreams;
+  readonly signals: NodeJS.Signals[];
+  emitLine(value: unknown): void;
+  close(): void;
+}
+
+/** A child-process stand-in that records signals but never closes unless the test asks it to. */
+function fakeChild(): FakeChild {
+  const child = new EventEmitter() as unknown as ChildProcessWithoutNullStreams;
+  const signals: NodeJS.Signals[] = [];
+  const stdin = new PassThrough();
+  const stdout = new PassThrough();
+  const stderr = new PassThrough();
+  Object.assign(child as object, {
+    pid: undefined,
+    stdin,
+    stdout,
+    stderr,
+    exitCode: null,
+    signalCode: null,
+    kill(signal: NodeJS.Signals) {
+      signals.push(signal);
+      return true;
+    },
+  });
+  return {
+    child,
+    signals,
+    emitLine(value: unknown) {
+      stdout.write(`${JSON.stringify(value)}\n`);
+    },
+    close() {
+      child.emit("close", null, "SIGKILL");
+    },
+  };
+}
+
 test("buildCopilotArguments maps permission, effort and resume, and passes the prompt with =", () => {
   const allowAll = buildCopilotArguments({ prompt: "-starts with a dash", model: "auto", cwd: "/work", permission: allow });
   assert.deepEqual(allowAll, [
@@ -105,12 +161,48 @@ test("buildCopilotArguments maps permission, effort and resume, and passes the p
 
 test("translateRules maps Claude-style rules, keeps native ones, and drops the rest", () => {
   assert.deepEqual(translateRules([
-    "Bash", "Bash(git:*)", "Bash(npm run *:*)", "Read", "Grep(src/**)", "Write(.env)", "Edit",
+    "Bash", "Bash(git:*)", "Bash(npm run *:*)", "Read", "Grep(src/file.txt)", "Write(.env)", "Edit",
     "shell(gh pr create)", "url(https://github.com)", "memory", "WebFetch", "mcp__x__y", "Read",
   ]), [
-    "shell", "shell(git:*)", "shell(npm run:*)", "read", "read(src/**)", "write(.env)", "write",
+    "shell", "shell(git:*)", "shell(npm run:*)", "read", "read(src/file.txt)", "write(.env)", "write",
     "shell(gh pr create)", "url(https://github.com)", "memory",
   ]);
+});
+
+test("inexact path globs are dropped from allows and deny the whole tool, never widened", () => {
+  const rules = [
+    "Write(*)", "Read(*)", "Grep(*)", "Glob(*)",
+    "Write(src/*)", "Write(src/**)", "Write(src:*)",
+    "Write(path/file.txt)", "Write", "Read",
+  ];
+  const allowWarnings: string[] = [];
+  const denyWarnings: string[] = [];
+  assert.deepEqual(translateRules(rules, "allow", (warning) => allowWarnings.push(warning)), [
+    "write(path/file.txt)", "write", "read",
+  ]);
+  assert.deepEqual(translateRules(rules, "deny", (warning) => denyWarnings.push(warning)), [
+    "write", "read", "write(path/file.txt)",
+  ]);
+  assert.equal(allowWarnings.length, 7, "every inexact allow is reported");
+  assert.equal(denyWarnings.length, 7, "every broadened deny is reported");
+  assert.ok(allowWarnings.every((warning) => /dropping the allow/.test(warning)));
+  assert.ok(denyWarnings.every((warning) => /denying the whole/.test(warning)));
+
+  assert.deepEqual(translateRules(["write(*)", "read(src/*)", "write(src/file.txt)"], "allow", () => undefined), ["write(src/file.txt)"]);
+  assert.deepEqual(translateRules(["write(*)", "read(src/*)", "write(src/file.txt)"], "deny", () => undefined), ["write", "read", "write(src/file.txt)"]);
+
+  const args = buildCopilotArguments({
+    prompt: "x",
+    model: "auto",
+    cwd: "/work",
+    permission: {
+      allow: ["Write(*)", "Write(path/file.txt)", "Write"],
+      deny: ["Write(src/*)", "Read(*)"],
+      default: "escalate",
+    },
+  }, undefined, () => undefined);
+  assert.deepEqual(args.filter((_, index) => args[index - 1] === "--allow-tool"), ["write(path/file.txt)", "write"]);
+  assert.deepEqual(args.filter((_, index) => args[index - 1] === "--deny-tool"), ["write", "read"]);
 });
 
 test("a turn stores the sessionId and maps text, tools, denials and the final message", async () => {
@@ -192,6 +284,72 @@ test("resume waits for the previous turn's process to exit, since Copilot locks 
   }
 });
 
+test("resume SIGKILLs a previous process that ignores SIGTERM before launching", async () => {
+  const cwd = await realpath(await mkdtemp(path.join(os.tmpdir(), "copilot-adapter-stubborn-")));
+  const pidFile = path.join(cwd, "child.pid");
+  const adapter = fixtureAdapter({ COPILOT_FIXTURE_PID: pidFile }, { exitWaitMs: 150 });
+  const request = spawnRequest(cwd, "STUBBORN");
+  let pid: number | undefined;
+  try {
+    const first = await adapter.spawn(request);
+    await eventsThrough(adapter, first.agentId, (event) => event.type === "turn.completed");
+    await waitUntil(() => existsSync(pidFile));
+    pid = Number(readFileSync(pidFile, "utf8"));
+    assert.ok(processIsAlive(pid), "the previous process is still alive before the resume");
+
+    const resumed = await adapter.resume(resumeRequest(request, first.agentId, "SECOND"));
+
+    await waitUntil(() => !processIsAlive(pid as number));
+    const events = await eventsThrough(adapter, resumed.agentId, (event) =>
+      event.type === "turn.completed" && event.data.turnId === resumed.turnId);
+    const completed = events.at(-1);
+    assert.equal(completed?.type === "turn.completed" ? completed.data.status : undefined, "completed");
+    assert.equal(completed?.type === "turn.completed" ? completed.data.finalText : undefined, "final 2");
+  } finally {
+    if (pid !== undefined && processIsAlive(pid)) process.kill(pid, "SIGKILL");
+    await adapter.closeAll();
+  }
+});
+
+test("resume fails with a retryable error when the previous process never closes", async () => {
+  const cwd = await realpath(await mkdtemp(path.join(os.tmpdir(), "copilot-adapter-never-closes-")));
+  const fake = fakeChild();
+  let spawns = 0;
+  const adapter = new CopilotAdapter({
+    spawnProcess: () => {
+      spawns += 1;
+      setImmediate(() => {
+        fake.emitLine({ type: "session.start", data: { sessionId: "fake-session" } });
+        fake.emitLine({ type: "result", sessionId: "fake-session", exitCode: 0 });
+      });
+      return fake.child;
+    },
+    initTimeoutMs: 2_000,
+    exitWaitMs: 50,
+    interruptGraceMs: 30,
+  });
+  const request = spawnRequest(cwd, "FIRST");
+  try {
+    const first = await adapter.spawn(request);
+    await eventsThrough(adapter, first.agentId, (event) => event.type === "turn.completed");
+
+    await assert.rejects(
+      () => adapter.resume(resumeRequest(request, first.agentId, "SECOND")),
+      (error: unknown) => {
+        if (!(error instanceof CopilotAdapterError)) return false;
+        assert.equal(error.details?.["retryable"], true);
+        assert.match(error.message, /retry the resume/i);
+        return true;
+      },
+    );
+    assert.equal(spawns, 1, "the second process is never launched");
+    assert.deepEqual(fake.signals, ["SIGTERM", "SIGKILL"]);
+  } finally {
+    fake.close();
+    await adapter.closeAll();
+  }
+});
+
 test("stop_agent interrupts the process group once, without reporting a process fault", async () => {
   const cwd = await realpath(await mkdtemp(path.join(os.tmpdir(), "copilot-adapter-interrupt-")));
   const adapter = fixtureAdapter();
@@ -203,6 +361,30 @@ test("stop_agent interrupts the process group once, without reporting a process 
     assert.equal(events.find((event) => event.type === "turn.completed")?.data.status, "interrupted");
     assert.ok(!events.some((event) => event.type === "error"), "a deliberate stop is not a process fault");
   } finally {
+    await adapter.closeAll();
+  }
+});
+
+test("interrupt SIGKILLs a child that emits a result but keeps running after SIGTERM", async () => {
+  const cwd = await realpath(await mkdtemp(path.join(os.tmpdir(), "copilot-adapter-sigterm-result-")));
+  const pidFile = path.join(cwd, "child.pid");
+  const adapter = fixtureAdapter({ COPILOT_FIXTURE_PID: pidFile });
+  let pid: number | undefined;
+  try {
+    const turn = await adapter.spawn(spawnRequest(cwd, "SIGTERM_RESULT"));
+    await waitUntil(() => existsSync(pidFile));
+    pid = Number(readFileSync(pidFile, "utf8"));
+    assert.ok(processIsAlive(pid), "the fixture starts alive");
+
+    await adapter.interrupt(turn.agentId);
+
+    // The result marked the turn terminal, but the process ignored SIGTERM: interrupt must kill it.
+    await waitUntil(() => !processIsAlive(pid as number));
+    const events = await eventsThrough(adapter, turn.agentId, (event) => event.type === "turn.completed");
+    assert.equal(events.filter((event) => event.type === "turn.completed").length, 1);
+    assert.equal(events.find((event) => event.type === "turn.completed")?.data.status, "interrupted");
+  } finally {
+    if (pid !== undefined && processIsAlive(pid)) process.kill(pid, "SIGKILL");
     await adapter.closeAll();
   }
 });

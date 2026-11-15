@@ -4,6 +4,7 @@ import { atom, read, update } from 'claude-code'
 import type { EngineInterface, On } from 'claude-code'
 
 import type { PanelAgent, PanelDiff, PanelEnsemble, PanelState } from '../types'
+import { desktopPane } from './desktop'
 import { BACKENDS, readDisabled, writeDisabled } from './policy'
 
 const PANE = 'subagent-mcp'
@@ -65,6 +66,19 @@ export function activityOf(a: PanelAgent): string {
   if (a.phase === 'thinking') return a.lastTool === undefined ? 'thinking' : `thinking, last ran ${a.lastTool}`
   return 'working'
 }
+
+// One glyph and theme color per state, so a row reads at a glance in every surface.
+const STATUS: Record<string, { glyph: string; color: string; label: string }> = {
+  running: { glyph: '●', color: 'claude', label: 'running' },
+  starting: { glyph: '◌', color: 'claude', label: 'starting' },
+  queued: { glyph: '◌', color: 'inactive', label: 'queued' },
+  pending: { glyph: '◌', color: 'inactive', label: 'pending' },
+  needs_approval: { glyph: '◆', color: 'permission', label: 'needs approval' },
+  completed: { glyph: '✓', color: 'success', label: 'completed' },
+  failed: { glyph: '✗', color: 'error', label: 'failed' },
+  interrupted: { glyph: '■', color: 'warning', label: 'interrupted' },
+}
+export const statusOf = (state: string) => STATUS[state] ?? { glyph: '·', color: 'inactive', label: state.replace(/_/g, ' ') }
 
 /** Splits a unified diff into one section per file (`diff --git` headers). */
 export function splitDiff(patch: string): { path: string; patch: string }[] {
@@ -142,8 +156,14 @@ function digest(d: Record<string, unknown>): string[] {
   return lines
 }
 
+// The project the session started in. Relative $.fs paths follow the session's current directory, which a
+// shell `cd` can move (into the mod folder, say), so project files are read by absolute path from here.
+let projectDir = ''
+const inProject = (path: string) => (projectDir === '' ? path : `${projectDir.replace(/\/$/, '')}/${path}`)
+
 /** Called from the one session.start hook in register.tsx. */
-export function declarePanelCommand($: EngineInterface) {
+export function declarePanelCommand($: EngineInterface, cwd?: string) {
+  if (cwd !== undefined && cwd !== '') projectDir = cwd
   return $.command.register({
     name: 'subagent-mcp',
     description: 'Open the subagent control panel (`widget` for the desktop app\'s small floating form)',
@@ -164,7 +184,7 @@ async function loadPolicy($: EngineInterface) {
     // keep what the file says
   }
   try {
-    file = readDisabled(await $.fs.read(MODELS_FILE)) ?? []
+    file = readDisabled(await $.fs.read(inProject(MODELS_FILE))) ?? []
   } catch {
     file = []
   }
@@ -219,7 +239,7 @@ export const registerPanel = (on: On) => {
         agents.sort((x, y) => Number(isRunning(y)) - Number(isRunning(x)))
         let latest: string | null = null
         try {
-          const cache = JSON.parse(await $.fs.read('.subagents/memory/update.json')) as { available?: boolean; latest?: string | null }
+          const cache = JSON.parse(await $.fs.read(inProject('.subagents/memory/update.json'))) as { available?: boolean; latest?: string | null }
           latest = cache.available === true && typeof cache.latest === 'string' ? cache.latest : null
         } catch {
           latest = null
@@ -278,6 +298,7 @@ export const registerPanel = (on: On) => {
     const selected = state.agents.find(a => a.id === state.selected)
     const running = state.agents.filter(isRunning)
     const openEnsembles = state.ensembles.filter(x => OPEN_ENSEMBLE.includes(x.status))
+    const glyph = (s: string) => <Text color={statusOf(s).color}>{statusOf(s).glyph}</Text>
 
     // The desktop app's minimized form: a glance, no keys (clicks may not reach a widget).
     if (e.props.placement === 'widget') {
@@ -288,14 +309,16 @@ export const registerPanel = (on: On) => {
             {running.length} running{waiting > 0 ? ` · ${waiting} need approval` : ''}{openEnsembles.length > 0 ? ` · ${openEnsembles.length} ensemble(s)` : ''}
           </Text>
           {running.slice(0, 4).map(a => (
-            <Text key={`w-${a.id}`} dimColor={a.state !== 'needs_approval'}>
-              {a.name}: {activityOf(a).slice(0, 48)}
-            </Text>
+            <Box key={`w-${a.id}`} gap={1}>
+              {glyph(a.state)}
+              <Text dimColor={a.state !== 'needs_approval'} wrap="truncate">{`${a.name}: ${activityOf(a)}`}</Text>
+            </Box>
           ))}
           {openEnsembles.slice(0, 2).map(x => (
-            <Text key={`we-${x.id}`} dimColor>
-              {x.name}: {x.members.filter(m => !RUNNING.includes(m.state) && m.state !== 'pending').length}/{x.members.length} settled
-            </Text>
+            <Box key={`we-${x.id}`} gap={1}>
+              <Text color="subtle">◇</Text>
+              <Text dimColor>{`${x.name}: ${x.members.filter(m => !RUNNING.includes(m.state) && m.state !== 'pending').length}/${x.members.length} settled`}</Text>
+            </Box>
           ))}
           {running.length === 0 && state.message !== '' && <Text dimColor>{state.message}</Text>}
         </Box>
@@ -337,27 +360,27 @@ export const registerPanel = (on: On) => {
       const page = (by: number) => update($, panel, s => (s.diff === null ? s : { ...s, diff: { ...s.diff, index: Math.min(s.diff.sections.length - 1, Math.max(0, s.diff.index + by)) } }))
       const back = () => update($, panel, s => ({ ...s, diff: null }))
       return (
-        <Box flexDirection="column">
-          <Box>
-            <Text bold>{d.agent}: {d.summary}</Text>
-          </Box>
-          <Box>
-            <Button key="diff-next" hotkey="j" plain onPress={() => page(1)}>next file</Button>
-            <Text>  </Text>
-            <Button key="diff-prev" hotkey="k" plain onPress={() => page(-1)}>prev file</Button>
-            <Text>  </Text>
-            <Button key="diff-back" hotkey="b" plain autoFocus onPress={back}>back</Button>
+        <Box flexDirection="column" gap={1}>
+          <Box flexDirection="column">
+            <Text bold>{`${d.agent} · changes`}</Text>
+            <Text dimColor>{d.summary}</Text>
           </Box>
           {section === undefined ? (
             <Text dimColor>No changes.</Text>
           ) : (
             <Box flexDirection="column">
-              <Text dimColor>
-                {section.path} ({d.index + 1}/{d.sections.length}){d.truncated ? ' · diff cut at the size limit' : ''}
-              </Text>
+              <Box gap={1}>
+                <Text color="suggestion" wrap="truncate-start">{section.path}</Text>
+                <Text dimColor>{`(${d.index + 1}/${d.sections.length})${d.truncated ? ' · diff cut at the size limit' : ''}`}</Text>
+              </Box>
               <Code key={`diff-${d.index}`} source={section.patch} path={section.path} format="diff" />
             </Box>
           )}
+          <Box gap={2} flexWrap="wrap">
+            <Button key="diff-back" hotkey="b" plain autoFocus onPress={back}>back</Button>
+            <Button key="diff-prev" hotkey="k" plain dimColor={d.index === 0} onPress={() => page(-1)}>prev file</Button>
+            <Button key="diff-next" hotkey="j" plain dimColor={d.index >= d.sections.length - 1} onPress={() => page(1)}>next file</Button>
+          </Box>
         </Box>
       )
     }
@@ -366,8 +389,8 @@ export const registerPanel = (on: On) => {
     if (c !== null && c.kind === 'message') {
       const agent = c.agent
       return (
-        <Box flexDirection="column">
-          <Text bold>Message {agent}</Text>
+        <Box flexDirection="column" borderStyle="round" borderColor="suggestion" paddingX={1} gap={1}>
+          <Text bold>{`Message ${agent}`}</Text>
           <Input
             key="message"
             autoFocus
@@ -378,7 +401,9 @@ export const registerPanel = (on: On) => {
               await run(`Message ${agent}`, 'send_message', { agent, prompt: text, run_in_background: true })
             }}
           />
-          <Button key="cancel" hotkey="n" plain onPress={() => say('Cancelled.')}>cancel</Button>
+          <Box>
+            <Button key="cancel" hotkey="n" plain dimColor onPress={() => say('Cancelled.')}>cancel</Button>
+          </Box>
         </Box>
       )
     }
@@ -395,13 +420,19 @@ export const registerPanel = (on: On) => {
         await handOff(updatePrompt(c.latest))
       }
       return (
-        <Box flexDirection="column">
+        <Box flexDirection="column" borderStyle="round" borderColor={c.kind === 'update' ? 'suggestion' : 'warning'} paddingX={1} gap={1}>
           <Text bold>{question}</Text>
-          <Box>
-            <Button key="yes" hotkey="y" plain onPress={yes}>yes</Button>
-            <Text>  </Text>
-            <Button key="no" hotkey="n" plain onPress={() => say('Cancelled.')}>no</Button>
-          </Box>
+          {e.surface === 'desktop' ? (
+            <Box gap="sm">
+              <Button key="yes" hotkey="y" variant="primary" onPress={yes}>{c.kind === 'update' ? 'Update' : c.kind === 'cleanup' ? 'Remove' : 'Stop'}</Button>
+              <Button key="no" hotkey="n" variant="secondary" onPress={() => say('Cancelled.')}>Cancel</Button>
+            </Box>
+          ) : (
+            <Box gap={2}>
+              <Button key="yes" hotkey="y" plain onPress={yes}>yes</Button>
+              <Button key="no" hotkey="n" plain onPress={() => say('Cancelled.')}>no</Button>
+            </Box>
+          )}
         </Box>
       )
     }
@@ -420,8 +451,6 @@ export const registerPanel = (on: On) => {
       return next === undefined ? undefined : select(next.id)
     }
     const pending = selected?.approval
-    const detailLines =
-      selected === undefined ? [] : pending === undefined ? state.detail : [`Waiting for approval: ${pending.tool} ${pending.command}`, ...state.detail]
     const decide = async (decision: 'allow' | 'allow_for_session' | 'deny') => {
       if (selected === undefined || pending === undefined) return
       const label = decision === 'deny' ? 'Denied' : decision === 'allow' ? 'Allowed' : 'Allowed for session'
@@ -449,135 +478,249 @@ export const registerPanel = (on: On) => {
       }
     }
     const toggle = async (backend: string) => {
-      if (state.locked.includes(backend)) return say(`${backend} is disabled by an environment variable; change it where the server starts`)
       try {
-        const text = await $.fs.read(MODELS_FILE)
+        const text = await $.fs.read(inProject(MODELS_FILE))
         const now = readDisabled(text)
         if (now === null) return say('disabledBackends in models.yaml is not a one-line list; edit it by hand')
+        // The file is the truth for what it lists: a backend it disables can always be turned back on here.
+        if (!now.includes(backend) && state.locked.includes(backend)) return say(`${backend} is disabled by an environment variable; change it where the server starts`)
         const next = now.includes(backend) ? now.filter(b => b !== backend) : [...now, backend]
         const edit = writeDisabled(text, next)
         if (!edit.ok) return say(edit.reason)
-        await $.fs.write(`${MODELS_FILE}.bak`, text)
-        await $.fs.write(MODELS_FILE, edit.text)
-        await loadPolicy($)
+        await $.fs.write(inProject(`${MODELS_FILE}.bak`), text)
+        await $.fs.write(inProject(MODELS_FILE), edit.text)
+        // Show the file's new list now; the server reloads models.yaml a moment after the write, so asking it
+        // straight away would still report the old list (and mark the backend env-locked). Ask again shortly.
+        await update($, panel, s => {
+          const locked = s.locked.filter(b => b !== backend)
+          return { ...s, disabled: [...new Set([...next, ...locked])], locked }
+        })
+        $.clock.after(1500, () => loadPolicy($))
         await say(`${backend} ${next.includes(backend) ? 'disabled' : 'enabled'} (models.yaml reloads live; previous copy in models.yaml.bak)`)
       } catch (error) {
         await say(`Could not change models.yaml: ${str((error as Error).message).slice(0, 80)} (is there a project .subagents/models.yaml? run i)`)
       }
     }
-    const row = (a: PanelAgent) => (
-      <Button key={`agent-${a.id}`} onPress={() => select(a.id)}>
-        {state.selected === a.id ? '> ' : '  '}
-        {a.name} <Text dimColor>{a.backend} {a.model} {a.state}{a.ensemble === undefined ? '' : ` [${a.ensemble}]`} {k(a.tokensIn)}in/{k(a.tokensOut)}out {ago(a.updated)}</Text>
-      </Button>
-    )
-    // Inline, the pane shows a window over the tree, so the key bar and message come first and the selected
-    // row's digest opens right under it; docked, the digest has its own column.
-    const list = (
-      <Box flexDirection="column">
-        {state.agents.length === 0 && <Text dimColor>No agents.</Text>}
-        {visible.map(a => (
-          <Box key={`g-${a.id}`} flexDirection="column">
-            {row(a)}
-            {isRunning(a) && <Text dimColor>{'    ' + activityOf(a)}</Text>}
-            {!wide && state.selected === a.id && detailLines.map((line, i) => <Text key={`d${i}`} dimColor>{'    ' + line}</Text>)}
+
+    if (e.surface === 'desktop') {
+      return desktopPane($.ui.resolve(e), {
+        state,
+        visible,
+        hidden,
+        selected,
+        running,
+        wide,
+        backends: BACKENDS,
+        isRunning,
+        activityOf,
+        statusOf,
+        k,
+        ago,
+        act: {
+          select,
+          move,
+          decide,
+          stop: a => ask({ kind: 'stop', agent: a.name }),
+          stopAll: () => ask({ kind: 'stopAll', names: running.map(a => a.name) }),
+          message: a => ask({ kind: 'message', agent: a.name }),
+          diff: showDiff,
+          cleanup: a => ask({ kind: 'cleanup', agent: a.name }),
+          init: () => handOff(INIT_PROMPT),
+          update: () => ask({ kind: 'update', latest: state.updateAvailable ?? '' }),
+          toggleAll: () => update($, panel, s => ({ ...s, showAll: !s.showAll })),
+          backend: toggle,
+        },
+      })
+    }
+
+    const heading = (text: string) => <Text bold dimColor size="caption">{text}</Text>
+
+    // One line per agent: marker, state glyph, name, then who runs it and how long ago it moved.
+    const row = (a: PanelAgent) => {
+      const isSelected = state.selected === a.id
+      const meta = [a.ensemble === undefined ? '' : a.ensemble, a.backend, a.model, ago(a.updated)].filter(Boolean).join(' · ')
+      return (
+        <Button key={`agent-${a.id}`} plain onPress={() => select(a.id)}>
+          <Text color="claude">{isSelected ? '▸ ' : '  '}</Text>
+          {glyph(a.state)}
+          <Text bold={isSelected}>{` ${a.name}`}</Text>
+          <Text dimColor>{`  ${meta}`}</Text>
+        </Button>
+      )
+    }
+
+    // The digest from get_agent_events: a stats line, then recent tools ("  tool target"), then "> message".
+    const header = state.detail[0]?.replace(/^[^:]*:\s*[^,]*,\s*/, '') ?? ''
+    const tools = state.detail.slice(1).filter(l => l.startsWith('  ')).map(l => l.trim())
+    const said = state.detail.find(l => l.startsWith('> '))?.slice(2) ?? ''
+
+    const card = (a: PanelAgent) => (
+      <Box key={`card-${a.id}`} flexDirection="column" borderStyle="round" borderColor={pending === undefined ? 'subtle' : 'permission'} paddingX={1} gap={1}>
+        <Box flexDirection="column">
+          <Box gap={1}>
+            <Text bold>{a.name}</Text>
+            <Text color={statusOf(a.state).color}>{`${statusOf(a.state).glyph} ${statusOf(a.state).label}`}</Text>
           </Box>
-        ))}
-      </Box>
-    )
-    const ensembleBlock = state.ensembles.length === 0 ? null : (
-      <Box flexDirection="column">
-        <Text bold>Ensembles</Text>
-        {state.ensembles.map(x => (
-          <Box key={`ens-${x.id}`} flexDirection="column">
-            <Text>
-              {'  '}{x.name} <Text dimColor>{x.status} {x.valid}/{x.of} valid</Text>
-            </Text>
-            <Text dimColor>
-              {'    ' + x.members.map(m => `${m.role}${m.name === undefined ? '' : ` (${m.name})`}: ${m.state}${m.valid === true ? ' ✓' : m.valid === false ? ' ✗' : ''}`).join(' · ')}
-            </Text>
+          <Text dimColor wrap="truncate">
+            {[`${a.backend} · ${a.model}`, `${k(a.tokensIn)} in / ${k(a.tokensOut)} out`, header, a.worktree === true ? 'worktree' : ''].filter(Boolean).join(' · ')}
+          </Text>
+        </Box>
+        {pending !== undefined && (
+          <Box flexDirection="column">
+            <Text color="permission">{`Waiting for approval: ${pending.tool} ${pending.command}`}</Text>
+            <Box gap={2} flexWrap="wrap">
+              <Button key="allow" hotkey="a" plain onPress={() => decide('allow')}>allow</Button>
+              <Button key="allow-session" hotkey="r" plain onPress={() => decide('allow_for_session')}>allow for session</Button>
+              <Button key="deny" hotkey="d" plain onPress={() => decide('deny')}>deny</Button>
+            </Box>
           </Box>
-        ))}
-      </Box>
-    )
-    const detail = (
-      <Box flexDirection="column">
-        {selected === undefined ? <Text dimColor>Select an agent.</Text> : detailLines.map((line, i) => <Text key={`d${i}`} dimColor={i > 0}>{line}</Text>)}
+        )}
+        {tools.length > 0 && (
+          <Box flexDirection="column">
+            {heading('RECENT TOOLS')}
+            {tools.map((t, i) => (
+              <Text key={`t${i}`} wrap="truncate">
+                <Text color="subtle">{'› '}</Text>
+                <Text mono>{t}</Text>
+              </Text>
+            ))}
+          </Box>
+        )}
+        {said !== '' && <Text italic dimColor>{`“${said}”`}</Text>}
+        <Box gap={2} flexWrap="wrap">
+          {isRunning(a) && <Button key="stop" hotkey="s" plain onPress={() => ask({ kind: 'stop', agent: a.name })}>stop</Button>}
+          <Button key="message" hotkey="m" plain onPress={() => ask({ kind: 'message', agent: a.name })}>message</Button>
+          {a.worktree === true && <Button key="diff" hotkey="v" plain onPress={() => showDiff(a)}>diff</Button>}
+          {!isRunning(a) && <Button key="cleanup" hotkey="w" plain dimColor onPress={() => ask({ kind: 'cleanup', agent: a.name })}>clean worktree</Button>}
+        </Box>
       </Box>
     )
 
-    return (
-      <Box flexDirection="column">
-        {!e.props.isFocused && (
-          <Text color="yellow">Keys go to the chat. Run /subagent-mcp again to use the panel.</Text>
-        )}
-        <Box>
-          {pending !== undefined && <Button key="allow" hotkey="a" plain onPress={() => decide('allow')}>allow</Button>}
-          {pending !== undefined && <Text>  </Text>}
-          {pending !== undefined && <Button key="allow-session" hotkey="r" plain onPress={() => decide('allow_for_session')}>allow for session</Button>}
-          {pending !== undefined && <Text>  </Text>}
-          {pending !== undefined && <Button key="deny" hotkey="d" plain onPress={() => decide('deny')}>deny</Button>}
-          {pending !== undefined && <Text>  </Text>}
-          {selected !== undefined && isRunning(selected) && (
-            <Button key="stop" hotkey="s" plain onPress={() => ask({ kind: 'stop', agent: selected.name })}>stop</Button>
-          )}
-          {selected !== undefined && isRunning(selected) && <Text>  </Text>}
-          {running.length > 0 && (
-            <Button key="stop-all" hotkey="x" plain onPress={() => ask({ kind: 'stopAll', names: running.map(a => a.name) })}>stop all</Button>
-          )}
-          {running.length > 0 && <Text>  </Text>}
-          {selected !== undefined && !isRunning(selected) && (
-            <Button key="cleanup" hotkey="w" plain onPress={() => ask({ kind: 'cleanup', agent: selected.name })}>clean worktree</Button>
-          )}
-          {selected !== undefined && !isRunning(selected) && <Text>  </Text>}
-          {selected?.worktree === true && <Button key="diff" hotkey="v" plain onPress={() => showDiff(selected)}>diff</Button>}
-          {selected?.worktree === true && <Text>  </Text>}
-          {selected !== undefined && <Button key="message" hotkey="m" plain onPress={() => ask({ kind: 'message', agent: selected.name })}>message</Button>}
-          {selected !== undefined && <Text>  </Text>}
-          <Button
-            key="init"
-            hotkey="i"
-            plain
-            onPress={() => handOff(INIT_PROMPT)}
-          >
-            init
-          </Button>
-          {state.updateAvailable !== null && <Text>  </Text>}
-          {state.updateAvailable !== null && (
-            <Button key="update" hotkey="u" plain onPress={() => ask({ kind: 'update', latest: state.updateAvailable ?? '' })}>
-              update to {state.updateAvailable}
-            </Button>
-          )}
-          <Text>  </Text>
-          <Button key="down" hotkey="j" plain onPress={() => move(1)}>next</Button>
-          <Text>  </Text>
-          <Button key="up" hotkey="k" plain onPress={() => move(-1)}>prev</Button>
-        </Box>
-        <Box>
-          {BACKENDS.map((b, i) => (
-            <Box key={`be-${b}`}>
-              <Button key={`backend-${b}`} hotkey={String(i + 1)} plain onPress={() => toggle(b)}>
-                {`${b} ${state.disabled.includes(b) ? (state.locked.includes(b) ? 'OFF (env)' : 'OFF') : 'on'}`}
-              </Button>
-              <Text>  </Text>
+    const group = (title: string, agents: PanelAgent[]) =>
+      agents.length === 0 ? null : (
+        <Box key={`grp-${title}`} flexDirection="column">
+          {heading(title)}
+          {agents.map(a => (
+            <Box key={`g-${a.id}`} flexDirection="column">
+              {row(a)}
+              {isRunning(a) && (
+                <Box paddingLeft={4}>
+                  <Text color={a.state === 'needs_approval' ? 'permission' : undefined} dimColor={a.state !== 'needs_approval'} wrap="truncate">{activityOf(a)}</Text>
+                </Box>
+              )}
+              {!wide && state.selected === a.id && <Box paddingLeft={2} marginY={1}>{card(a)}</Box>}
             </Box>
           ))}
         </Box>
-        {state.message !== '' && <Text dimColor>{state.message}</Text>}
-        {wide ? (
+      )
+
+    // Inline, the pane shows a window over the tree, so the selected agent's card opens right under its row;
+    // docked wide, the card has its own column.
+    const list = (
+      <Box flexDirection="column" gap={1}>
+        {state.agents.length === 0 && <Text dimColor>No agents yet. Spawned agents show up here.</Text>}
+        {group('RUNNING', visible.filter(isRunning))}
+        {group('RECENT', visible.filter(a => !isRunning(a)))}
+        {(hidden > 0 || state.showAll) && (
           <Box>
-            <Box flexDirection="column" width={Math.floor(e.props.bodyColumns / 2)}>{list}</Box>
-            <Box flexDirection="column">{detail}</Box>
+            <Button key="all" hotkey="l" plain dimColor onPress={() => update($, panel, s => ({ ...s, showAll: !s.showAll }))}>
+              {state.showAll ? 'show recent only' : `show ${hidden} older`}
+            </Button>
+          </Box>
+        )}
+      </Box>
+    )
+
+    const ensembleBlock = state.ensembles.length === 0 ? null : (
+      <Box flexDirection="column">
+        {heading('ENSEMBLES')}
+        {state.ensembles.map(x => (
+          <Box key={`ens-${x.id}`} flexDirection="column">
+            <Box gap={1}>
+              <Text color="subtle">◇</Text>
+              <Text bold>{x.name}</Text>
+              <Text dimColor>{`${x.status} · ${x.valid}/${x.of} valid`}</Text>
+            </Box>
+            {x.members.map((m, i) => (
+              <Box key={`m${i}`} paddingLeft={2} gap={1}>
+                {glyph(m.state)}
+                <Text>{`${m.role}${m.name === undefined ? '' : ` (${m.name})`}`}</Text>
+                <Text dimColor>{statusOf(m.state).label}</Text>
+                {m.valid === true && <Text color="success">valid</Text>}
+                {m.valid === false && <Text color="error">invalid</Text>}
+              </Box>
+            ))}
+          </Box>
+        ))}
+      </Box>
+    )
+
+    const waiting = state.agents.filter(a => a.state === 'needs_approval').length
+    const done = state.agents.filter(a => a.state === 'completed').length
+    const failed = state.agents.filter(a => a.state === 'failed').length
+    const problem = state.message.startsWith('subagent-mcp is not') || / failed|Could not/.test(state.message)
+
+    return (
+      <Box flexDirection="column" gap={1}>
+        {!e.props.isFocused && <Text color="warning">Keys go to the chat. Run /subagent-mcp again to use the panel.</Text>}
+        <Box justifyContent="space-between" flexWrap="wrap" columnGap={2}>
+          <Box gap={2}>
+            <Text>
+              <Text color="claude">●</Text>
+              {` ${running.length - waiting} running`}
+            </Text>
+            {waiting > 0 && (
+              <Text color="permission">{`◆ ${waiting} waiting`}</Text>
+            )}
+            <Text dimColor>
+              <Text color="success">✓</Text>
+              {` ${done} done`}
+            </Text>
+            {failed > 0 && <Text color="error">{`✗ ${failed} failed`}</Text>}
+          </Box>
+          {state.updateAvailable !== null && (
+            <Button key="update" hotkey="u" plain onPress={() => ask({ kind: 'update', latest: state.updateAvailable ?? '' })}>
+              {`update to ${state.updateAvailable}`}
+            </Button>
+          )}
+        </Box>
+        {state.message !== '' && (
+          <Text color={problem ? 'error' : undefined} dimColor={!problem} wrap="wrap">{state.message}</Text>
+        )}
+        {wide ? (
+          <Box gap={2}>
+            <Box flexDirection="column" width={Math.floor(e.props.bodyColumns * 0.45)}>{list}</Box>
+            <Box flexDirection="column" flexGrow={1}>
+              {selected === undefined ? <Text dimColor>Select an agent.</Text> : card(selected)}
+            </Box>
           </Box>
         ) : (
           list
         )}
         {ensembleBlock}
-        {(hidden > 0 || state.showAll) && (
-          <Button key="all" hotkey="l" plain onPress={() => update($, panel, s => ({ ...s, showAll: !s.showAll }))}>
-            {state.showAll ? 'show recent only' : `show ${hidden} older`}
-          </Button>
-        )}
+        <Box flexDirection="column">
+          <Text bold dimColor size="caption">BACKENDS</Text>
+          <Box columnGap={2} flexWrap="wrap">
+            {BACKENDS.map((b, i) => {
+              const off = state.disabled.includes(b)
+              return (
+                <Button key={`backend-${b}`} hotkey={String(i + 1)} plain dimColor={off} onPress={() => toggle(b)}>
+                  <Text color={off ? 'inactive' : 'success'}>{off ? '○ ' : '● '}</Text>
+                  <Text strikethrough={off}>{b}</Text>
+                  {off && <Text dimColor>{state.locked.includes(b) ? ' off (env)' : ' off'}</Text>}
+                </Button>
+              )
+            })}
+          </Box>
+        </Box>
+        <Box columnGap={2} flexWrap="wrap">
+          <Button key="down" hotkey="j" plain dimColor onPress={() => move(1)}>next</Button>
+          <Button key="up" hotkey="k" plain dimColor onPress={() => move(-1)}>prev</Button>
+          {running.length > 0 && (
+            <Button key="stop-all" hotkey="x" plain dimColor onPress={() => ask({ kind: 'stopAll', names: running.map(a => a.name) })}>stop all</Button>
+          )}
+          <Button key="init" hotkey="i" plain dimColor onPress={() => handOff(INIT_PROMPT)}>init</Button>
+        </Box>
       </Box>
     )
   })

@@ -12,6 +12,7 @@ import { ConfigRegistry } from "../src/config/registry.js";
 import type { AgentConfig } from "../src/config/schema.js";
 import { aggregate } from "../src/ensemble/aggregators.js";
 import { fitToBudget } from "../src/ensemble/budget.js";
+import { resolveSpec } from "../src/ensemble/config.js";
 import { EnsembleManager } from "../src/ensemble/manager.js";
 import { applySnapshot, createWorktree, snapshotWorkingTree } from "../src/execution.js";
 import { RoutingHistory } from "../src/routing/history.js";
@@ -406,4 +407,52 @@ test("applySnapshot handles a deleted file replaced by a directory, and flags su
   const tree = await createWorktree(repository, snapshot.base);
   await applySnapshot(tree, snapshot);
   assert.equal(await readFile(join(tree.path, "sp ace.txt", "x"), "utf8"), "inside\n");
+});
+
+// ---------------------------------------------------------------- review fixes (#16)
+
+test("pipeline: members without depends_on follow the one before; an explicit depends_on replaces that link", () => {
+  const spec = resolveSpec({ task: "t", mode: "pipeline", agents: [
+    { role: "a", config: "codex-general", model: "sol" },
+    { role: "b", config: "codex-general", model: "sol", depends_on: ["a"] },
+    { role: "c", config: "codex-general", model: "sol" },
+    { role: "d", config: "codex-general", model: "sol", depends_on: ["a"] },
+  ] }, new Map());
+  assert.deepEqual(spec.agents.map((agent) => agent.depends_on), [undefined, ["a"], ["b"], ["a"]]);
+  assert.throws(() => resolveSpec({ task: "t", mode: "pipeline", agents: [
+    { role: "a", config: "codex-general", model: "sol", on_dependency_failure: "continue" },
+    { role: "b", config: "codex-general", model: "sol" },
+  ] }, new Map()), /a: on_dependency_failure needs depends_on/);
+});
+
+test("the missing-cost warning waits for a member to settle without a cost", async () => {
+  const f = await fixture();
+  const started = await f.manager.start({ task: "t", agents: roster.slice(0, 2), budget: { max_cost_usd: 5 } });
+  const id = String(started.ensemble_id);
+  const warnings = async () => ((await f.manager.get({ ensemble: id })).warnings as string[] | undefined) ?? [];
+  assert.ok(!(await warnings()).some((warning) => /report no cost/.test(warning)), "nothing has reported yet");
+  const view = await members(f.manager, id);
+  complete(f.codex, view.members[0]!.agent_id, "one", "completed", { inputTokens: 1, outputTokens: 1, costUsd: 0.01 });
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  assert.ok(!(await warnings()).some((warning) => /report no cost/.test(warning)), "the settled member reported its cost");
+  complete(f.opencode, view.members[1]!.agent_id, "two", "completed", { inputTokens: 1, outputTokens: 1 });
+  await until(() => f.events.length === 1);
+  assert.ok((await warnings()).some((warning) => /report no cost/.test(warning)), "a member settled without a cost");
+});
+
+test("a budget reached while the synthesizer runs stops it; the deterministic aggregate stands", async () => {
+  const f = await fixture();
+  const started = await f.manager.start({
+    task: "t", agents: roster.slice(0, 1), budget: { max_total_tokens: 100 },
+    aggregation: { synthesize: { config: "codex-general", model: "luna" } },
+  });
+  const id = String(started.ensemble_id);
+  complete(f.codex, (await members(f.manager, id)).members[0]!.agent_id, "result", "completed", { inputTokens: 10, outputTokens: 5 });
+  await until(() => f.codex.spawnRequests.length === 2);
+  const synth = (await members(f.manager, id)).synthesis!;
+  f.codex.emit(synth.agent_id!, "usage.updated", { usage: { inputTokens: 500, outputTokens: 0 } });
+  await until(() => f.events.length === 1);
+  const synthesis = (f.events[0]!.summary as Record<string, unknown>).synthesis as Record<string, unknown>;
+  assert.equal(synthesis.reason, "budget reached");
+  assert.equal(synthesis.fallback, "deterministic aggregate");
 });

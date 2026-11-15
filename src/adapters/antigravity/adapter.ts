@@ -48,6 +48,16 @@ interface Deferred<T> {
   settled: boolean;
 }
 
+interface DeniedTool {
+  readonly toolName: string;
+  readonly errorMessage?: string;
+}
+
+interface DeniedAction {
+  readonly action: string;
+  readonly displayName?: string;
+}
+
 interface AntigravityTurn {
   readonly id: string;
   terminal: boolean;
@@ -55,6 +65,8 @@ interface AntigravityTurn {
   timedOut: boolean;
   timeout?: NodeJS.Timeout;
   interruptPromise?: Promise<void>;
+  /** Reset with each new turn; a tool step can report a denial before the result does. */
+  readonly deniedTools: DeniedTool[];
 }
 
 interface AntigravitySession {
@@ -373,7 +385,13 @@ export class AntigravityAdapter implements BackendAdapter {
     const error = isRecord(toolInfo.error) ? toolInfo.error : undefined;
     const status = error === undefined && step.state === "DONE" ? "completed"
       : isPermissionDenial(error) ? "denied" : "failed";
-    const output = toolInfo.output ?? error;
+    if (status === "denied") {
+      session.currentTurn.deniedTools.push({
+        toolName,
+        ...(typeof error?.message === "string" ? { errorMessage: error.message } : {}),
+      });
+    }
+    const output = toolEndOutput(status, toolInfo, error);
     this.#emit(session, "tool.end", {
       toolCallId,
       toolName,
@@ -402,7 +420,7 @@ export class AntigravityAdapter implements BackendAdapter {
     const response = typeof result.response === "string" ? scanChildOutput(result.response) : undefined;
     // Headless agy auto-denies actions no permissions.allow rule covers. The result still says
     // SUCCESS, often with an empty response, so name the denied actions instead of returning nothing.
-    const denied = deniedActions(result);
+    const denied = deniedActions(result, session.currentTurn.deniedTools);
     let outcome: "completed" | "interrupted" | "failed" = normalized;
     let finalText = response;
     if (denied.length > 0) {
@@ -411,6 +429,7 @@ export class AntigravityAdapter implements BackendAdapter {
         code: "ANTIGRAVITY_PERMISSION_DENIED",
         message,
         fatal: false,
+        persists: true,
         details: { deniedActions: denied },
       });
       if (response === undefined || response.trim() === "") {
@@ -605,7 +624,7 @@ function requireAgentName(value: string | undefined): string {
 }
 
 function newTurn(id: string): AntigravityTurn {
-  return { id, terminal: false, interruptRequested: false, timedOut: false };
+  return { id, terminal: false, interruptRequested: false, timedOut: false, deniedTools: [] };
 }
 
 function deferred<T>(): Deferred<T> {
@@ -623,18 +642,63 @@ function isPermissionDenial(error: Readonly<Record<string, unknown>> | undefined
   return typeof error?.message === "string" && /permission check failed|denied permission/i.test(error.message);
 }
 
-function deniedActions(result: Readonly<Record<string, unknown>>): { action: string; displayName?: string }[] {
-  if (!Array.isArray(result.denied_actions)) return [];
-  return result.denied_actions.filter(isRecord).flatMap((entry) => typeof entry.action === "string"
-    ? [{ action: entry.action, ...(typeof entry.display_name === "string" ? { displayName: entry.display_name } : {}) }]
-    : []);
+function deniedActions(
+  result: Readonly<Record<string, unknown>>,
+  stepDenials: readonly DeniedTool[],
+): DeniedAction[] {
+  const entries = Array.isArray(result.denied_actions) ? result.denied_actions.filter(isRecord) : [];
+  // The result can omit denied_actions entirely, or carry entries without an action. Fall back to
+  // the tool step that already reported the denial so the parent still learns what was blocked.
+  if (entries.length === 0) {
+    return stepDenials.map((denial) => ({ action: ruleActionForTool(denial.toolName) }));
+  }
+  const denied = new Map<string, DeniedAction>();
+  entries.forEach((entry, index) => {
+    const displayName = nonEmptyString(entry.display_name);
+    const stepError = nonEmptyString(stepDenials[index]?.errorMessage);
+    const action = nonEmptyString(entry.action)
+      ?? displayName
+      ?? (stepError === undefined ? undefined : scanChildOutput(stepError))
+      ?? "tool";
+    denied.set(action, { action, ...(displayName === undefined ? {} : { displayName }) });
+  });
+  return [...denied.values()];
 }
 
-function deniedActionsMessage(denied: readonly { action: string; displayName?: string }[]): string {
-  const names = denied.map((entry) => entry.displayName === undefined ? entry.action : `${entry.action} (${entry.displayName})`);
-  const rules = [...new Set(denied.map((entry) => `${entry.action}(...)`))].join(", ");
-  return `Antigravity headless mode auto-denied: ${names.join(", ")}. Headless runs cannot ask for approval; `
-    + `add allow rules such as ${rules} under permissions.allow in ~/.gemini/antigravity-cli/settings.json.`;
+/** agy's rule syntax names commands as `command(...)`; the tool step calls it `run_command`. */
+function ruleActionForTool(toolName: string): string {
+  if (toolName === "run_command") return "command";
+  if (toolName.startsWith("run_") && toolName.length > "run_".length) return toolName.slice("run_".length);
+  return toolName === "" ? "tool" : toolName;
+}
+
+function deniedActionsMessage(denied: readonly DeniedAction[]): string {
+  const names = denied.map((entry) => entry.displayName === undefined || entry.displayName === entry.action
+    ? entry.action
+    : `${entry.action} (${entry.displayName})`);
+  return `Antigravity headless mode auto-denied: ${names.join(", ")}. Headless runs cannot ask for approval. `
+    + `To allow only a specific action, add a narrow allow rule under permissions.allow in `
+    + `~/.gemini/antigravity-cli/settings.json; for example "command(git)" allows only git commands, `
+    + `while a broad wildcard such as "command(*)" grants every command. Keep dangerous commands blocked `
+    + `with a deny rule such as "command(sudo)" under permissions.deny.`;
+}
+
+function toolEndOutput(
+  status: "completed" | "failed" | "denied",
+  toolInfo: Readonly<Record<string, unknown>>,
+  error: Readonly<Record<string, unknown>> | undefined,
+): unknown {
+  if (status === "completed" || error === undefined) return toolInfo.output;
+  // Keep a partial or empty output but also carry the reason, so a failed/denied tool does not lose
+  // its error when `output` is "" or truncated. Error text gets the same hygiene as other child text.
+  return {
+    ...(toolInfo.output === undefined ? {} : { output: toolInfo.output }),
+    error: typeof error.message === "string" ? { ...error, message: scanChildOutput(error.message) } : error,
+  };
+}
+
+function nonEmptyString(value: unknown): string | undefined {
+  return typeof value === "string" && value.trim() !== "" ? value : undefined;
 }
 
 function extractUsage(result: Readonly<Record<string, unknown>>): Usage | undefined {

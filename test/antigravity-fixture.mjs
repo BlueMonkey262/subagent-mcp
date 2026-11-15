@@ -17,6 +17,17 @@ function send(value) {
   process.stdout.write(`${JSON.stringify(value)}\n`);
 }
 
+function sendDeniedStep(index) {
+  const tool = { name: "run_command", parameters: { CommandLine: "date" } };
+  send({ event: "step_update", step_update: {
+    conversation_id: conversationId, step_index: index, step_type: "tool", state: "ACTIVE", tool_name: "run_command", tool_info: tool,
+  } });
+  send({ event: "step_update", step_update: {
+    conversation_id: conversationId, step_index: index, step_type: "tool", state: "ERROR", tool_name: "run_command",
+    tool_info: { ...tool, error: { type: "TOOL_ERROR", message: "permission check failed for unsandboxed \"date\": user denied permission to run command:\ndate" } },
+  } });
+}
+
 send({ event: "init", conversation_id: conversationId, init: { cwd: process.cwd(), permission_mode: "request-review" } });
 
 // Keep the fixture alive when the test runner has not yet written a prompt.
@@ -28,7 +39,7 @@ lines.on("line", (line) => {
   const message = JSON.parse(line);
   if (message.event !== "user") return;
   const prompt = String(message.message?.content ?? "");
-  if (prompt.includes("MALFORMED")) {
+  if (prompt.includes("MALFORMED") && !prompt.includes("DENIED")) {
     process.stdout.write("not-json\n");
     return;
   }
@@ -37,24 +48,58 @@ lines.on("line", (line) => {
     return;
   }
   if (prompt.includes("HANG")) return;
-  if (prompt.includes("DENIED")) {
-    // Live agy 1.2.x shape for a headless auto-denial: the tool step ends in ERROR and the result
-    // still says SUCCESS, with denied_actions and (when the model stops there) an empty response.
+  if (prompt.includes("TOOL_FAIL")) {
     step += 1;
     const index = step * 10;
-    const tool = { name: "run_command", parameters: { CommandLine: "date" } };
+    const tool = { name: "run_command", parameters: { CommandLine: "false" } };
     send({ event: "step_update", step_update: {
       conversation_id: conversationId, step_index: index, step_type: "tool", state: "ACTIVE", tool_name: "run_command", tool_info: tool,
     } });
     send({ event: "step_update", step_update: {
       conversation_id: conversationId, step_index: index, step_type: "tool", state: "ERROR", tool_name: "run_command",
-      tool_info: { ...tool, error: { type: "TOOL_ERROR", message: "permission check failed for unsandboxed \"date\": user denied permission to run command:\ndate" } },
+      tool_info: { ...tool, output: "", error: { type: "TOOL_ERROR", message: "exit status 1" } },
     } });
-    const explained = prompt.includes("EXPLAINED");
     send({ event: "result", result: {
-      conversation_id: conversationId, status: "SUCCESS", response: explained ? "I could not run date: permission denied." : "",
+      conversation_id: conversationId, status: "SUCCESS", response: "The command failed.",
       usage: { input_tokens: 3, output_tokens: 1, cache_read_tokens: 0, total_tokens: 4 },
-      denied_actions: [{ action: "command", display_name: "RunCommand" }],
+    } });
+    return;
+  }
+  if (prompt.includes("ERROR_OUTPUT")) {
+    step += 1;
+    const index = step * 10;
+    const tool = { name: "write_file", parameters: { Path: "notes.txt" } };
+    send({ event: "step_update", step_update: {
+      conversation_id: conversationId, step_index: index, step_type: "tool", state: "ACTIVE", tool_name: "write_file", tool_info: tool,
+    } });
+    send({ event: "step_update", step_update: {
+      conversation_id: conversationId, step_index: index, step_type: "tool", state: "ERROR", tool_name: "write_file",
+      tool_info: { ...tool, output: "", error: { type: "TOOL_ERROR", message: "disk full while writing notes.txt" } },
+    } });
+    send({ event: "result", result: {
+      conversation_id: conversationId, status: "SUCCESS", response: "I could not write the file.",
+      usage: { input_tokens: 3, output_tokens: 1, cache_read_tokens: 0, total_tokens: 4 },
+    } });
+    return;
+  }
+  if (prompt.includes("DENIED")) {
+    // Live agy 1.2.x shape for a headless auto-denial: the tool step ends in ERROR and the result
+    // still says SUCCESS, with denied_actions and (when the model stops there) an empty response.
+    step += 1;
+    const index = step * 10;
+    sendDeniedStep(index);
+    const explained = prompt.includes("EXPLAINED");
+    const whitespace = prompt.includes("WHITESPACE");
+    let deniedActions;
+    if (prompt.includes("NO_ACTIONS")) deniedActions = undefined;
+    else if (prompt.includes("MALFORMED")) deniedActions = [{ display_name: "RunCommand" }];
+    else if (prompt.includes("NO_ACTION")) deniedActions = [{}];
+    else deniedActions = [{ action: "command", display_name: "RunCommand" }];
+    send({ event: "result", result: {
+      conversation_id: conversationId, status: "SUCCESS",
+      response: whitespace ? " \n\t " : explained ? "I could not run date: permission denied." : "",
+      usage: { input_tokens: 3, output_tokens: 1, cache_read_tokens: 0, total_tokens: 4 },
+      ...(deniedActions === undefined ? {} : { denied_actions: deniedActions }),
     } });
     return;
   }

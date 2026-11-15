@@ -31,6 +31,12 @@ export type NormalizedEventData = {
     readonly code: string;
     readonly message: string;
     readonly fatal: boolean;
+    /**
+     * Set when the error describes how a successful turn went (for example actions that were denied),
+     * so it stays on the agent after the turn completes. Other non-fatal errors, such as a rate limit
+     * the backend retried past, are dropped when the turn completes successfully.
+     */
+    readonly persists?: boolean;
     readonly details?: Readonly<Record<string, unknown>>;
   };
 };

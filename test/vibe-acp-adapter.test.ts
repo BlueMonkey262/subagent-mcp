@@ -368,3 +368,24 @@ test("supervisor: an approval parked when the turn times out is settled, not lef
     await vibe.closeAll();
   }
 });
+
+test("deny * covers every Vibe built-in tool, and a glob may use Vibe's own names", () => {
+  const all = vibeAcpToolEnv(["*"]);
+  for (const tool of ["RUN_TYPESCRIPT", "SKILL", "SEARCH_TOOL_FUNCTIONS", "READ_FILE", "GREP"]) {
+    assert.equal(all[`VIBE_TOOLS__${tool}__PERMISSION`], "ask", `${tool} asks under deny *`);
+  }
+  assert.equal(vibeAcpToolEnv(["run_*"]).VIBE_TOOLS__RUN_TYPESCRIPT__PERMISSION, "ask");
+  assert.equal(vibeAcpToolEnv(["Read*"]).VIBE_TOOLS__READ_FILE__PERMISSION, "ask");
+});
+
+test("closeAll() kills a vibe-acp process that is still starting", async () => {
+  const dir = await tempDir("close");
+  // A process that never answers initialize, so the spawn stays inside session setup.
+  const adapter = new VibeAcpAdapter({ executable: process.execPath, executableArgs: ["-e", "setInterval(() => {}, 1000)"], startupTimeoutMs: 20_000 });
+  const started = Date.now();
+  const spawn = adapter.spawn(request(dir, "hello"));
+  await new Promise((resolve) => setTimeout(resolve, 200));
+  await adapter.closeAll();
+  await assert.rejects(spawn, /could not start a session/);
+  assert.ok(Date.now() - started < 10_000, "the spawn ended with closeAll, not at the startup timeout");
+});

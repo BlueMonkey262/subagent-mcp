@@ -244,8 +244,8 @@ export const TOOL_CATALOG: readonly ToolDefinition[] = [
       "aggregated result instead of per-agent reports. Each member is an ordinary spawn under the same config, " +
       "model-policy and permission checks; all members are validated before any launches. `task` is shared; a " +
       "member's `instructions` add to it. Modes: parallel; specialist (instructions required); competitive (each " +
-      "member in its own worktree); pipeline (each member gets the previous one's successful result; `depends_on` " +
-      "sets it explicitly, and on_dependency_failure: continue passes failures on too). isolation: none | worktree " +
+      "member in its own worktree); pipeline (each member gets the previous one's successful result; a member's `depends_on` " +
+      "replaces that link, and on_dependency_failure: continue passes failures on too). isolation: none | worktree " +
       "(at HEAD) | snapshot (own worktree holding the current working tree, uncommitted changes included; best for " +
       "reviews). A member may give `select` instead of config/model, or `selection.count` adds members: models are " +
       "picked from the roster by category, objective, routing profiles, measured history and quota, never past " +

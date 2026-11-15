@@ -505,6 +505,49 @@ test("sendMessage queues while an agent is busy and delivers it once the current
   assert.equal(final?.["queued"], undefined);
 });
 
+test("a queued resume clears the previous turn's non-fatal error", async () => {
+  const adapter = new FakeAdapter("codex");
+  const supervisor = new Supervisor({
+    registry: testRegistry([codexAgentConfig()]),
+    adapters: new AdapterRegistry([adapter]),
+    cwd: "/work",
+  });
+
+  const spawned = await supervisor.spawnAgent({
+    agent: "general",
+    prompt: "first turn",
+    description: "queued error reset",
+    run_in_background: true,
+  });
+  const agentId = spawned["agent_id"] as string;
+  await waitUntil(() => supervisor.listAgents().some((agent) => agent["agent_id"] === agentId && agent["state"] === "running"));
+  await supervisor.sendMessage({ agent: agentId, prompt: "second turn", run_in_background: true });
+
+  adapter.queueScript([{
+    create: (context) => ({
+      type: "turn.completed",
+      agentId: context.agentId,
+      backend: context.backend,
+      data: { turnId: context.turnId, status: "completed" as const, finalText: "second turn done" },
+    }),
+  }]);
+
+  // A non-fatal error on turn 1 sticks to record.lastError unless the queued resume clears it.
+  adapter.emit(agentId, "error", {
+    code: "ANTIGRAVITY_PERMISSION_DENIED",
+    message: "Antigravity headless mode auto-denied: command (RunCommand)",
+    fatal: false,
+  });
+  adapter.emit(agentId, "turn.completed", { turnId: "first-turn", status: "completed", finalText: "first turn done" });
+
+  await waitUntil(() => adapter.resumeRequests.length === 1);
+  await waitUntil(() => supervisor.listAgents().some((agent) => agent["agent_id"] === agentId && agent["state"] === "completed"));
+
+  const result = supervisor.getAgentResult(agentId) as { error?: { code: string }; result?: string };
+  assert.equal(result.error, undefined, "the successful queued turn must not inherit turn 1's denial");
+  assert.equal(result.result, "second turn done");
+});
+
 test("a completed background agent frees its capacity slot (no leak past MAX_CONCURRENT_AGENTS)", async () => {
   const adapter = new FakeAdapter("codex");
   const supervisor = new Supervisor({
@@ -1302,4 +1345,25 @@ test("the block is re-checked when a queued message is delivered and when a spaw
   assert.match(String(await waiting), /blocked in subagent-mcp/, "the waiting spawn is refused once it gets the slot");
   assert.equal(claude.spawnRequests.length, 1);
   assert.equal(supervisor.concurrency().active, 0, "the refused spawn released its slot");
+});
+
+test("a non-fatal error the turn recovers from is dropped on success; one that persists, or a failed turn, keeps it", async () => {
+  const adapter = new FakeAdapter("codex");
+  const supervisor = new Supervisor({
+    registry: testRegistry([codexAgentConfig()]),
+    adapters: new AdapterRegistry([adapter]),
+    cwd: "/work",
+  });
+  const run = async (error: { code: string; persists?: boolean }, status: "completed" | "failed") => {
+    const spawned = await supervisor.spawnAgent({ agent: "general", prompt: "p", description: "d", run_in_background: true });
+    const agentId = spawned["agent_id"] as string;
+    await waitUntil(() => supervisor.listAgents().some((agent) => agent["agent_id"] === agentId && agent["state"] === "running"));
+    adapter.emit(agentId, "error", { code: error.code, message: "m", fatal: false, ...(error.persists ? { persists: true } : {}) });
+    adapter.emit(agentId, "turn.completed", { turnId: `${agentId}-t`, status, finalText: "done" });
+    await waitUntil(() => supervisor.listAgents().some((agent) => agent["agent_id"] === agentId && agent["state"] === status));
+    return (supervisor.getAgentResult(agentId) as { error?: { code: string } }).error?.code;
+  };
+  assert.equal(await run({ code: "OPENCODE_RATE_LIMITED" }, "completed"), undefined, "a retried rate limit is not the outcome");
+  assert.equal(await run({ code: "ANTIGRAVITY_PERMISSION_DENIED", persists: true }, "completed"), "ANTIGRAVITY_PERMISSION_DENIED");
+  assert.equal(await run({ code: "OPENCODE_PROVIDER_ERROR" }, "failed"), "OPENCODE_PROVIDER_ERROR");
 });
