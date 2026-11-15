@@ -45,7 +45,9 @@ coverage only.
 
 Agents live in `.subagents/<name>.md` (frontmatter + system prompt) and the model roster in
 `.subagents/models.yaml`, in the project you run Claude Code from. If a project has none, the server
-uses the examples bundled in this repo's `.subagents/`.
+uses the agent configs bundled in this repo's `.subagents/` and this repo's own `.subagents/models.yaml`,
+or `.subagents/models.yaml.example` when that doesn't exist either. `models.yaml` is gitignored here: it is
+your config, and the example is the documented starting point.
 
 ## Tools
 

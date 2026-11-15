@@ -58,8 +58,8 @@ If you already have a `statusLine`, decide whether to replace it or skip this st
 ## 5. Configure agents and models
 
 Without a `.subagents/` directory in your project, the server uses the examples bundled in this repo.
-To customize, copy `<repo>/.subagents` into your project and edit `models.yaml` so it lists the models
-you actually have access to (`agent --list-models`, `opencode models`, and so on). Changes under
+To customize, copy `<repo>/.subagents` into your project, rename `models.yaml.example` to `models.yaml`
+and edit it so it lists the models you actually have access to (`agent --list-models`, `opencode models`, and so on). Changes under
 `.subagents/` hot-reload.
 
 Antigravity (`agy`) agents carry their system prompt in an `agy` custom agent, not in the

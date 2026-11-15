@@ -15,8 +15,13 @@ if [[ ! -f "$ROOT/dist/src/server.js" ]]; then
     exit 1
 fi
 
+# The install's own models.yaml (gitignored, the person's config) wins over the bundled example.
 if [[ -z "${SUBAGENT_MCP_MODELS_FILE:-}" && ! -f "$PWD/.subagents/models.yaml" ]]; then
-    export SUBAGENT_MCP_MODELS_FILE="$ROOT/.subagents/models.yaml"
+    if [[ -f "$ROOT/.subagents/models.yaml" ]]; then
+        export SUBAGENT_MCP_MODELS_FILE="$ROOT/.subagents/models.yaml"
+    else
+        export SUBAGENT_MCP_MODELS_FILE="$ROOT/.subagents/models.yaml.example"
+    fi
 fi
 if [[ -z "${SUBAGENT_MCP_AGENTS_DIR:-}" && ! -d "$PWD/.subagents" ]]; then
     export SUBAGENT_MCP_AGENTS_DIR="$ROOT/.subagents"

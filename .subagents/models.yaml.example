@@ -1,0 +1,82 @@
+# Example model roster for subagent-mcp.
+#
+# Copy this file to `.subagents/models.yaml` in your project (or in this repo, to change the fallback
+# roster used by projects that have none) and keep only the models you actually have access to.
+# `models.yaml` is gitignored here: it is your own config. When no `models.yaml` exists, the server
+# uses this example as-is.
+#
+# Model ids must be what each CLI accepts:
+#   claude       `claude --model <id>`
+#   codex        `codex` model ids (`provider:` picks a [model_providers.*] entry in ~/.codex/config.toml)
+#   opencode     "provider/model", from `opencode models`
+#   antigravity  `agy models`
+#   cursor       `agent --list-models`
+# The file hot-reloads. An invalid edit pauses new spawns until it is fixed.
+
+# ---- Server limits (all optional) -------------------------------------------------------------
+# maxConcurrent: 12               # agents running at once, across all backends (default 12)
+# codexResumeIdleSeconds: 1800    # resuming a Codex thread idle longer than this needs
+#                                 # allow_expensive_resume (default 1800)
+#
+# Per-backend allowances. list_models reports what is left of each one.
+# allowances:
+#   cursor:
+#     maxSpawns: 20
+#     maxCostUsd: 5
+#   codex:
+#     maxInputTokens: 2000000
+#     maxOutputTokens: 200000
+
+# ---- Policy: refuse agents before they start (README: "Blocking backends and models") --------
+# Each setting also has an environment variable for every project: SUBAGENT_MCP_DISABLED_BACKENDS,
+# SUBAGENT_MCP_BLOCK_MODELS, SUBAGENT_MCP_BLOCK_CLAUDE_MODELS.
+# disabledBackends: [antigravity]                  # the panel's 1-5 keys edit this line
+# blockModels: ["*grok*", "codex:gpt-5.6-sol"]     # globs, optionally "backend:" prefixed
+# blockClaudeModels: true                          # Claude subagents use Claude Code's own Agent tool
+
+models:
+  claude:
+    - name: claude-sonnet-5-5
+      description: Balanced default for most delegated work
+    - name: claude-opus-5-5
+      description: Highest capability for hard reasoning and large changes; slower and more expensive
+    - name: claude-haiku-5-5
+      description: Fast and cheap for narrow, well-scoped tasks (search, summaries, small edits)
+
+  codex:
+    - name: gpt-5.6-sol
+      description: Codex CLI default model, strong for multi-step coding
+    - name: gpt-5.6-luna
+      description: Fast and affordable agentic coding model
+    # A model served by a custom provider from ~/.codex/config.toml:
+    # - name: my-model
+    #   provider: my-provider
+    #   description: Served through [model_providers.my-provider]
+    #
+    # Endpoint models (NVIDIA NIM, any OpenAI-compatible URL) are added automatically by
+    # `subagent-mcp endpoint add ...` as "<endpoint>/<alias>" in the claude, codex and opencode rosters.
+    # Policy checks both that alias and the endpoint's upstream model id.
+
+  opencode:
+    - name: opencode/deepseek-v4.1-flash-free
+      description: DeepSeek V4.1 Flash on OpenCode Zen's free tier; good for cheap review passes
+    - name: opencode-go/deepseek-v4.1-flash
+      description: DeepSeek V4.1 Flash through an OpenCode Go subscription
+    - name: ollama-cloud/gpt-oss:20b
+      description: Open-weight gpt-oss 20B through Ollama Cloud
+    # A model you serve yourself. Define the provider in opencode.json, then list it here:
+    # - name: local/qwen3-coder:30b
+    #   description: Local model through an Ollama provider named "local"
+
+  antigravity:
+    - name: gemini-3.8-flash-low
+      description: Fast, low-effort Gemini 3.8 Flash tier
+    - name: gemini-3.8-flash-high
+      description: Higher-reasoning Gemini 3.8 Flash tier
+    - name: gemini-3.1-pro-high
+      description: Higher-capability Gemini 3.1 Pro tier
+
+  cursor:
+    # Effort is part of the id in Cursor (for example grok-4.7-high).
+    - name: auto
+      description: Cursor Agent CLI default model routing

@@ -4,3 +4,5 @@ dist/
 .codex/config.toml
 .claude/agents/orchestrator.md
 .codex/agents/orchestrator.toml
+.subagents/models.yaml
+.subagents/models.yaml.bak
