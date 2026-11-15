@@ -123,9 +123,28 @@ permissions are always enforced by `agy`, not by the bridge (`bridge_enforced: f
 ## Tools
 
 `spawn_agent`, `send_message`, `list_agents`, `stop_agent`, `resolve_approval`,
-`get_agent_events`, `list_models`, `restart_host`, and the ensemble tools below — see each tool's description for details. A spawn blocks
+`get_agent_events`, `get_agent_diff`, `list_models`, `restart_host`, and the ensemble tools below — see each tool's description for details. A spawn blocks
 until the child completes or needs your approval; when it needs approval, call
 `resolve_approval` to continue.
+
+- `get_agent_diff` returns an isolated agent's changes: everything in its managed worktree,
+  committed or not and untracked files included, against the commit it started from (for snapshot
+  isolation, the snapshot, so your own uncommitted edits are not shown as the agent's). Per-file
+  line counts plus a unified diff capped at `max_chars`. The agent can't hide a change from it:
+  `skip-worktree` and `assume-unchanged` flags are ignored, untracked files are filtered only by the
+  tree's `.gitignore` files (not the shared repository's `info/exclude` or your global excludes), and
+  a new `.gitignore` always appears. Taking the diff runs nothing the worktree configures: files are
+  staged as raw bytes without `git add`, so no clean filter runs, and textconv, external diff and
+  fsmonitor are off.
+- `get_dashboard` is for status UIs such as the `/subagent-mcp` panel and its poller (its
+  description steers the model to `list_agents`; hiding it with a `tool.list` hook would also take
+  it from the mod's own `$.mcp.call`): live agents, the most recent finished ones (`recent`, default 10) and any that settled in
+  the last 15 minutes, pending approvals, recent ensembles with member states and the concurrency
+  counters in one read. Pass the previous `revision` as `since` and an unchanged
+  snapshot answers `{ revision, unchanged: true }`.
+- Agent listings and `get_agent_events` summaries carry `phase` (`tool` while a call is open,
+  `thinking` between calls, `approval` while waiting; a settled agent's state) and `last_tool`,
+  the most recent call, kept after it ends. `current_activity` is still the open call only.
 
 Every spawned agent has a human-memorable name (a mathematician, philosopher, or figure from Greek mythology), assigned automatically unless
 `spawn_agent.name` is supplied. Results and agent listings include it, and tools that accept an
@@ -519,7 +538,8 @@ connection, so do it between sessions.
   tail of the latest message) instead of the raw log; add `since` (the previous
   `currentSequence`) to see only what is new. For the raw log, `types` filters event types and
   `coalesce: true` merges the per-chunk `message.delta` events. The one push is the Claude Code
-  channel below, which covers completion, failure, and approval requests only.
+  channel below, which covers completion, failure, and approval requests only. In the desktop app,
+  where channels can't be turned on, the panel mod's toasts cover the same three (SETUP.md step 4b).
 - Antigravity works in live use, including tool soft-denial and interrupts.
 
 ## Claude Code channel (background completion alerts)

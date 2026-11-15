@@ -542,7 +542,7 @@ export class OpenCodeAdapter implements BackendAdapter {
       } else if (part.type === "tool") {
         const seen = session.seenParts.get(part.id) ?? { emittedLength: 0, toolStarted: false, toolEnded: false };
         const state = isRecord(part.state) ? part.state : {};
-        if (!seen.toolStarted) {
+        if (!seen.toolStarted && toolInputReady(state)) {
           this.#emit(sessionId, "tool.start", { toolCallId: part.id, toolName: typeof part.tool === "string" ? part.tool : "unknown", input: isRecord(state.input) ? state.input : {} });
           seen.toolStarted = true;
         }
@@ -652,7 +652,7 @@ export class OpenCodeAdapter implements BackendAdapter {
           const key = `tool:${part.id}`;
           const seen = session.seenParts.get(key) ?? { emittedLength: 0, toolStarted: false, toolEnded: false };
           const state = isRecord(part.state) ? part.state : {};
-          if (!seen.toolStarted) {
+          if (!seen.toolStarted && toolInputReady(state)) {
             this.#emit(sessionId, "tool.start", { toolCallId: part.id, toolName: typeof part.name === "string" ? part.name : "unknown", input: isRecord(state.input) ? state.input : {} });
             seen.toolStarted = true;
           }
@@ -708,6 +708,10 @@ export class OpenCodeAdapter implements BackendAdapter {
    */
   #reportProviderError(sessionId: string, session: OpenCodeSession, value: unknown): boolean {
     if (session.providerErrorTurn === session.turnId) return true;
+    // Our own abort (a turn timeout or an interrupt) surfaces as a provider error ("Step interrupted");
+    // reporting it would replace the real cause and count against the provider's health. Returning true
+    // also suppresses the generic OPENCODE_TURN_FAILED fallback for a turn we ended ourselves.
+    if (session.timedOut || session.interruptRequested) return true;
     const error = providerErrorOf(value);
     if (error === undefined) return false;
     session.providerErrorTurn = session.turnId;
@@ -962,6 +966,15 @@ function extractPaths(metadata: Readonly<Record<string, unknown>>): readonly str
     if (typeof value === "string") paths.add(value);
   }
   return [...paths];
+}
+
+/**
+ * OpenCode lists a tool part while the model is still streaming its arguments (`pending`, input `{}`).
+ * Start it once the input has arrived or the call has moved on, so tool.start carries the real input.
+ */
+export function toolInputReady(state: Readonly<Record<string, unknown>>): boolean {
+  if (state.status !== "pending" && state.status !== undefined) return true;
+  return isRecord(state.input) && Object.keys(state.input).length > 0;
 }
 
 function extractUsage(info: Readonly<Record<string, unknown>>): Usage | undefined {

@@ -1,5 +1,8 @@
-import { expect, test } from 'claude-code/testing'
+import { expect, mock, test } from 'claude-code/testing'
 
+import { snapshotOf, transitions } from './hooks/notes'
+import { MISSING_TOOL } from './hooks/register'
+import { activityOf, splitDiff } from './hooks/panel'
 import { readDisabled, writeDisabled } from './hooks/policy'
 
 const PANE = {
@@ -222,6 +225,36 @@ test('a backend key rewrites only the disabledBackends line and keeps a copy', a
   await ui.unmount()
 })
 
+test('a backend turned off can be turned back on while the server still reports the old list', async ($, on) => {
+  let file = 'disabledBackends: [cursor]\nmodels:\n'
+  const writes: string[] = []
+  on('mcp.call', (_, e) => {
+    // The server has not reloaded models.yaml yet: it still reports cursor as disabled.
+    const body = e.tool === 'list_models' ? { model_policy: { disabled_backends: ['cursor'] } } : e.tool === 'list_agents' ? { agents: [] } : {}
+    return { value: { content: [{ type: 'text', text: JSON.stringify(body) }], structuredContent: body } }
+  })
+  on('command.register', () => ({ value: { command: 'subagent-mcp' } }))
+  on('ui.open', () => ({ value: { isPlaced: true } }))
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+  on('fs.read', (_, e) => ({ value: String((e as { path?: string }).path).endsWith('models.yaml') ? file : '{}' }))
+  on('fs.write', (_, e) => {
+    const { path, text } = e as { path?: string; text?: string }
+    if (String(path).endsWith('models.yaml')) (file = String(text), writes.push(file))
+    return { value: undefined }
+  })
+  await open($)
+
+  const ui = await $.ui.mount(PANE)
+  await ui.press({ key: 'backend-cursor' })
+  expect(writes.at(-1)).toContain('disabledBackends: []')
+  await ui.press({ key: 'backend-cursor' })
+  expect(writes.at(-1)).toContain('disabledBackends: [cursor]')
+  await ui.press({ key: 'backend-cursor' })
+  expect(writes.at(-1)).toContain('disabledBackends: []')
+  expect(writes).toHaveLength(3)
+  await ui.unmount()
+})
+
 test('the line editor handles lists, empty lists and what it will not touch', () => {
   expect(readDisabled(YAML)).toEqual([])
   expect(readDisabled('disabledBackends: [cursor, "codex"] # why\nmodels:\n')).toEqual(['cursor', 'codex'])
@@ -230,4 +263,320 @@ test('the line editor handles lists, empty lists and what it will not touch', ()
   expect(on).toEqual({ ok: true, text: 'disabledBackends: [cursor, codex]\nmodels:\n' })
   expect(writeDisabled('disabledBackends:\n  - cursor\nmodels:\n', []).ok).toBe(false)
   expect(writeDisabled('nothing here', ['cursor']).ok).toBe(false)
+})
+
+// A server with get_dashboard: one read carries agents and ensembles.
+const dashboardServer = (
+  on: Parameters<Parameters<typeof test>[1]>[1],
+  board: Record<string, unknown>,
+  extra: Record<string, unknown> = {},
+) => {
+  const calls: { tool: string; args: Record<string, unknown> }[] = []
+  on('mcp.call', (_, e) => {
+    calls.push({ tool: e.tool, args: e.args })
+    const body = e.tool === 'get_dashboard' ? { revision: 'r1', approvals: [], concurrency: {}, ...board } : (extra[e.tool] ?? {})
+    return { value: { content: [{ type: 'text', text: JSON.stringify(body) }], structuredContent: body } }
+  })
+  on('command.register', () => ({ value: { command: 'subagent-mcp' } }))
+  on('ui.open', () => ({ value: { isPlaced: true } }))
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+  on('fs.read', () => ({ value: '{}' }))
+  return calls
+}
+
+const ENSEMBLE = {
+  ensemble_id: 'ens-1', name: 'review', status: 'running', valid: 1, of: 2,
+  members: [{ role: 'glm', name: 'Pan', state: 'completed', valid: true }, { role: 'deepseek', name: 'Kolmogorov', state: 'running' }],
+}
+
+test('with get_dashboard the panel reads agents and ensembles in one call and says what a thinking agent last ran', async ($, on) => {
+  const calls = dashboardServer(on, {
+    agents: [agent({ name: 'Kolmogorov', state: 'running', phase: 'thinking', last_tool: 'shell git diff', ensemble_id: 'ens-1', ensemble_role: 'deepseek' })],
+    ensembles: [ENSEMBLE],
+  })
+  await open($)
+
+  const ui = await $.ui.mount(PANE)
+  expect(await ui.find({ type: 'Text', text: /thinking, last ran shell git diff/ })).toBeTruthy()
+  expect(await ui.find({ type: 'Text', text: /ENSEMBLES/ })).toBeTruthy()
+  expect(await ui.find({ type: 'Text', text: /^glm \(Pan\)$/ })).toBeTruthy()
+  expect(await ui.find({ type: 'Text', text: /^deepseek \(Kolmogorov\)$/ })).toBeTruthy()
+  expect(calls.some(c => c.tool === 'list_agents')).toBe(false)
+  await ui.unmount()
+})
+
+test('a server without get_dashboard falls back to list_agents', async ($, on) => {
+  const calls: string[] = []
+  on('mcp.call', (_, e) => {
+    calls.push(e.tool)
+    // Claude Code's words when the connected server has no such tool (it throws them; the kit's mock answers them).
+    if (e.tool === 'get_dashboard') return { value: { isError: true, content: [{ type: 'text', text: 'subagent-strip: $.mcp.call: no connected MCP tool "get_dashboard" on a server named "subagent-mcp"' }] } }
+    const body = e.tool === 'list_agents' ? { agents: [agent({ name: 'Ada', state: 'completed' })] } : {}
+    return { value: { content: [{ type: 'text', text: JSON.stringify(body) }], structuredContent: body } }
+  })
+  on('command.register', () => ({ value: { command: 'subagent-mcp' } }))
+  on('ui.open', () => ({ value: { isPlaced: true } }))
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+  on('fs.read', () => ({ value: '{}' }))
+  await open($)
+
+  const ui = await $.ui.mount(PANE)
+  expect(await ui.find({ key: 'agent-id-Ada' })).toBeTruthy()
+  expect(calls).toContain('list_agents')
+  await ui.unmount()
+})
+
+const PATCH = [
+  'diff --git a/a.txt b/a.txt', 'index 1..2 100644', '--- a/a.txt', '+++ b/a.txt', '@@ -1 +1,2 @@', ' one', '+two', '',
+].join('\n') + [
+  'diff --git a/new.txt b/new.txt', 'new file mode 100644', '--- /dev/null', '+++ b/new.txt', '@@ -0,0 +1 @@', '+fresh', '',
+].join('\n')
+
+test('v shows the selected agent\'s worktree diff one file at a time, and b goes back', async ($, on) => {
+  const calls = dashboardServer(
+    on,
+    { agents: [agent({ name: 'Ada', state: 'completed', worktree: { path: '/w', branch: 'subagent/x' } })], ensembles: [] },
+    { get_agent_diff: { branch: 'subagent/x', insertions: 2, deletions: 0, files: [{ path: 'a.txt' }, { path: 'new.txt' }], patch: PATCH, truncated: false } },
+  )
+  await open($)
+
+  const ui = await $.ui.mount(PANE)
+  await ui.press({ key: 'diff' })
+  expect(calls.filter(c => c.tool === 'get_agent_diff').map(c => c.args['agent'])).toEqual(['id-Ada'])
+  expect(await ui.find({ type: 'Text', text: /2 file\(s\), \+2 -0 on subagent\/x/ })).toBeTruthy()
+  expect(await ui.find({ type: 'Text', text: /^a\.txt$/ })).toBeTruthy()
+  expect(await ui.find({ type: 'Text', text: /^\(1\/2\)/ })).toBeTruthy()
+  await ui.press({ key: 'diff-next' })
+  expect(await ui.find({ type: 'Text', text: /^new\.txt$/ })).toBeTruthy()
+  expect(await ui.find({ type: 'Text', text: /^\(2\/2\)/ })).toBeTruthy()
+  await ui.press({ key: 'diff-back' })
+  expect(await ui.find({ key: 'agent-id-Ada' })).toBeTruthy()
+
+  // Left open on a diff, the pane reopens on the list.
+  await ui.press({ key: 'diff' })
+  await ui.unmount()
+  await $.command.run({ command: 'subagent-mcp', args: '' })
+  const again = await $.ui.mount(PANE)
+  expect(await again.find({ key: 'agent-id-Ada' })).toBeTruthy()
+  expect(await again.find({ key: 'diff-back' })).toBeFalsy()
+  await again.unmount()
+})
+
+test('no diff key for an agent without a worktree', async ($, on) => {
+  dashboardServer(on, { agents: [agent({ name: 'Ada', state: 'completed' })], ensembles: [] })
+  await open($)
+  const ui = await $.ui.mount(PANE)
+  expect(await ui.find({ key: 'diff' })).toBeFalsy()
+  await ui.unmount()
+})
+
+test('as a desktop widget the pane is a glance: counts and what each running agent is doing', async ($, on) => {
+  dashboardServer(on, {
+    agents: [
+      agent({ name: 'Ada', state: 'running', current_activity: 'read src/host.ts' }),
+      agent({ name: 'Bo', state: 'needs_approval', request_id: 'r', tool_name: 'Bash', command: 'ls' }),
+    ],
+    ensembles: [ENSEMBLE],
+  })
+  await open($)
+  for (const surface of ['terminal', 'desktop'] as const) {
+    const ui = await $.ui.mount({ ...PANE, surface, props: { ...PANE.props, placement: 'widget' } })
+    expect(await ui.find({ type: 'Text', text: /2 running · 1 need approval · 1 ensemble/ })).toBeTruthy()
+    expect(await ui.find({ type: 'Text', text: /Ada: read src\/host\.ts/ })).toBeTruthy()
+    expect(await ui.find({ type: 'Text', text: /review: 1\/2 settled/ })).toBeTruthy()
+    expect(await ui.find({ key: 'allow' })).toBeFalsy()
+    await ui.unmount()
+  }
+})
+
+test('/subagent-mcp widget asks for the widget placement', async ($, on) => {
+  const opens: Record<string, unknown>[] = []
+  on('mcp.call', () => ({ value: { content: [{ type: 'text', text: '{"agents":[],"ensembles":[]}' }] } }))
+  on('command.register', () => ({ value: { command: 'subagent-mcp' } }))
+  on('ui.open', (_, e) => (opens.push(e as Record<string, unknown>), { value: { isPlaced: true } }))
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+  on('fs.read', () => ({ value: '{}' }))
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  await $.command.run({ command: 'subagent-mcp', args: 'widget' })
+  expect(opens.at(-1)?.['placement']).toBe('widget')
+  expect(opens.at(-1)?.['focus']).toBeUndefined()
+  // Let the first refresh settle before the test ends.
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop', props: { ...PANE.props, placement: 'widget' } })
+  expect(await ui.find({ type: 'Text', text: /0 running/ })).toBeTruthy()
+  await ui.unmount()
+})
+
+test('toast lines: approvals, finished agents, finished ensembles; members only through their ensemble', () => {
+  const before = snapshotOf(
+    [
+      { agent_id: 'a', name: 'Ada', state: 'running', backend: 'codex', model: 'm' },
+      { agent_id: 'b', name: 'Bo', state: 'running' },
+      { agent_id: 'c', name: 'Cy', state: 'running', ensemble_id: 'ens-1' },
+    ],
+    [{ ensemble_id: 'ens-1', name: 'review', status: 'running', valid: 0, of: 2 }],
+  )
+  const after = snapshotOf(
+    [
+      { agent_id: 'a', name: 'Ada', state: 'completed', backend: 'codex', model: 'm' },
+      { agent_id: 'b', name: 'Bo', state: 'needs_approval', tool_name: 'Bash', command: 'npm test' },
+      { agent_id: 'c', name: 'Cy', state: 'completed', ensemble_id: 'ens-1' },
+    ],
+    [{ ensemble_id: 'ens-1', name: 'review', status: 'completed', valid: 2, of: 2 }],
+  )
+  expect(transitions(undefined, after)).toEqual([])
+  expect(transitions(before, after)).toEqual([
+    'Ada finished (codex m)',
+    'Bo needs approval: Bash npm test (/subagent-mcp to answer)',
+    'Ensemble review completed: 2/2 valid',
+  ])
+  expect(transitions(after, after)).toEqual([])
+})
+
+test('splitDiff and activityOf', () => {
+  expect(splitDiff(PATCH).map(s => s.path)).toEqual(['a.txt', 'new.txt'])
+  expect(splitDiff('')).toEqual([])
+  const base = { id: 'x', name: 'x', backend: 'b', model: 'm', updated: '', tokensIn: 0, tokensOut: 0 }
+  expect(activityOf({ ...base, state: 'running', phase: 'tool', activity: 'read a.ts' })).toBe('read a.ts')
+  expect(activityOf({ ...base, state: 'running', phase: 'thinking' })).toBe('thinking')
+  expect(activityOf({ ...base, state: 'needs_approval', phase: 'approval' })).toBe('waiting for approval')
+})
+
+test('the digest is fetched again when the selected agent settles, then left alone', async ($, on) => {
+  const clock = mock.clock(on)
+  let state = 'running'
+  const digests: string[] = []
+  on('mcp.call', (_, e) => {
+    if (e.tool === 'get_agent_events') digests.push(state)
+    const body =
+      e.tool === 'get_dashboard' ? { revision: state, agents: [agent({ name: 'Ada', state })], ensembles: [] }
+      : e.tool === 'get_agent_events' ? { name: 'Ada', state, latest_message: state === 'running' ? 'working on it' : 'all done' }
+      : {}
+    return { value: { content: [{ type: 'text', text: JSON.stringify(body) }], structuredContent: body } }
+  })
+  on('command.register', () => ({ value: { command: 'subagent-mcp' } }))
+  on('ui.open', () => ({ value: { isPlaced: true } }))
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+  on('fs.read', () => ({ value: '{}' }))
+  await open($)
+
+  const ui = await $.ui.mount(PANE)
+  expect(await ui.find({ type: 'Text', text: /working on it/ })).toBeTruthy()
+  state = 'completed'
+  await clock.advance(2000)
+  expect(await ui.find({ type: 'Text', text: /all done/ })).toBeTruthy()
+  const settled = digests.filter(d => d === 'completed').length
+  await clock.advance(2000)
+  await clock.advance(2000)
+  expect(digests.filter(d => d === 'completed').length).toBe(settled)
+  await ui.unmount()
+})
+
+test('the missing-tool check matches both the engine message and an MCP error', () => {
+  expect(MISSING_TOOL.test('subagent-strip: $.mcp.call: no connected MCP tool "get_dashboard" on a server named "subagent-mcp"')).toBe(true)
+  expect(MISSING_TOOL.test('MCP error -32602: Tool get_dashboard not found')).toBe(true)
+  expect(MISSING_TOOL.test('subagent-mcp host is restarting')).toBe(false)
+})
+
+test('on desktop the pane draws its own layout with the same keys', async ($, on) => {
+  const calls = server(on, [
+    agent({ name: 'Ada', state: 'needs_approval', request_id: 'req-9', tool_name: 'Bash', command: 'rm -rf build' }),
+    agent({ name: 'Bo', state: 'completed' }),
+  ])
+  await open($)
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  expect(await ui.find({ type: 'Text', text: /^Waiting for approval: Bash$/ })).toBeTruthy()
+  expect(await ui.find({ type: 'Text', text: /^Running$/ })).toBeTruthy()
+  expect(await ui.find({ key: 'agent-id-Bo' })).toBeTruthy()
+  expect(await ui.find({ key: 'backend-cursor' })).toBeTruthy()
+  await ui.press({ key: 'allow' })
+  expect(calls.filter(c => c.tool === 'resolve_approval').map(c => c.args)).toEqual([{ request_id: 'req-9', decision: 'allow' }])
+
+  await ui.press({ key: 'stop' })
+  expect(await ui.find({ type: 'Text', text: /Stop Ada\?/ })).toBeTruthy()
+  await ui.press({ key: 'yes' })
+  expect(calls.filter(c => c.tool === 'stop_agent').map(c => c.args)).toEqual([{ agent: 'Ada' }])
+  await ui.unmount()
+})
+
+test('desktop ensembles draw a card with one row per member', async ($, on) => {
+  dashboardServer(on, { agents: [agent({ name: 'Kolmogorov', state: 'running', ensemble_role: 'deepseek' })], ensembles: [ENSEMBLE] })
+  await open($)
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  expect(await ui.find({ type: 'Text', text: /^review$/ })).toBeTruthy()
+  expect(await ui.find({ type: 'Text', text: /^glm \(Pan\)$/ })).toBeTruthy()
+  expect(await ui.find({ type: 'Text', text: /^Ensembles$/ })).toBeTruthy()
+  await ui.unmount()
+})
+
+test('splitDiff unquotes the paths git quotes', () => {
+  const patch = 'diff --git "a/sp ace\\"q.txt" "b/sp ace\\"q.txt"\n+x\n' +
+    'diff --git "a/caf\\303\\251.txt" "b/caf\\303\\251.txt"\n+y\n' +
+    'diff --git "a/tab\\tname" "b/tab\\tname"\n+z\n'
+  expect(splitDiff(patch).map(s => s.path)).toEqual(['sp ace"q.txt', 'café.txt', 'tab\tname'])
+})
+
+// Kept last: the models.yaml path the server reports is remembered for the rest of the session.
+test('a project without its own models.yaml edits the bundled file the server reports', async ($, on) => {
+  const bundled = '/opt/subagent-mcp/.subagents/models.yaml'
+  let file = 'disabledBackends: []\nmodels:\n'
+  const reads: string[] = []
+  const writes: { path: string; text: string }[] = []
+  on('mcp.call', (_, e) => {
+    const body = e.tool === 'list_models' ? { models_file: bundled } : e.tool === 'list_agents' ? { agents: [] } : {}
+    return { value: { content: [{ type: 'text', text: JSON.stringify(body) }], structuredContent: body } }
+  })
+  on('command.register', () => ({ value: { command: 'subagent-mcp' } }))
+  on('ui.open', () => ({ value: { isPlaced: true } }))
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+  on('fs.read', (_, e) => {
+    const path = String((e as { path?: string }).path)
+    reads.push(path)
+    if (path === bundled) return { value: file }
+    if (path.endsWith('models.yaml')) throw new Error('E')
+    return { value: '{}' }
+  })
+  on('fs.write', (_, e) => {
+    const { path, text } = e as { path?: string; text?: string }
+    writes.push({ path: String(path), text: String(text) })
+    if (path === bundled) file = String(text)
+    return { value: undefined }
+  })
+  await $.session.start({ cwd: '/Users/me/MeshCore', surface: 'terminal', isInteractive: true })
+  await $.command.run({ command: 'subagent-mcp', args: '' })
+
+  const ui = await $.ui.mount(PANE)
+  await ui.press({ key: 'backend-cursor' })
+  expect(writes.map(w => w.path)).toEqual([`${bundled}.bak`, bundled])
+  expect(file).toContain('disabledBackends: [cursor]')
+  expect(reads.some(path => path.startsWith('/Users/me/MeshCore/.subagents/models.yaml'))).toBe(false)
+  await ui.unmount()
+})
+
+test('a backend the environment also disables is not reported as enabled when its file entry is removed', async ($, on) => {
+  let file = 'disabledBackends: [cursor]\nmodels:\n'
+  const said: string[] = []
+  on('mcp.call', (_, e) => {
+    const body = e.tool === 'list_models'
+      ? { model_policy: { disabled_backends: ['cursor'], disabled_backends_env: ['cursor'] } }
+      : e.tool === 'list_agents' ? { agents: [] } : {}
+    return { value: { content: [{ type: 'text', text: JSON.stringify(body) }], structuredContent: body } }
+  })
+  on('command.register', () => ({ value: { command: 'subagent-mcp' } }))
+  on('ui.open', () => ({ value: { isPlaced: true } }))
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+  on('fs.read', (_, e) => ({ value: String((e as { path?: string }).path).endsWith('models.yaml') ? file : '{}' }))
+  on('fs.write', (_, e) => {
+    const { path, text } = e as { path?: string; text?: string }
+    if (String(path).endsWith('models.yaml')) file = String(text)
+    return { value: undefined }
+  })
+  on('ui.notify', (_, e) => (said.push(String((e as { message?: string }).message)), { value: undefined }))
+  await open($)
+
+  const ui = await $.ui.mount(PANE)
+  await ui.press({ key: 'backend-cursor' })
+  expect(file).toContain('disabledBackends: []')
+  expect(await ui.find({ type: 'Text', text: / off \(env\)/ })).toBeTruthy()
+  await ui.unmount()
 })

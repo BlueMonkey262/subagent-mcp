@@ -260,6 +260,35 @@ export class EnsembleManager {
     return { ...view, ...(input.wait_seconds !== undefined && !FINAL_STATUSES.has(record.status) ? { timed_out: this.#pendingApprovals(record).length === 0 } : {}) };
   }
 
+  /**
+   * Compact view of the most recent ensembles for a status UI (get_dashboard): running ones first,
+   * then the newest finished, each with its members' state. No model calls and no file reads.
+   */
+  overview(limit = 5): readonly Readonly<Record<string, unknown>>[] {
+    const records = [...this.#records.values()].sort((a, b) => b.created_at.localeCompare(a.created_at));
+    // Refresh before sorting into open and finished, so one that just finished is listed as finished.
+    for (const record of records) if (!FINAL_STATUSES.has(record.status)) this.#safeRefresh(record);
+    const open = records.filter((record) => !FINAL_STATUSES.has(record.status));
+    const done = records.filter((record) => FINAL_STATUSES.has(record.status)).slice(0, Math.max(0, limit - open.length));
+    return [...open, ...done].map((record) => {
+      return {
+        ensemble_id: record.id, name: record.name, status: record.status, mode: record.spec.mode,
+        created_at: record.created_at, updated_at: record.updated_at,
+        valid: record.members.filter((member) => member.valid === true).length, of: record.members.length,
+        ...(record.synthesis === undefined ? {} : { synthesis: record.synthesis.state }),
+        members: record.members.map((member) => ({
+          role: member.role, state: member.state,
+          ...(member.name === undefined ? {} : { name: member.name }),
+          ...(member.agent_id === undefined ? {} : { agent_id: member.agent_id }),
+          ...(member.backend === undefined ? {} : { backend: member.backend }),
+          ...(member.model === undefined ? {} : { model: member.model }),
+          ...(member.valid === undefined ? {} : { valid: member.valid }),
+          ...(member.invalid_reason === undefined ? {} : { invalid_reason: member.invalid_reason.slice(0, 160) }),
+        })),
+      };
+    });
+  }
+
   async cancel(identifier: string): Promise<Readonly<Record<string, unknown>>> {
     const record = this.#require(identifier);
     const live = this.#liveFor(record);

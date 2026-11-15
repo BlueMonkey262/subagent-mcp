@@ -308,6 +308,10 @@ test("responses fit the character budget, keeping top-level fields", () => {
   assert.equal(fitted.ensemble_id, "ens-1");
   assert.equal(fitted.truncated, true);
   assert.deepEqual(extractJson("noise ```json\n{\"a\":1}\n``` tail"), { ok: true, value: { a: 1 } });
+  // The safety notice scanChildOutput prepends starts with a bracket; the object after it is still found.
+  assert.deepEqual(extractJson("[Safety notice: child output mentions permission-control settings.]\n{\"findings\":[{\"t\":1}]}"),
+    { ok: true, value: { findings: [{ t: 1 }] } });
+  assert.deepEqual(extractJson("[1, 2]"), { ok: true, value: [1, 2] });
 });
 
 test("profiles supply rosters; call fields override them; competitive forces worktrees", async () => {
@@ -345,6 +349,14 @@ test("ordinary spawn_agent results are unchanged and still notify", async () => 
   complete(f.codex, String(result.agent_id), "done");
   await until(() => f.detached.length === 1);
   assert.equal(f.detached[0]!.status, "completed");
+});
+
+test("extractJson pairs each bracket with its own close: arrays after the safety notice or a bracketed aside", () => {
+  assert.deepEqual(extractJson("[Safety notice: child output mentions permission-control settings.]\n[{\"a\":1},{\"b\":2}]"),
+    { ok: true, value: [{ a: 1 }, { b: 2 }] });
+  assert.deepEqual(extractJson("Here it is [as requested]:\n[{\"t\":1}]"), { ok: true, value: [{ t: 1 }] });
+  assert.deepEqual(extractJson("Result: {\"s\":\"a ] and } in a string\"} done"), { ok: true, value: { s: "a ] and } in a string" } });
+  assert.deepEqual(extractJson("no json [here] at all"), { ok: false });
 });
 
 test("a retry while the first push is still in flight does not send the event twice", async () => {

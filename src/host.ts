@@ -1,3 +1,4 @@
+import { buildDashboard } from "./dashboard.js";
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { readdirSync, readFileSync, realpathSync, statSync } from "node:fs";
@@ -233,6 +234,8 @@ export async function serveHost(options: {
   readonly socketPath: string;
   readonly supervisor: Supervisor;
   readonly ensembles?: EnsembleManager;
+  /** The models.yaml this host loaded: list_models reports it so the panel edits the same file. */
+  readonly modelsFile?: string;
   readonly onClients?: (count: number) => void;
   readonly onShutdown?: () => void;
   /** Set once the host begins shutting down; no further mutating RPCs are accepted. */
@@ -332,9 +335,14 @@ export async function serveHost(options: {
           if (shuttingDown) return;
           shuttingDown = true;
           options.onShutdown?.();
-        }, { clients: () => sockets.size, attached: () => attached.size, attach: () => attach(socket),
+        }, {
+          clients: () => sockets.size,
+          attached: () => attached.size,
+          attach: () => attach(socket),
           shuttingDown: () => shuttingDown || options.shuttingDown?.() === true,
-          ...(options.ensembles === undefined ? {} : { ensembles: options.ensembles }) });
+          ...(options.ensembles === undefined ? {} : { ensembles: options.ensembles }),
+          ...(options.modelsFile === undefined ? {} : { modelsFile: options.modelsFile }),
+        });
       }
     });
     const drop = (): void => {
@@ -836,6 +844,7 @@ export async function runHost(): Promise<void> {
     socketPath: paths.socketPath,
     supervisor,
     ensembles,
+    modelsFile,
     onClients: scheduleIdle,
     onShutdown: () => void shutdown(),
     shuttingDown: () => shuttingDown,
@@ -1016,6 +1025,7 @@ interface DispatchContext {
   /** True once the host is shutting down and must not accept more state changes. */
   readonly shuttingDown: () => boolean;
   readonly ensembles?: EnsembleManager;
+  readonly modelsFile?: string;
 }
 
 async function dispatch(supervisor: Supervisor, method: string, params: unknown, context: DispatchContext): Promise<unknown> {
@@ -1050,6 +1060,14 @@ async function dispatch(supervisor: Supervisor, method: string, params: unknown,
       return supervisor.sendMessage(input as unknown as SendMessageInput);
     case "list_agents":
       return supervisor.sessionView(input as ListAgentsInput);
+    case "get_dashboard":
+      return buildDashboard(supervisor, context.ensembles, {
+        since: typeof input["since"] === "string" ? input["since"] : undefined,
+        recent: typeof input["recent"] === "number" ? input["recent"] : undefined,
+        ensembles: typeof input["ensembles"] === "number" ? input["ensembles"] : undefined,
+      });
+    case "get_agent_diff":
+      return supervisor.agentDiff(requiredString(input, "agent"), typeof input["max_chars"] === "number" ? input["max_chars"] : undefined);
     case "list_agent_configs": return supervisor.listAgentConfigs();
     case "wait_for_agents": return supervisor.waitForAgents(input.agents as string[], input.mode as 'all' | 'any' | undefined,
       input.timeout_seconds as number | undefined, input.since as string | undefined, input.max_result_chars as number | undefined);
@@ -1078,11 +1096,14 @@ async function dispatch(supervisor: Supervisor, method: string, params: unknown,
         ? supervisor.getAgentEvents(agent, since, input["limit"], options)
         : supervisor.getAgentEvents(agent, since, undefined, options);
     }
-    case "list_models":
-      return supervisor.listModels(
+    case "list_models": {
+      const models = await supervisor.listModels(
         isBackend(input["backend"]) ? input["backend"] : undefined,
         ...(typeof input["live"] === "boolean" ? [input["live"]] : []),
       );
+      // A project without its own models.yaml runs on the bundled one (bin/run-server.sh); name the file in use.
+      return context.modelsFile === undefined ? models : { ...models, models_file: context.modelsFile };
+    }
     case "shutdown": {
       const { active, waiting } = supervisor.concurrency();
       if (active > 0 || waiting > 0) {
