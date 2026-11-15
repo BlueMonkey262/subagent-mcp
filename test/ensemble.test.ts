@@ -38,7 +38,7 @@ function fixture(options: { maxConcurrent?: number; directory?: string; supervis
     supervisor, cwd: "/repo", launchWaitMs: 200,
     ...(options.directory === undefined ? {} : { directory: options.directory }),
     profileSources: [],
-    onSettled: (event) => events.push({ ...event }),
+    onSettled: (event) => { events.push({ ...event }); return true; },
   });
   return { codex, opencode, supervisor, manager, detached, events };
 }

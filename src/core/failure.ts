@@ -104,13 +104,13 @@ const CODE_CLASSIFICATIONS: ReadonlyArray<readonly [RegExp, Classification]> = [
 ];
 
 const MESSAGE_CLASSIFICATIONS: ReadonlyArray<readonly [RegExp, Classification]> = [
-  [/rate[\s_-]?limit|too many requests|(?:^|\D)429(?:\D|$)/i, RATE_LIMIT],
+  [/rate[\s_-]?limit|too many requests|throttl|requests per (?:second|minute)|(?:^|\D)429(?:\D|$)/i, RATE_LIMIT],
   [
     /quota|usage limit|credit balance|insufficient[_ -]?quota|out of credits|billing|budget (?:exceeded|limit)|exceeded your .{0,40}quota/i,
     QUOTA,
   ],
   [
-    /authenticat|unauthori[sz]ed|invalid api key|api key|(?:^|\D)40[13](?:\D|$)|not logged in|login required|permission denied.{0,30}(?:key|credential)/i,
+    /authenticat|unauthori[sz]ed|invalid api key|api key|forbidden|(?:^|\D)40[13](?:\D|$)|not logged in|login required|permission denied.{0,30}(?:key|credential)/i,
     AUTH,
   ],
   [/timed? out|timeout|deadline exceeded/i, TIMEOUT],

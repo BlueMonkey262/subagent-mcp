@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import { classifyFailure, normalizeFailure } from "../src/core/failure.js";
+import { classifyProviderError } from "../src/core/providers.js";
 
 test("quota, auth, rate limit, and task failures get distinct automation categories", () => {
   const quota = classifyFailure({
@@ -36,6 +37,15 @@ test("structured status and subtype outrank generic code prefixes", () => {
   assert.equal(classifyFailure({ code: "CODEX_PROCESS_EXIT", message: "process exited" }).category, "process");
   assert.equal(classifyFailure({ code: "CLAUDE_PROTOCOL_ERROR", message: "bad envelope" }).category, "protocol");
   assert.equal(classifyFailure({ code: "OPENCODE_POLL_ERROR", message: "fetch failed" }).category, "transport");
+});
+
+test("provider wording from the ensemble branch still classifies through the shared table", () => {
+  for (const message of ["The upstream service throttled this request", "Rate window: requests per minute exceeded"]) {
+    assert.equal(classifyFailure({ code: "OPENCODE_PROVIDER_ERROR", message }).category, "rate_limit", message);
+    assert.equal(classifyProviderError(message), "rate_limit", message);
+  }
+  assert.equal(classifyFailure({ code: "OPENCODE_PROVIDER_ERROR", message: "Forbidden: this model is not available" }).category, "auth");
+  assert.equal(classifyProviderError("Forbidden: this model is not available"), "auth");
 });
 
 test("legacy failed turns cannot retain a *_SUCCESS code", () => {

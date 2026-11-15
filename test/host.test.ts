@@ -681,7 +681,7 @@ test("the host runs ensembles over the socket, strips forged membership and push
     onDetachedSettled: (result) => { if (ensembles?.routeDetached(result) !== true) endpoint?.notify({ event: "detached", data: result }); },
   });
   ensembles = new EnsembleManager({ supervisor, cwd, profileSources: [], launchWaitMs: 50,
-    onSettled: (event) => endpoint?.notify({ event: "ensemble", data: event }) });
+    onSettled: async (event) => endpoint !== undefined && (await endpoint.notify({ event: "ensemble", data: event })) > 0 });
   const paths = hostPaths(cwd);
   endpoint = await serveHost({ socketPath: paths.socketPath, supervisor, ensembles });
   try {
@@ -713,6 +713,62 @@ test("the host runs ensembles over the socket, strips forged membership and push
     await endpoint.close();
     await rm(paths.socketPath, { force: true });
   }
+});
+
+test("an ensemble that settles before attach stays pending until attach_session", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "subagent-host-ensemble-unattached-"));
+  const adapter = new FakeAdapter("codex");
+  adapter.queueScript([{
+    create: (context) => ({
+      type: "turn.completed" as const, agentId: context.agentId, backend: context.backend,
+      data: { turnId: context.turnId, status: "completed" as const, finalText: "done" },
+    }),
+    delayMs: 20,
+  }]);
+  let endpoint: Awaited<ReturnType<typeof serveHost>> | undefined;
+  let ensembles: EnsembleManager | undefined;
+  const supervisor = new Supervisor({
+    registry: registry(), adapters: new AdapterRegistry([adapter]), cwd,
+    onDetachedSettled: (result) => { if (ensembles?.routeDetached(result) !== true) endpoint?.notify({ event: "detached", data: result }); },
+  });
+  ensembles = new EnsembleManager({ supervisor, cwd, profileSources: [], launchWaitMs: 50,
+    onSettled: async (event) => {
+      if (endpoint === undefined || endpoint.attached === 0) return false;
+      return (await endpoint.notify({ event: "ensemble", data: event })) > 0;
+    } });
+  const paths = hostPaths(cwd);
+  endpoint = await serveHost({ socketPath: paths.socketPath, supervisor, ensembles });
+  try {
+    const client = await HostClient.connect(paths.socketPath);
+    const settled: Record<string, unknown>[] = [];
+    client.onEnsemble((data) => settled.push(data));
+    const started = await client.call("start_ensemble", {
+      task: "t", agents: [{ role: "a", config: "general" }],
+    }) as Record<string, unknown>;
+    const deadline = Date.now() + 3_000;
+    let undelivered = false;
+    while (Date.now() < deadline) {
+      const listed = await client.call("get_ensemble", {}) as { ensembles?: { ensemble_id: string; status: string; undelivered?: boolean }[] };
+      const record = listed.ensembles?.find((entry) => entry.ensemble_id === String(started.ensemble_id));
+      if (record?.status === "completed") { undelivered = record.undelivered === true; break; }
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.equal(settled.length, 0, "a connected but unattached probe never receives the event");
+    assert.equal(undelivered, true, "the event is still pending, not marked delivered");
+    await client.call("attach_session");
+    await waitUntil(() => settled.length === 1);
+    assert.equal(settled[0]!.status, "completed");
+    client.close();
+  } finally {
+    ensembles.close();
+    await endpoint.close();
+    await rm(paths.socketPath, { force: true });
+  }
+});
+
+test("host startup loads recovered results exactly once", async () => {
+  const source = await readFile(fileURLToPath(new URL("../src/host.js", import.meta.url)), "utf8");
+  assert.equal((source.match(/supervisor\.recoverResults\(\)/g) ?? []).length, 1, "the merge must not leave a duplicate startup call");
 });
 
 test("the proxy attaches only after initialize and only for Claude Code", () => {

@@ -23,7 +23,7 @@ const permission = { allow: [], deny: [], default: "escalate" as const };
 const config = (name: string, backend: AgentConfig["backend"]): AgentConfig =>
   ({ name, backend, description: name, systemPrompt: "", permission, env: {}, sourcePath: `/configs/${name}.md` });
 
-async function fixture(options: { profiles?: string; onSettled?: (event: Record<string, unknown>) => void; directory?: string; history?: RoutingHistory } = {}) {
+async function fixture(options: { profiles?: string; onSettled?: (event: Record<string, unknown>) => boolean | Promise<boolean>; directory?: string; history?: RoutingHistory } = {}) {
   const codex = new FakeAdapter("codex");
   const opencode = new FakeAdapter("opencode");
   const registry = new ConfigRegistry([config("codex-general", "codex"), config("opencode-general", "opencode")], {
@@ -46,7 +46,7 @@ async function fixture(options: { profiles?: string; onSettled?: (event: Record<
     supervisor, cwd: "/repo", launchWaitMs: 100, profileSources: sources,
     ...(options.directory === undefined ? {} : { directory: options.directory }),
     ...(options.history === undefined ? {} : { history: options.history }),
-    onSettled: options.onSettled ?? ((event) => events.push({ ...event })),
+    onSettled: options.onSettled ?? ((event) => { events.push({ ...event }); return true; }),
   });
   return { codex, opencode, supervisor, manager, detached, events };
 }
@@ -128,7 +128,7 @@ test("late results update the stored aggregate and send one follow-up event", as
 test("undeliverable events stay pending and are delivered later", async () => {
   let connected = false;
   const delivered: Record<string, unknown>[] = [];
-  const f = await fixture({ onSettled: (event) => { if (!connected) throw new Error("no client"); delivered.push(event); } });
+  const f = await fixture({ onSettled: (event) => { if (!connected) throw new Error("no client"); delivered.push(event); return true; } });
   const started = await f.manager.start({ task: "t", agents: roster.slice(0, 1) });
   const view = await members(f.manager, String(started.ensemble_id));
   complete(f.codex, view.members[0]!.agent_id, "done");
@@ -140,9 +140,9 @@ test("undeliverable events stay pending and are delivered later", async () => {
   const listed = await f.manager.get({});
   assert.equal((listed.ensembles as { undelivered?: boolean }[])[0]!.undelivered, true);
   connected = true;
-  f.manager.deliverPending();
+  await f.manager.deliverPending();
   assert.equal(delivered.length, 1);
-  f.manager.deliverPending();
+  await f.manager.deliverPending();
   assert.equal(delivered.length, 1, "delivered once");
 });
 
@@ -455,4 +455,39 @@ test("a budget reached while the synthesizer runs stops it; the deterministic ag
   const synthesis = (f.events[0]!.summary as Record<string, unknown>).synthesis as Record<string, unknown>;
   assert.equal(synthesis.reason, "budget reached");
   assert.equal(synthesis.fallback, "deterministic aggregate");
+});
+
+test("a budget reached during synthesis also stops members still running", async () => {
+  const f = await fixture();
+  const started = await f.manager.start({
+    task: "t", agents: roster.slice(0, 2), budget: { max_total_tokens: 100 },
+    completion: { strategy: "first_valid" },
+    aggregation: { strategy: "collect", synthesize: { config: "codex-general", model: "luna" } },
+  });
+  const id = String(started.ensemble_id);
+  const view = await members(f.manager, id);
+  complete(f.codex, view.members[0]!.agent_id, "first", "completed", { inputTokens: 10, outputTokens: 5 });
+  await until(() => f.codex.spawnRequests.length === 2);
+  assert.equal(f.supervisor.outcome(view.members[1]!.agent_id).state, "running");
+  const synth = (await members(f.manager, id)).synthesis!;
+  f.codex.emit(synth.agent_id!, "usage.updated", { usage: { inputTokens: 500, outputTokens: 0 } });
+  await until(() => f.supervisor.outcome(view.members[1]!.agent_id).state === "interrupted");
+  await until(() => f.events.length === 1);
+});
+
+test("a late member settling without a cost still triggers the missing-cost warning", async () => {
+  const f = await fixture();
+  const started = await f.manager.start({
+    task: "t", agents: roster.slice(0, 2), budget: { max_cost_usd: 5 },
+    completion: { strategy: "first_valid" },
+  });
+  const id = String(started.ensemble_id);
+  const view = await members(f.manager, id);
+  complete(f.codex, view.members[0]!.agent_id, "first", "completed", { inputTokens: 1, outputTokens: 1, costUsd: 0.01 });
+  await until(() => f.events.length === 1);
+  const warnings = async () => ((await f.manager.get({ ensemble: id })).warnings as string[] | undefined) ?? [];
+  assert.ok(!(await warnings()).some((warning) => /report no cost/.test(warning)), "the running member may still report a cost");
+  complete(f.opencode, view.members[1]!.agent_id, "second", "completed", { inputTokens: 1, outputTokens: 1 });
+  await until(() => f.events.length === 2);
+  assert.ok((await warnings()).some((warning) => /report no cost/.test(warning)), "a late member settled without a cost");
 });

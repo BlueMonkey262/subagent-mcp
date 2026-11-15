@@ -755,7 +755,6 @@ export async function runHost(): Promise<void> {
   supervisor.restorePending(pending);
   supervisor.enablePersistence(paths.snapshotPath);
   await supervisor.recoverResults();
-  await supervisor.recoverResults();
   await supervisor.flushSnapshot();
   const history = new RoutingHistory(join(paths.directory, "routing-history.jsonl"));
   await history.load().catch((error) => process.stderr.write(`subagent-mcp: routing history unreadable: ${String(error)}\n`));
@@ -764,10 +763,11 @@ export async function runHost(): Promise<void> {
     cwd,
     history,
     directory: join(paths.directory, "ensembles"),
-    onSettled: (event) => {
-      // Throwing leaves the record's notification pending, so get_ensemble shows it was never pushed.
-      if (endpoint === undefined || endpoint.clients === 0) throw new Error("no connected client");
-      void endpoint.notify({ event: "ensemble", data: event });
+    onSettled: async (event) => {
+      // A probe/CLI socket is not a consumer; only an attached session can receive the event.
+      // Returning false leaves the record's notification pending for the next attach_session.
+      if (endpoint === undefined || endpoint.attached === 0) return false;
+      return (await endpoint.notify({ event: "ensemble", data: event })) > 0;
     },
   });
   await ensembles.restore().catch((error) => process.stderr.write(`subagent-mcp: ensemble restore failed: ${String(error)}\n`));
@@ -993,7 +993,7 @@ async function handleLine(
     const result = await dispatch(supervisor, method, request["params"], context);
     socket.write(`${JSON.stringify({ id, result })}\n`);
     // A client that makes tool calls has its listeners attached: retry events no one was connected to receive.
-    if (method !== "hello" && method !== "shutdown") context.ensembles?.deliverPending();
+    if (method !== "hello" && method !== "shutdown") void context.ensembles?.deliverPending();
     if (method === "shutdown") setTimeout(onShutdown, 30);
   } catch (error) {
     const body = error instanceof Error

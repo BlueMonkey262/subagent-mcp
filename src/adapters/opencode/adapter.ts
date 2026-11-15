@@ -562,7 +562,10 @@ export class OpenCodeAdapter implements BackendAdapter {
         .join("");
       const usage = extractUsage(info);
       const status = session.timedOut ? "failed" : info.finish === "error" || info.error !== undefined ? "failed" : "completed";
-      if (status === "failed") this.#reportProviderError(sessionId, session, info.error);
+      if (status === "failed") {
+        const reported = this.#reportProviderError(sessionId, session, info.error);
+        if (!reported && !session.timedOut) this.#emitFailedTurn(sessionId, info);
+      }
       this.#completeTurn(sessionId, session, status, finalText === "" ? undefined : scanChildOutput(finalText), usage);
     }
   }
@@ -689,6 +692,10 @@ export class OpenCodeAdapter implements BackendAdapter {
     if (idle) {
       const outcome = idle.outcome;
       const status = session.timedOut || outcome === "failed" ? "failed" : outcome === "interrupted" ? "interrupted" : "completed";
+      if (status === "failed") {
+        const reported = this.#reportProviderError(sessionId, session, idle.error);
+        if (!reported && !session.timedOut) this.#emitFailedTurn(sessionId, idle);
+      }
       const usage: Usage | undefined = sawUsage ? { inputTokens, outputTokens, cachedInputTokens, uncachedInputTokens, costUsd } : undefined;
       this.#completeTurn(sessionId, session, status, lastText === "" ? undefined : scanChildOutput(lastText), usage);
     }
@@ -699,10 +706,10 @@ export class OpenCodeAdapter implements BackendAdapter {
    * of the failed turn, so the supervisor can tell why it failed and back off from a throttled
    * provider. OpenCode itself retries retryable requests; the turn is never replayed here.
    */
-  #reportProviderError(sessionId: string, session: OpenCodeSession, value: unknown): void {
-    if (session.providerErrorTurn === session.turnId) return;
+  #reportProviderError(sessionId: string, session: OpenCodeSession, value: unknown): boolean {
+    if (session.providerErrorTurn === session.turnId) return true;
     const error = providerErrorOf(value);
-    if (error === undefined) return;
+    if (error === undefined) return false;
     session.providerErrorTurn = session.turnId;
     const kind = classifyProviderError(error.message, error.statusCode);
     this.#emit(sessionId, "error", {
@@ -714,6 +721,27 @@ export class OpenCodeAdapter implements BackendAdapter {
         ...(error.statusCode === undefined ? {} : { statusCode: error.statusCode }),
         ...(error.type === undefined ? {} : { type: error.type }),
         ...(kind === undefined ? {} : { class: kind }),
+      },
+    });
+    return true;
+  }
+
+  /** Emit a normalized error for a failed finish/idle record that carries no error event of its own. */
+  #emitFailedTurn(sessionId: string, record: Readonly<Record<string, unknown>>): void {
+    const error = isRecord(record.error) ? record.error : undefined;
+    const text = typeof error?.message === "string" && error.message !== ""
+      ? error.message
+      : typeof record.outcome === "string" ? `OpenCode turn ended with ${record.outcome}`
+      : typeof record.finish === "string" ? `OpenCode turn ended with finish=${record.finish}`
+      : "OpenCode turn failed without an error message";
+    this.#emit(sessionId, "error", {
+      code: "OPENCODE_TURN_FAILED",
+      message: scanChildOutput(text),
+      fatal: false,
+      details: {
+        ...(typeof record.finish === "string" ? { finish: record.finish } : {}),
+        ...(typeof record.outcome === "string" ? { outcome: record.outcome } : {}),
+        ...(error === undefined ? {} : { error }),
       },
     });
   }

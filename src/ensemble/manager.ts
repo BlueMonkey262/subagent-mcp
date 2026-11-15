@@ -57,8 +57,8 @@ export interface EnsembleManagerOptions {
   /** Where ensemble records persist (one JSON file each). Omit to keep them in memory only. */
   readonly directory?: string;
   readonly profileSources?: readonly ProfileSource[];
-  /** One compact event per finalized background ensemble (and one follow-up for late results). Throw if it could not be delivered. */
-  readonly onSettled?: (event: Readonly<Record<string, unknown>>) => void;
+  /** One compact event per finalized background ensemble (and one follow-up for late results). Returns whether it was delivered. */
+  readonly onSettled?: (event: Readonly<Record<string, unknown>>) => boolean | Promise<boolean>;
   /** How long a background start waits for members to launch before answering. */
   readonly launchWaitMs?: number;
   /** Measured outcomes for model selection; members' outcomes are recorded here. */
@@ -104,7 +104,7 @@ export class EnsembleManager {
   readonly #cwd: string;
   readonly #directory: string | undefined;
   readonly #profileSources: readonly ProfileSource[];
-  readonly #onSettled: ((event: Readonly<Record<string, unknown>>) => void) | undefined;
+  readonly #onSettled: ((event: Readonly<Record<string, unknown>>) => boolean | Promise<boolean>) | undefined;
   readonly #launchWaitMs: number;
   readonly #history: RoutingHistory | undefined;
   readonly #candidateSource: () => Promise<CandidateSource>;
@@ -117,6 +117,7 @@ export class EnsembleManager {
   readonly #unsubscribeUsage: () => void;
   #refreshing = false;
   #refreshAgain = false;
+  #delivering = false;
 
   constructor(options: EnsembleManagerOptions) {
     this.#supervisor = options.supervisor;
@@ -296,17 +297,23 @@ export class EnsembleManager {
    * Retry events that could not be pushed (no client connected, or the host was still starting).
    * The host calls this after serving a request, when a client is known to be listening.
    */
-  deliverPending(): void {
-    for (const record of this.#records.values()) {
-      if (!FINAL_STATUSES.has(record.status)) continue;
-      let changed = false;
-      if (record.notification.required && record.notification.state === "pending") {
-        changed = this.#emit(record, false) || changed;
+  async deliverPending(): Promise<void> {
+    if (this.#delivering) return;
+    this.#delivering = true;
+    try {
+      for (const record of this.#records.values()) {
+        if (!FINAL_STATUSES.has(record.status)) continue;
+        let changed = false;
+        if (record.notification.required && record.notification.state === "pending") {
+          changed = await this.#emit(record, false) || changed;
+        }
+        if (record.late_update?.state === "pending" && record.members.every((member) => this.#terminal(member))) {
+          changed = await this.#emitLateUpdate(record) || changed;
+        }
+        if (changed) await this.#persist(record);
       }
-      if (record.late_update?.state === "pending" && record.members.every((member) => this.#terminal(member))) {
-        changed = this.#emitLateUpdate(record) || changed;
-      }
-      if (changed) void this.#persist(record);
+    } finally {
+      this.#delivering = false;
     }
   }
 
@@ -648,7 +655,10 @@ export class EnsembleManager {
       // A late result updates the stored aggregate (deterministic, free); one follow-up event once all have settled.
       record.summary = aggregate(this.#results(record), record.spec.aggregation, { cwd: this.#cwd });
       record.usage = this.#usagePublic(record);
-      if (record.late_update?.state === "pending" && record.members.every((member) => this.#terminal(member))) this.#emitLateUpdate(record);
+      this.#warnIncompleteCost(record);
+      if (record.late_update?.state === "pending" && record.members.every((member) => this.#terminal(member))) {
+        void this.#emitLateUpdate(record);
+      }
     }
     if (changed) {
       record.updated_at = new Date().toISOString();
@@ -685,28 +695,33 @@ export class EnsembleManager {
     if (allSettled) this.#finalizeSoon(record, "all_settled");
   }
 
+  #warnIncompleteCost(record: EnsembleRecord): void {
+    if (record.spec.budget?.max_cost_usd === undefined) return;
+    const live = this.#liveFor(record);
+    // Only a settled agent's usage is final; a running one may still report its cost at turn end.
+    if (!this.#usageTotals(record).settled_without_cost || live.budgetWarned) return;
+    live.budgetWarned = true;
+    warnOnce(record, "Some members report no cost; the cost budget counts reported cost only.");
+  }
+
   #overBudget(record: EnsembleRecord): boolean {
     const budget = record.spec.budget;
     if (budget === undefined) return false;
     const usage = this.#usageTotals(record);
-    const live = this.#liveFor(record);
-    // Only a settled agent's usage is final; a running one may still report its cost at turn end.
-    if (budget.max_cost_usd !== undefined && usage.settled_without_cost && !live.budgetWarned) {
-      live.budgetWarned = true;
-      warnOnce(record, "Some members report no cost; the cost budget counts reported cost only.");
-    }
+    this.#warnIncompleteCost(record);
     if (budget.max_cost_usd !== undefined && usage.cost_reported >= budget.max_cost_usd) return true;
     if (budget.max_total_tokens !== undefined && usage.tokens_reported >= budget.max_total_tokens) return true;
     return false;
   }
 
-  /** The budget ran out during synthesis: stop the synthesizer; the deterministic aggregate stands. */
+  /** The budget ran out during synthesis: stop the synthesizer and any members still running. */
   #stopSynthesisForBudget(record: EnsembleRecord): void {
     const live = this.#liveFor(record);
     const agentId = record.synthesis?.agent_id;
     if (live.synthesisBudgetStop || agentId === undefined || record.synthesis?.state !== "running") return;
     live.synthesisBudgetStop = true;
-    void this.#supervisor.stopAgents([agentId]).catch(() => undefined);
+    const open = record.members.filter((member) => member.agent_id !== undefined && !this.#terminal(member)).map((member) => member.agent_id!);
+    void this.#supervisor.stopAgents([...new Set([agentId, ...open])]).catch(() => undefined);
   }
 
   #satisfied(record: EnsembleRecord): boolean {
@@ -816,20 +831,21 @@ export class EnsembleManager {
     const open = record.members.some((member) => !this.#terminal(member));
     const live = this.#liveFor(record);
     if (record.notification.required && live.blockingCaller) record.notification = { required: false, state: "not_required" };
-    if (record.notification.required) this.#emit(record, false);
+    if (record.notification.required) await this.#emit(record, false);
     if (open && status !== "cancelled") record.late_update = { state: record.notification.required ? "pending" : "not_required" };
     this.#wake(record);
     await this.#persist(record);
   }
 
-  /** Push the consolidated event. Returns true when the delivery state changed. */
-  #emit(record: EnsembleRecord, update: boolean): boolean {
+  /** Push the consolidated event. Returns true when it was delivered and the delivery state changed. */
+  async #emit(record: EnsembleRecord, update: boolean): Promise<boolean> {
     if (this.#onSettled === undefined) return false;
     try {
-      this.#onSettled({
+      const delivered = await this.#onSettled({
         ensemble_id: record.id, name: record.name, status: record.status, reason: record.reason,
         ...(update ? { update: true } : {}), summary: this.#summaryView(record),
       });
+      if (delivered !== true) return false;
     } catch {
       return false;
     }
@@ -839,7 +855,7 @@ export class EnsembleManager {
   }
 
   /** Only worth a second event when a late member actually added a valid result. */
-  #emitLateUpdate(record: EnsembleRecord): boolean {
+  async #emitLateUpdate(record: EnsembleRecord): Promise<boolean> {
     if (!record.members.some((member) => member.late === true && member.valid === true)) {
       record.late_update = { state: "not_required" };
       return true;
