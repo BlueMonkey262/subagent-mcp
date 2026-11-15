@@ -17,7 +17,7 @@ export class ConfigurationError extends SubagentError {
 
 export class ConfigInvalidError extends SubagentError {
   constructor(warning: string) {
-    super(`Configuration reload is invalid; execution is paused until it is fixed. ${warning}`, "CONFIG_INVALID", {
+    super(`subagent-mcp cannot run agents until the configuration is fixed. ${warning}`, "CONFIG_INVALID", {
       warning,
     });
   }

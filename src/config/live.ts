@@ -10,11 +10,12 @@ import {
 import type { Backend } from "../core/types.js";
 import {
   ConfigRegistry,
-  loadConfigRegistry,
+  loadConfigRegistryWithStatus,
   type AgentConfigSource,
   type RegistryLoadOptions,
   type ResolveAgentOptions,
 } from "./registry.js";
+import { missingModelsFileMessage } from "./models-file.js";
 import type { Allowance, ModelEntry, ResolvedAgentConfig } from "./schema.js";
 import { applyPolicyEnv, OPEN_POLICY, type ModelPolicy } from "../core/model-policy.js";
 
@@ -55,6 +56,11 @@ export function missingConfigMessage(input: {
   ].join("\n");
 }
 
+export interface LiveConfigOptions extends RegistryLoadOptions {
+  /** Paths the launcher checked for models.yaml, for the missing-roster message. */
+  readonly modelsFileChecked?: readonly string[];
+}
+
 /**
  * Config viewed by the supervisor. Reloads when the roster or agent files change so a roster
  * edit does not require an MCP reconnect. A failed reload keeps the last good registry for
@@ -68,17 +74,23 @@ export class LiveConfig implements AgentConfigSource {
   #watchers: FSWatcher[] = [];
   #onChange: (() => void) | undefined;
 
-  constructor(private readonly options: RegistryLoadOptions) {}
+  constructor(private readonly options: LiveConfigOptions) {}
 
   async reload(): Promise<void> {
     try {
-      const registry = await loadConfigRegistry(this.options);
+      const { registry, modelsFileMissing } = await loadConfigRegistryWithStatus({
+        ...this.options,
+        allowMissingModels: true,
+      });
       if (registry.listAgents().length === 0) {
         throw new ConfigurationError(`No agent configs were found in ${this.options.agentsDirectory}`);
       }
       this.#registry = registry;
       this.#error = undefined;
-      this.#warning = undefined;
+      // A missing roster is not a broken config: start empty and say how to create the file.
+      this.#warning = modelsFileMissing
+        ? missingModelsFileMessage(this.options.modelsFileChecked ?? [this.options.modelsFile])
+        : undefined;
     } catch (error) {
       const message = missingConfigMessage({
         agentsDirectory: this.options.agentsDirectory,

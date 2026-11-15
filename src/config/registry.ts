@@ -165,12 +165,46 @@ export function defaultServerLimits(): ServerLimits {
   };
 }
 
+export interface RegistryLoadStatus {
+  readonly registry: ConfigRegistry;
+  /** True when the roster was loaded empty because no models file existed. */
+  readonly modelsFileMissing: boolean;
+}
+
+export interface RegistryLoadOverrides extends RegistryLoadOptions {
+  /** Load an empty roster instead of failing when `modelsFile` does not exist. */
+  readonly allowMissingModels?: boolean;
+}
+
 export async function loadConfigRegistry(options: RegistryLoadOptions): Promise<ConfigRegistry> {
+  return (await loadConfigRegistryWithStatus(options)).registry;
+}
+
+export async function loadConfigRegistryWithStatus(options: RegistryLoadOverrides): Promise<RegistryLoadStatus> {
   const [agents, models] = await Promise.all([
     loadAgentConfigs(options.agentsDirectory),
-    loadModelsFile(options.modelsFile),
+    loadModelsFileMaybe(options.modelsFile, options.allowMissingModels === true),
   ]);
-  return new ConfigRegistry(agents, await withEndpointModels(models.roster), models.limits);
+  // With no models.yaml there is no roster to add endpoint models to either.
+  const roster = models.missing ? models.file.roster : await withEndpointModels(models.file.roster);
+  return { registry: new ConfigRegistry(agents, roster, models.file.limits), modelsFileMissing: models.missing };
+}
+
+async function loadModelsFileMaybe(path: string, allowMissing: boolean): Promise<{ file: ModelsFile; missing: boolean }> {
+  try {
+    return { file: await loadModelsFile(path), missing: false };
+  } catch (error) {
+    if (!allowMissing || !isErrno(error, "ENOENT")) throw error;
+    return { file: { roster: emptyRoster(), limits: defaultServerLimits() }, missing: true };
+  }
+}
+
+function emptyRoster(): ModelRoster {
+  return { claude: [], codex: [], opencode: [], antigravity: [], cursor: [] };
+}
+
+function isErrno(error: unknown, code: string): boolean {
+  return typeof error === "object" && error !== null && "code" in error && error.code === code;
 }
 
 const AGENT_CONFIG_SUFFIX = ".md";

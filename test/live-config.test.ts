@@ -172,3 +172,42 @@ Work.
     live.close();
   }
 });
+
+test("agents load with an empty roster when models.yaml is missing, and say which paths were checked", async () => {
+  const root = await mkdtemp(join(tmpdir(), "subagent-live-no-models-"));
+  const agents = join(root, ".subagents");
+  const models = join(agents, "models.yaml");
+  const installed = join(root, "install", ".subagents", "models.yaml");
+  await mkdir(agents);
+  await writeFile(join(agents, "general.md"), `---
+name: general
+backend: codex
+description: General agent
+---
+Work.
+`);
+  const live = new LiveConfig({ agentsDirectory: agents, modelsFile: models, modelsFileChecked: [models, installed] });
+  const adapter = new FakeAdapter("codex");
+  try {
+    await live.reload();
+    assert.equal(live.hasConfig(), true);
+    assert.deepEqual(live.listModels("codex"), []);
+    const warning = live.configWarning() ?? "";
+    assert.match(warning, /No models\.yaml was found/);
+    assert.ok(warning.includes(models));
+    assert.ok(warning.includes(installed));
+    assert.match(warning, /Copy \.subagents\/models\.yaml\.example to \.subagents\/models\.yaml/);
+
+    const supervisor = new Supervisor({ registry: live, adapters: new AdapterRegistry([adapter]), cwd: root });
+    const listed = await supervisor.listModels(undefined, false);
+    assert.equal(listed["config_warning"], warning);
+    await assert.rejects(
+      supervisor.spawnAgent({ agent: "general", prompt: "work", description: "no roster" }),
+      (error: Error & { code?: string }) => error.code === "CONFIG_INVALID"
+        && /No models\.yaml was found/.test(error.message)
+        && error.message.includes(models),
+    );
+  } finally {
+    live.close();
+  }
+});

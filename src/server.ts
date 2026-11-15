@@ -6,6 +6,7 @@ import { z } from "zod";
 import { fileURLToPath } from "node:url";
 
 import { CHANNEL_CAPABILITY, CHANNEL_INSTRUCTIONS, createChannelNotifier } from "./channel.js";
+import { resolveModelsFile } from "./config/models-file.js";
 import { BACKENDS, isBackend } from "./core/types.js";
 import { NORMALIZED_EVENT_TYPES } from "./events/schema.js";
 import { HostSession, runHost } from "./host.js";
@@ -18,13 +19,19 @@ async function main(): Promise<void> {
   }
   const cwd = process.cwd();
   const agentsDirectory = process.env.SUBAGENT_MCP_AGENTS_DIR ?? `${cwd}/.subagents`;
-  const modelsFile = process.env.SUBAGENT_MCP_MODELS_FILE ?? `${cwd}/.subagents/models.yaml`;
+  const models = resolveModelsFile({ cwd });
 
   const server = new McpServer(
     { name: "subagent-mcp", version: "0.1.0" },
     { capabilities: { experimental: { [CHANNEL_CAPABILITY]: {} } }, instructions: CHANNEL_INSTRUCTIONS },
   );
-  const host = new HostSession({ cwd, agentsDirectory, modelsFile, scriptPath: fileURLToPath(import.meta.url) });
+  const host = new HostSession({
+    cwd,
+    agentsDirectory,
+    modelsFile: models.path,
+    modelsFileChecked: models.checked,
+    scriptPath: fileURLToPath(import.meta.url),
+  });
   host.onDetached(createChannelNotifier(server.server));
   await host.connect();
   const call = async (method: string, params?: unknown): Promise<unknown> => {
