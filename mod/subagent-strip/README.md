@@ -18,7 +18,8 @@ Shows the active subagent-mcp agents in the status line under the prompt, one co
 - If `<project>/.subagents/memory/update.json` reports an available release, one dim update row is printed after the agent rows.
 - Dormant when no subagent-mcp server answers three polls in a row; it then probes once a minute.
 - The poller reads `get_dashboard` (one call, and only a revision while nothing changed), falling back to
-  `list_agents` on a server that predates it. A `tool.list` hook keeps `get_dashboard` from the model.
+  `list_agents` on a server that predates it (and tries `get_dashboard` again every 5 minutes, since a `/mcp`
+  reconnect can bring a newer server). A `tool.list` hook keeps `get_dashboard` from the model.
 - Toasts (the `toasts` option, on by default): an agent finished or failed, an agent needs approval, an
   ensemble completed. Ensemble members are reported once, with their ensemble. These matter most in the
   desktop app, which gets no channel events (SETUP.md step 4b).

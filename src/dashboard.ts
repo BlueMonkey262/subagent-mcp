@@ -6,13 +6,16 @@ import type { Supervisor } from "./supervisor.js";
 export interface DashboardInput {
   /** The revision from a previous call; when nothing changed the answer is just `{ revision, unchanged: true }`. */
   readonly since?: string | undefined;
-  /** Finished agents to include after the live ones (default 10). */
+  /** Finished agents to include after the live ones (default 10), besides any that settled in the last 15 minutes. */
   readonly recent?: number | undefined;
   /** Ensembles to include: every open one, then the newest finished, up to this many (default 5). */
   readonly ensembles?: number | undefined;
 }
 
-const LIVE = new Set(["starting", "running", "needs_approval", "queued", "blocked"]);
+// "blocked" is a queued task whose dependency failed: settled, like "interrupted".
+const LIVE = new Set(["starting", "running", "needs_approval", "queued"]);
+/** A just-settled agent stays listed this long whatever `recent` is, so a poller sees it settle. */
+const RECENTLY_SETTLED_MS = 15 * 60_000;
 
 /**
  * One read for a status UI: live agents and the most recent finished ones (list_agents records),
@@ -24,7 +27,9 @@ export function buildDashboard(supervisor: Supervisor, ensembles: EnsembleManage
   const recent = Math.min(50, Math.max(0, input.recent ?? 10));
   const all = supervisor.listAgents();
   const live = all.filter((agent) => LIVE.has(String(agent.state)));
-  const finished = all.filter((agent) => !LIVE.has(String(agent.state))).slice(0, recent);
+  const cutoff = Date.now() - RECENTLY_SETTLED_MS;
+  const finished = all.filter((agent) => !LIVE.has(String(agent.state)))
+    .filter((agent, index) => index < recent || Date.parse(String(agent.updated_at)) >= cutoff);
   const agents = [...live, ...finished];
   const approvals = live
     .filter((agent) => agent.state === "needs_approval" && agent.request_id !== undefined)

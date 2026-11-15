@@ -145,9 +145,19 @@ test("get_agent_diff reports committed, uncommitted and untracked changes, again
     assert.doesNotMatch(diff.patch, /\+user edit/);
     assert.equal(diff.truncated, false);
 
-    const short = await supervisor.agentDiff(spawned["agent_id"] as string, 500);
-    assert.ok(short.patch.length <= 500);
-    assert.ok(short.patch === "" || short.patch.endsWith("\n"), "cut at a line end");
+    // A large file: the patch is cut at the cap (never past it, at a line end) without reading it all.
+    await writeFile(join(worktree.path, "big.txt"), Array.from({ length: 200_000 }, (_, i) => `line ${i}`).join("\n") + "\n");
+    // Force-added past .gitignore: still the agent's change.
+    await writeFile(join(worktree.path, ".gitignore"), "secret.log\n");
+    await writeFile(join(worktree.path, "secret.log"), "kept\n");
+    await exec("git", ["add", "-f", "secret.log"], { cwd: worktree.path });
+    for (const cap of [500, 501, 777]) {
+      const short = await supervisor.agentDiff(spawned["agent_id"] as string, cap);
+      assert.ok(short.patch.length <= cap, `patch within ${cap}`);
+      assert.ok(short.patch.endsWith("\n"), "cut at a line end");
+      assert.equal(short.truncated, true);
+      assert.ok(short.files.some((file) => file.path === "secret.log"), "force-added ignored file is listed");
+    }
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -159,4 +169,14 @@ test("OpenCode tool parts start once their input has arrived or the call has mov
   assert.equal(toolInputReady({ status: "pending", input: { command: "ls" } }), true);
   assert.equal(toolInputReady({ status: "running", input: {} }), true);
   assert.equal(toolInputReady({ status: "completed" }), true);
+});
+
+test("get_dashboard keeps a just-settled agent past the recent limit", async () => {
+  const { adapter, supervisor } = fixture();
+  const spawned = await supervisor.spawnAgent({ agent: "general", prompt: "work", description: "old", run_in_background: true });
+  const id = spawned["agent_id"] as string;
+  adapter.emit(id, "turn.completed", { turnId: "t1", status: "completed", finalText: "done" });
+  await waitUntil(() => supervisor.listAgents().some((agent) => agent["agent_id"] === id && agent["state"] === "completed"));
+  const board = buildDashboard(supervisor, undefined, { recent: 0 });
+  assert.deepEqual((board["agents"] as Record<string, unknown>[]).map((agent) => agent["state"]), ["completed"]);
 });

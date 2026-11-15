@@ -1,4 +1,4 @@
-import { expect, test } from 'claude-code/testing'
+import { expect, mock, test } from 'claude-code/testing'
 
 import { snapshotOf, transitions } from './hooks/notes'
 import { activityOf, splitDiff } from './hooks/panel'
@@ -396,4 +396,34 @@ test('splitDiff and activityOf', () => {
   expect(activityOf({ ...base, state: 'running', phase: 'tool', activity: 'read a.ts' })).toBe('read a.ts')
   expect(activityOf({ ...base, state: 'running', phase: 'thinking' })).toBe('thinking')
   expect(activityOf({ ...base, state: 'needs_approval', phase: 'approval' })).toBe('waiting for approval')
+})
+
+test('the digest is fetched again when the selected agent settles, then left alone', async ($, on) => {
+  const clock = mock.clock(on)
+  let state = 'running'
+  const digests: string[] = []
+  on('mcp.call', (_, e) => {
+    if (e.tool === 'get_agent_events') digests.push(state)
+    const body =
+      e.tool === 'get_dashboard' ? { revision: state, agents: [agent({ name: 'Ada', state })], ensembles: [] }
+      : e.tool === 'get_agent_events' ? { name: 'Ada', state, latest_message: state === 'running' ? 'working on it' : 'all done' }
+      : {}
+    return { value: { content: [{ type: 'text', text: JSON.stringify(body) }], structuredContent: body } }
+  })
+  on('command.register', () => ({ value: { command: 'subagent-mcp' } }))
+  on('ui.open', () => ({ value: { isPlaced: true } }))
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+  on('fs.read', () => ({ value: '{}' }))
+  await open($)
+
+  const ui = await $.ui.mount(PANE)
+  expect(await ui.find({ type: 'Text', text: /working on it/ })).toBeTruthy()
+  state = 'completed'
+  await clock.advance(2000)
+  expect(await ui.find({ type: 'Text', text: /all done/ })).toBeTruthy()
+  const settled = digests.filter(d => d === 'completed').length
+  await clock.advance(2000)
+  await clock.advance(2000)
+  expect(digests.filter(d => d === 'completed').length).toBe(settled)
+  await ui.unmount()
 })

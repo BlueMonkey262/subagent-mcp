@@ -10,6 +10,8 @@ const FAILURES_BEFORE_DORMANT = 3
 const SERVER = 'subagent-mcp'
 // get_dashboard is for this poller and the panel; the model keeps list_agents and get_ensemble.
 const HIDDEN_TOOLS = [`mcp__${SERVER}__get_dashboard`]
+// After falling back, try get_dashboard again this often: a /mcp reconnect can bring a newer server.
+const DASHBOARD_RETRY_MS = 5 * 60_000
 const MISSING_TOOL = /get_dashboard.*(not found|unknown)|(not found|unknown).*get_dashboard/i
 
 type Call = { isError?: boolean; structuredContent?: unknown; content: { type: string; text?: string }[] }
@@ -42,6 +44,7 @@ export const register: Register = (on, options) => {
     // get_dashboard answers { unchanged } while nothing moved; a server that predates it gets list_agents.
     let revision: string | undefined
     let dashboard = true
+    let retryAt = 0
     let last: Snapshot | undefined
 
     const schedule = (ms: number) => {
@@ -50,6 +53,7 @@ export const register: Register = (on, options) => {
     }
 
     const read = async (): Promise<Snapshot> => {
+      if (!dashboard && Date.now() >= retryAt) dashboard = true
       if (dashboard) {
         let result: Call | undefined
         try {
@@ -67,6 +71,7 @@ export const register: Register = (on, options) => {
         const text = result?.content.find(c => c.type === 'text')?.text ?? 'get_dashboard not found'
         if (!MISSING_TOOL.test(text)) throw new Error('get_dashboard failed')
         dashboard = false
+        retryAt = Date.now() + DASHBOARD_RETRY_MS
       }
       const result = (await $.mcp.call(SERVER, 'list_agents')) as Call
       if (result.isError) throw new Error('list_agents failed')

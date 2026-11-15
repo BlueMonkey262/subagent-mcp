@@ -1,4 +1,4 @@
-import { execFile } from 'node:child_process';
+import { execFile, spawn } from 'node:child_process';
 import { promisify } from 'node:util';
 import { dirname, join } from 'node:path';
 import { randomUUID } from 'node:crypto';
@@ -140,17 +140,23 @@ export async function diffWorktree(tree: Worktree, maxChars: number): Promise<Wo
   const env = { ...process.env, GIT_INDEX_FILE: index };
   const big = 64 * 1024 * 1024;
   try {
-    await exec('git', ['read-tree', 'HEAD'], { cwd: tree.path, env });
+    // Start from a copy of the worktree's own index: it keeps files the agent force-added past
+    // .gitignore (and the stat cache); HEAD is the fallback when there is no index yet.
+    try {
+      const realIndex = (await exec('git', ['rev-parse', '--path-format=absolute', '--git-path', 'index'], { cwd: tree.path })).stdout.trim();
+      await copyFile(realIndex, index);
+    } catch { await exec('git', ['read-tree', 'HEAD'], { cwd: tree.path, env }); }
     await exec('git', ['add', '-A', '--', '.'], { cwd: tree.path, env, maxBuffer: big });
     const numstat = (await exec('git', ['diff', '--cached', '--numstat', '-z', '--no-renames', against], { cwd: tree.path, env, maxBuffer: big })).stdout;
     const files = numstat.split('\0').filter(Boolean).map((line) => {
       const [added, deleted, ...rest] = line.split('\t');
       return { path: rest.join('\t'), added: added === '-' ? null : Number(added), deleted: deleted === '-' ? null : Number(deleted) };
     });
-    const full = (await exec('git', ['diff', '--cached', '--no-color', '--no-renames', against], { cwd: tree.path, env, maxBuffer: big })).stdout;
-    const truncated = full.length > maxChars;
+    // Read no more of the patch than the cap needs, so a huge diff is cut instead of failing.
+    const { text, more } = await readCapped('git', ['diff', '--cached', '--no-color', '--no-renames', against], { cwd: tree.path, env }, maxChars + 1);
+    const truncated = more || text.length > maxChars;
     // Cut at a line end so the patch stays parseable up to its last whole hunk line.
-    const cut = truncated ? full.slice(0, Math.max(0, full.lastIndexOf('\n', maxChars) + 1)) : full;
+    const cut = truncated ? text.slice(0, text.lastIndexOf('\n', maxChars - 1) + 1) : text;
     return {
       path: tree.path, branch: tree.branch, against, files,
       insertions: files.reduce((sum, file) => sum + (file.added ?? 0), 0),
@@ -160,4 +166,31 @@ export async function diffWorktree(tree: Worktree, maxChars: number): Promise<Wo
   } finally {
     await rm(index, { force: true }).catch(() => undefined);
   }
+}
+
+/** Runs a command and keeps the first `limit` characters of its output, stopping it once it has them. */
+function readCapped(command: string, args: readonly string[], options: { cwd: string; env: NodeJS.ProcessEnv }, limit: number): Promise<{ text: string; more: boolean }> {
+  return new Promise((resolve, reject) => {
+    const child = spawn(command, args, { cwd: options.cwd, env: options.env, stdio: ['ignore', 'pipe', 'pipe'] });
+    let text = '';
+    let more = false;
+    let stderr = '';
+    child.stdout.setEncoding('utf8');
+    child.stdout.on('data', (chunk: string) => {
+      if (more) return;
+      text += chunk;
+      if (text.length > limit) {
+        text = text.slice(0, limit);
+        more = true;
+        child.kill('SIGTERM');
+      }
+    });
+    child.stderr.setEncoding('utf8');
+    child.stderr.on('data', (chunk: string) => { if (stderr.length < 4_000) stderr += chunk; });
+    child.on('error', reject);
+    child.on('close', (code) => {
+      if (more || code === 0) resolve({ text, more });
+      else reject(new Error(`${command} ${args[0] ?? ''} exited ${String(code)}: ${stderr.trim()}`));
+    });
+  });
 }

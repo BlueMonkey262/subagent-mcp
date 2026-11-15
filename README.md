@@ -104,8 +104,9 @@ until the child completes or needs your approval; when it needs approval, call
   isolation, the snapshot, so your own uncommitted edits are not shown as the agent's). Per-file
   line counts plus a unified diff capped at `max_chars`.
 - `get_dashboard` is for status UIs (the `/subagent-mcp` panel and its poller hide it from the
-  model): live and recent agents, pending approvals, recent ensembles with member states and the
-  concurrency counters in one read. Pass the previous `revision` as `since` and an unchanged
+  model): live agents, the most recent finished ones (`recent`, default 10) and any that settled in
+  the last 15 minutes, pending approvals, recent ensembles with member states and the concurrency
+  counters in one read. Pass the previous `revision` as `since` and an unchanged
   snapshot answers `{ revision, unchanged: true }`.
 - Agent listings and `get_agent_events` summaries carry `phase` (`tool` while a call is open,
   `thinking` between calls, `approval` while waiting; a settled agent's state) and `last_tool`,

@@ -257,8 +257,9 @@ export class EnsembleManager {
    */
   overview(limit = 5): readonly Readonly<Record<string, unknown>>[] {
     const records = [...this.#records.values()].sort((a, b) => b.created_at.localeCompare(a.created_at));
+    // Refresh before sorting into open and finished, so one that just finished is listed as finished.
+    for (const record of records) if (!FINAL_STATUSES.has(record.status)) this.#safeRefresh(record);
     const open = records.filter((record) => !FINAL_STATUSES.has(record.status));
-    for (const record of open) this.#safeRefresh(record);
     const done = records.filter((record) => FINAL_STATUSES.has(record.status)).slice(0, Math.max(0, limit - open.length));
     return [...open, ...done].map((record) => {
       return {

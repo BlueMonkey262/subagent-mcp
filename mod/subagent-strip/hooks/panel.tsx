@@ -55,6 +55,7 @@ const MODELS_FILE = '.subagents/models.yaml'
 const isRunning = (a: PanelAgent) => RUNNING.includes(a.state)
 const OPEN_ENSEMBLE = ['launching', 'running', 'synthesizing']
 // A server that predates get_dashboard answers with a protocol error naming the tool.
+const DASHBOARD_RETRY_MS = 5 * 60_000
 const MISSING_TOOL = /get_dashboard.*(not found|unknown)|(not found|unknown).*get_dashboard/i
 
 /** What a running agent is doing, in a few words: its open tool call, else what it last ran. */
@@ -176,8 +177,11 @@ export const registerPanel = (on: On) => {
   let timer: { cancel: () => void } | undefined
   // Bumped by every open and every hand-off; a late refresh checks it before reclaiming focus.
   let epoch = 0
-  // Cleared once a server answers that it has no get_dashboard; list_agents serves from then on.
+  // Cleared when a server answers that it has no get_dashboard; list_agents serves until the retry.
   let dashboard = true
+  let retryAt = 0
+  // Which agent, in which state, the shown digest was fetched for.
+  let fetched: { id: string; state: string } | undefined
 
   on('command.run', { command: 'subagent-mcp' }, async ($, e) => {
     const mine = ++epoch
@@ -189,6 +193,7 @@ export const registerPanel = (on: On) => {
       try {
         let rows: Record<string, unknown>[] | undefined
         let ensembles: PanelEnsemble[] = []
+        if (!dashboard && Date.now() >= retryAt) dashboard = true
         if (dashboard) {
           try {
             // One read for agents, approvals and ensembles.
@@ -200,6 +205,7 @@ export const registerPanel = (on: On) => {
           } catch (error) {
             if (!MISSING_TOOL.test(str((error as Error).message))) throw error
             dashboard = false
+            retryAt = Date.now() + DASHBOARD_RETRY_MS
           }
         }
         if (rows === undefined) {
@@ -220,10 +226,12 @@ export const registerPanel = (on: On) => {
         const selected = agents.some(a => a.id === before.selected) ? before.selected : (agents[0]?.id ?? null)
         let detail = before.detailFor === selected ? before.detail : []
         const chosen = agents.find(a => a.id === selected)
-        // A settled agent's digest does not change: fetch it once, keep polling only running ones.
-        if (selected !== null && (chosen === undefined || isRunning(chosen) || before.detailFor !== selected || detail.length === 0)) {
+        // A settled agent's digest does not change: poll running ones, and fetch once more when the state moves.
+        const stale = fetched === undefined || fetched.id !== selected || fetched.state !== chosen?.state
+        if (selected !== null && (chosen === undefined || isRunning(chosen) || stale || before.detailFor !== selected || detail.length === 0)) {
           try {
             detail = digest(await callTool($, 'get_agent_events', { agent: selected, summary: true }))
+            fetched = { id: selected, state: chosen?.state ?? '' }
           } catch {
             // keep the previous digest
           }

@@ -155,7 +155,7 @@ async function main(): Promise<void> {
       '{ revision, unchanged: true } while nothing has changed.',
     inputSchema: {
       since: z.string().optional().describe('revision from the previous call'),
-      recent: z.number().int().min(0).max(50).optional().describe('finished agents to include (default 10)'),
+      recent: z.number().int().min(0).max(50).optional().describe('finished agents to include (default 10); agents that settled in the last 15 minutes are always included'),
       ensembles: z.number().int().min(0).max(20).optional().describe('ensembles to include (default 5; open ones first)'),
     } },
     async input => toContent(await call('get_dashboard', input)));
