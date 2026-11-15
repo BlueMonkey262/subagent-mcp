@@ -440,6 +440,46 @@ test("a dependency failure blocks the task and pings according to its notify pol
   assert.equal(blockedPings[0]?.["task_id"], pinging["task_id"]);
 });
 
+test("a dependent of a terminal agent that cannot produce its pinned turn blocks", async () => {
+  const settled: Readonly<Record<string, unknown>>[] = [];
+  const { supervisor, adapter } = fixture({ settled });
+  const now = new Date().toISOString();
+  supervisor.restore([{
+    id: "agent-terminal",
+    name: "terminal",
+    backend: "codex",
+    model: "fake-model",
+    agentConfig: "general",
+    cwd: "/work",
+    state: "running",
+    background: true,
+    createdAt: now,
+    updatedAt: now,
+    timeoutSeconds: null,
+    meta: { turn: 1, history: [] },
+  }]);
+  const taskId = "task-terminal-dep";
+  supervisor.restorePending([{
+    id: taskId,
+    created_at: now,
+    input: { ...spawn, backend: "codex", notify: "always" },
+    dependencies: [{ agent: "agent-terminal", turn: 1 }],
+    state: "queued",
+    notify: "always",
+  }] as never);
+  await waitUntil(() => supervisor.getAgentResult(taskId)?.state === "blocked");
+
+  const blocked = supervisor.getAgentResult(taskId) as Record<string, unknown>;
+  const result = blocked["result"] as Record<string, unknown>;
+  assert.equal((result["error"] as { code: string }).code, "DEPENDENCY_UNAVAILABLE");
+  assert.deepEqual(result["dependency"], { agent: "agent-terminal", turn: 1 });
+  assert.equal(adapter.spawnRequests.length, 0, "the dependent must not launch");
+  assert.equal(supervisor.hasPendingWork(), false, "a blocked dependent no longer keeps the host alive");
+  assert.equal(settled.length, 1);
+  assert.equal(settled[0]?.["status"], "blocked");
+  assert.equal(settled[0]?.["task_id"], taskId);
+});
+
 test("notify policy matrix for completed/failed, and needs_approval always pings", async () => {
   const expected: Record<NotifyMode, Record<"completed" | "failed", number>> = {
     always: { completed: 1, failed: 1 },

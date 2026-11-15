@@ -52,6 +52,14 @@ export interface ListAgentsInput {
 }
 export type NotifyMode = 'always' | 'on_failure' | 'never';
 
+/** One prerequisite of a queued task: the pinned turn's result, or why it can never arrive. */
+interface DependencyCheck {
+  readonly agent: string;
+  readonly turn: number;
+  readonly result?: Row;
+  readonly error?: FailureInfo;
+}
+
 interface PendingTask {
   id: string; created_at: string; updated_at?: string; input: SpawnAgentInput; dependencies: { agent: string; turn: number }[];
   state: 'queued' | 'starting' | 'blocked' | 'interrupted' | 'completed'; result?: Record<string, unknown>;
@@ -785,6 +793,87 @@ export class Supervisor {
     return true;
   }
 
+  #dependencyError(
+    dependency: { readonly agent: string; readonly turn: number },
+    code: string,
+    message: string,
+    details: Readonly<Record<string, unknown>> = {},
+  ): FailureInfo {
+    return classifyFailure({
+      code,
+      message,
+      source: 'supervisor',
+      details: { agent: dependency.agent, turn: dependency.turn, ...details },
+    });
+  }
+
+  /** An existing turn outcome that failed or produced invalid structured output. */
+  #dependencyResultError(dependency: { readonly agent: string; readonly turn: number }, result: Row): FailureInfo {
+    const invalid = result.validation_errors !== undefined;
+    const persisted = normalizeFailure(result.error, { failed: result.status !== 'completed' || invalid });
+    if (persisted !== undefined) return persisted;
+    return this.#dependencyError(
+      dependency,
+      invalid ? 'DEPENDENCY_INVALID_RESULT' : 'DEPENDENCY_FAILED',
+      invalid
+        ? `Prerequisite ${dependency.agent} turn ${dependency.turn} returned invalid structured output`
+        : `Prerequisite ${dependency.agent} turn ${dependency.turn} ended ${String(result.status)}`,
+      { status: result.status, ...(invalid ? { validation_errors: result.validation_errors } : {}) },
+    );
+  }
+
+  /**
+   * Resolve one pinned prerequisite. Undefined result and error means it may still produce the
+   * turn. A terminal agent or task without the pinned turn can never produce it: waiting would
+   * keep the dependent queued, and the host alive, forever.
+   */
+  #checkDependency(dependency: { readonly agent: string; readonly turn: number }): DependencyCheck {
+    const base = { agent: dependency.agent, turn: dependency.turn };
+    const task = this.#pending.get(dependency.agent);
+    if (task !== undefined) {
+      if (task.state === 'blocked' || task.state === 'interrupted') {
+        return {
+          ...base,
+          error: this.#dependencyError(dependency, 'DEPENDENCY_FAILED',
+            `Prerequisite task ${task.id} is ${task.state}`, { state: task.state }),
+        };
+      }
+      if (task.state === 'queued' || task.state === 'starting') return base;
+      const agentId = task.result?.agent_id;
+      if (typeof agentId !== 'string') {
+        return {
+          ...base,
+          error: this.#dependencyError(dependency, 'DEPENDENCY_UNAVAILABLE',
+            `Prerequisite task ${task.id} completed without a linked agent`),
+        };
+      }
+      return this.#checkDependencyAgent(dependency, agentId);
+    }
+    return this.#checkDependencyAgent(dependency, dependency.agent);
+  }
+
+  #checkDependencyAgent(
+    dependency: { readonly agent: string; readonly turn: number },
+    agentId: string,
+  ): DependencyCheck {
+    const record = this.#requireRecord(agentId);
+    const result = record.meta.history.find(item => item.turn === dependency.turn);
+    if (result !== undefined) {
+      return result.status !== 'completed' || result.validation_errors
+        ? { agent: dependency.agent, turn: dependency.turn, result, error: this.#dependencyResultError(dependency, result) }
+        : { agent: dependency.agent, turn: dependency.turn, result };
+    }
+    if (isActiveState(record.state)) return { agent: dependency.agent, turn: dependency.turn };
+    return {
+      agent: dependency.agent,
+      turn: dependency.turn,
+      error: this.#dependencyError(dependency, 'DEPENDENCY_UNAVAILABLE',
+        `Prerequisite agent ${agentId} is ${record.state} and has no result for pinned turn ${dependency.turn}; ` +
+          'it can no longer produce one.',
+        { agent_id: agentId, state: record.state }),
+    };
+  }
+
   async #runTask(task: PendingTask) {
     const run = async () => {
       if (this.#stopping) { this.#changes.delete(check); this.#clearTaskTimer(task.id); return; }
@@ -797,18 +886,21 @@ export class Supervisor {
         // grace window restorePending() uses instead of launching a long-stale schedule.
         if (this.#blockMissedStart(task)) { await this.#writeSnapshot(); this.#changed(); return; }
       }
-      const results = task.dependencies.map(dep => {
-        const prerequisite = this.#pending.get(dep.agent);
-        if (prerequisite && ['blocked','interrupted'].includes(prerequisite.state)) return { status: 'failed' };
-        if (prerequisite && !prerequisite.result?.agent_id) return undefined;
-        return this.#requireRecord(dep.agent).meta.history.find(h => h.turn === dep.turn);
-      });
-      if (results.some(r => !r)) return;
+      const checks = task.dependencies.map(dep => this.#checkDependency(dep));
+      if (checks.some(check => check.result === undefined && check.error === undefined)) return;
       this.#changes.delete(check);
       this.#clearTaskTimer(task.id);
       // A shutdown may have begun while the timer/readiness check was running.
       if (this.#stopping) return;
-      if (results.some(r => r!.status !== 'completed' || r!.validation_errors)) { this.#setTaskState(task, 'blocked'); await this.#writeSnapshot(); this.#changed(); return; }
+      const failed = checks.find(check => check.error !== undefined);
+      if (failed !== undefined) {
+        task.result = { error: failed.error, dependency: { agent: failed.agent, turn: failed.turn } };
+        this.#setTaskState(task, 'blocked');
+        await this.#writeSnapshot();
+        this.#changed();
+        return;
+      }
+      const results = checks.map(check => check.result!);
       this.#setTaskState(task, 'starting');
       await this.#writeSnapshot();
       if ((task.state as string) === 'interrupted') return;
