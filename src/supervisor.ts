@@ -1683,8 +1683,9 @@ export class Supervisor {
     this.#changed();
     if (record.detached && record.state !== "running" && record.state !== "starting") {
       // Nobody is blocked on this turn, so push the outcome instead of leaving the caller to poll.
-      // Cleared first: the follow-up (resolve_approval / send_message) blocks, or re-sets it.
-      record.detached = false;
+      // needs_approval is not terminal: keep detached armed so the turn's eventual outcome still
+      // pings once. A terminal outcome clears it first; the follow-up re-sets it if it blocks.
+      const terminal = record.state !== "needs_approval";
       if (this.#shouldNotify(record)) {
         try {
           this.#onDetachedSettled?.(this.#result(record));
@@ -1692,6 +1693,7 @@ export class Supervisor {
           // A failing notifier must not break the event pump.
         }
       }
+      if (terminal) record.detached = false;
     }
     const waiters = record.waiters;
     record.waiters = [];

@@ -524,6 +524,41 @@ test("notify policy matrix for completed/failed, and needs_approval always pings
   await supervisor.stopAgent(String(spawned["agent_id"]));
 });
 
+test("an approval ping does not consume the turn's terminal ping", async () => {
+  const settled: Readonly<Record<string, unknown>>[] = [];
+  const { supervisor, adapter } = fixture({ settled });
+  adapter.queueScript([{
+    create: (context) => ({
+      type: "approval.requested",
+      agentId: context.agentId,
+      backend: context.backend,
+      data: {
+        requestId: "req-approval-ping",
+        agentId: context.agentId,
+        backend: "codex" as const,
+        toolName: "Bash",
+        input: { command: "npm test" },
+        command: "npm test",
+        cwd: "/work",
+        requestedAt: new Date().toISOString(),
+      },
+    }),
+  }]);
+  const spawned = await supervisor.spawnAgent({ ...spawn, notify: "always" });
+  const agentId = String(spawned["agent_id"]);
+  await waitUntil(() => settled.length === 1);
+  assert.equal(settled[0]?.["status"], "needs_approval");
+
+  const resolving = supervisor.resolveApproval("req-approval-ping", "allow");
+  await waitUntil(() => supervisor.listAgents().some((agent) =>
+    agent["agent_id"] === agentId && agent["state"] === "running"));
+  adapter.emit(agentId, "turn.completed", { turnId: "after-approval", status: "completed", finalText: "approved" });
+  await resolving;
+  await waitUntil(() => settled.length === 2);
+  assert.deepEqual(settled.map((ping) => ping["status"]), ["needs_approval", "completed"]);
+  assert.equal(settled[1]?.["result"], "approved");
+});
+
 test("notify survives a snapshot round-trip and a send_message resume", async () => {
   const firstSettled: Readonly<Record<string, unknown>>[] = [];
   const first = fixture({ settled: firstSettled });
