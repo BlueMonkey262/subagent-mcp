@@ -40,7 +40,7 @@ test('config discovery, bounded listing, progress and durable successive structu
   s.enablePersistence(path);
   a.queueScript([]);
   const id = String((await s.spawnAgent({ ...spawn, result_schema: { type: 'object', properties: { ok: { type: 'boolean' } }, required: ['ok'] } })).agent_id);
-  assert.equal(s.listAgentConfigs().configs[0]?.name, 'general');
+  assert.equal((await s.listAgentConfigs()).configs[0]?.name, 'general');
   a.emit(id, 'tool.start', { toolCallId: 't', toolName: 'Running tests', input: {} }); await tick();
   assert.equal(s.listAgents()[0]?.current_activity, 'Running tests');
   a.emit(id, 'turn.completed', { turnId: 'first', status: 'completed', finalText: '{"ok":true}', usage: { costUsd: 1 } });

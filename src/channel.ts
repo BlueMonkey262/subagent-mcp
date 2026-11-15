@@ -26,7 +26,12 @@ export const CHANNEL_INSTRUCTIONS =
   "needs_approval events carry the request details: answer with resolve_approval. A result cut with " +
   "[truncated] is available in full from get_agent_events. A background ensemble (start_ensemble) sends one " +
   '<channel source="subagent-mcp" kind="ensemble" ensemble_id="..." status="..."> event with its aggregate ' +
-  "instead of one per member; member approval requests still arrive individually.";
+  "instead of one per member; member approval requests still arrive individually. " +
+  'Schedule work for later (for example overnight) with spawn_agent\'s start_at or delay_seconds; it returns a ' +
+  'queued task receipt immediately. Choose notify per job: "always" (default), "on_failure", or "never"; ' +
+  "needs_approval always pings. If no Claude Code session is attached when a background agent settles, the ping " +
+  "is queued and delivered when a session next attaches (at most once). A scheduled task whose start was missed " +
+  "past the grace window is blocked with MISSED_START.";
 
 export function isClaudeCodeClient(clientName: string | undefined): boolean {
   return clientName === CLAUDE_CODE_CLIENT_NAME;

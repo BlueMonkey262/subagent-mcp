@@ -44,7 +44,17 @@ export function buildDashboard(supervisor: Supervisor, ensembles: EnsembleManage
     ensembles: ensembles?.overview(Math.min(20, Math.max(0, input.ensembles ?? 5))) ?? [],
     concurrency: supervisor.concurrency(),
   };
-  const revision = createHash("sha256").update(JSON.stringify(body)).digest("base64url").slice(0, 16);
+  // Liveness timestamps are recomputed on every read (see Supervisor#livenessView), so they move
+  // even when nothing happened. Leave them out of the revision or a poller would never see
+  // `unchanged`; the full records above still carry them.
+  const revisionBody = {
+    ...body,
+    agents: agents.map((agent) => {
+      const { liveness_checked_at: _checkedAt, heartbeat_age_seconds: _heartbeatAge, ...stable } = agent as Record<string, unknown>;
+      return stable;
+    }),
+  };
+  const revision = createHash("sha256").update(JSON.stringify(revisionBody)).digest("base64url").slice(0, 16);
   if (input.since !== undefined && input.since === revision) return { revision, unchanged: true };
   return { revision, at: new Date().toISOString(), ...body };
 }

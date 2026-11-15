@@ -7,6 +7,7 @@ import { fileURLToPath } from "node:url";
 
 import { CHANNEL_CAPABILITY, CHANNEL_INSTRUCTIONS, createChannelNotifier, createEnsembleChannelNotifier } from "./channel.js";
 import { HostSession, runHost } from "./host.js";
+import { attachSessionAfterInitialize } from "./session.js";
 import { ServedCatalog, TOOL_CATALOG, validateToolInput } from "./tool-catalog.js";
 
 async function main(): Promise<void> {
@@ -26,8 +27,8 @@ async function main(): Promise<void> {
   host.onDetached(createChannelNotifier(server.server));
   host.onEnsemble(createEnsembleChannelNotifier(server.server));
   await host.connect();
-  const call = async (method: string, params?: unknown): Promise<unknown> => {
-    const result = await host.call(method, params);
+  const call = async (method: string, params?: unknown, timeoutMs = 0): Promise<unknown> => {
+    const result = await host.call(method, params, timeoutMs);
     // A newer host's tools are already listed here, so its "reconnect for updated tools" warning is moot.
     const warning = catalog.servesHost(host.hostBuild()) && host.hostIsNewer() ? undefined : host.warning();
     return warning !== undefined && typeof result === "object" && result !== null && !Array.isArray(result)
@@ -79,7 +80,7 @@ async function main(): Promise<void> {
       input = checked.value;
     }
     try {
-      const value = local ? await restart(isRecord(input) && input["force"] === true) : await call(name, input);
+      const value = local ? await restart(isRecord(input) && input["force"] === true) : await call(name, input, tool.timeoutMs);
       return tool.format === "compact" ? toCompactContent(value) : toContent(value);
     } catch (error) {
       return failure(error instanceof Error ? error.message : String(error));
@@ -87,6 +88,8 @@ async function main(): Promise<void> {
   });
 
   const transport = new StdioServerTransport();
+  // Probes and non-Claude clients never attach; the queue is drained after initialize for Claude Code.
+  attachSessionAfterInitialize(server.server, host);
   await server.connect(transport);
 
   // The host process owns the agents. Exiting this proxy must not kill them.

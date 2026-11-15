@@ -17,7 +17,7 @@ import { Supervisor } from "../src/supervisor.js";
 
 const permission = { allow: [], deny: [], default: "escalate" as const };
 
-function testRegistry(agents: readonly AgentConfig[], roster: Partial<ModelRoster> = {}): ConfigRegistry {
+function testRegistry(agents: readonly AgentConfig[], roster: Partial<ModelRoster> = {}, limits = defaultServerLimits()): ConfigRegistry {
   const fullRoster: ModelRoster = {
     claude: roster.claude ?? [],
     codex: roster.codex ?? [{ name: "fake-model" }],
@@ -27,7 +27,7 @@ function testRegistry(agents: readonly AgentConfig[], roster: Partial<ModelRoste
     copilot: roster.copilot ?? [],
     vibe: roster.vibe ?? [],
   };
-  return new ConfigRegistry(agents, fullRoster);
+  return new ConfigRegistry(agents, fullRoster, limits);
 }
 
 function codexAgentConfig(overrides: Partial<AgentConfig> = {}): AgentConfig {
@@ -102,6 +102,185 @@ test("summary keeps the finished turn's message and reports a tool.end whose sta
   const recent = supervisor.summarizeAgentEvents(id, 5, mid);
   assert.deepEqual((recent["recent_tools"] as { tool: string; status: string }[]).map((c) => [c.tool, c.status]), [["Bash", "completed"]]);
   assert.equal(recent["latest_message"], "Final answer here.");
+});
+
+test("a failed turn without an error gets a synthesized actionable error", async () => {
+  const adapter = new FakeAdapter("codex");
+  const supervisor = new Supervisor({
+    registry: testRegistry([codexAgentConfig()]),
+    adapters: new AdapterRegistry([adapter]),
+    cwd: "/work",
+  });
+  adapter.queueScript([]);
+  const id = String((await supervisor.spawnAgent({ agent: "general", prompt: "x", description: "x", run_in_background: true }))["agent_id"]);
+  adapter.emit(id, "turn.completed", { turnId: "silent-failure", status: "failed" });
+  await waitUntil(() => supervisor.listAgents().find(agent => agent["agent_id"] === id)?.["state"] === "failed");
+
+  const listed = supervisor.listAgents().find(agent => agent["agent_id"] === id);
+  const error = listed?.["error"] as { code: string; category: string; recommended_action: string } | undefined;
+  assert.equal(error?.code, "TURN_FAILED");
+  assert.equal(error?.category, "task");
+  assert.equal(error?.recommended_action, "none");
+
+  const events = supervisor.getAgentEvents(id, 0);
+  const errors = (events.events as unknown as { type: string; data: { code?: string; source?: string } }[])
+    .filter(event => event.type === "error");
+  assert.equal(errors.length, 1);
+  assert.equal(errors[0]?.data.code, "TURN_FAILED");
+  assert.equal(errors[0]?.data.source, "supervisor");
+
+  adapter.queueScript([]);
+  await supervisor.sendMessage({ agent: id, prompt: "retry", run_in_background: true });
+  adapter.emit(id, "turn.completed", { turnId: "recovered", status: "completed", finalText: "ok" });
+  await waitUntil(() => supervisor.listAgents().find(agent => agent["agent_id"] === id)?.["state"] === "completed");
+  assert.equal(supervisor.listAgents().find(agent => agent["agent_id"] === id)?.["error"], undefined);
+});
+
+test("a backend error is classified and never exposed as a successful code", async () => {
+  const adapter = new FakeAdapter("codex");
+  const supervisor = new Supervisor({
+    registry: testRegistry([codexAgentConfig()]),
+    adapters: new AdapterRegistry([adapter]),
+    cwd: "/work",
+  });
+  adapter.queueScript([]);
+  const id = String((await supervisor.spawnAgent({ agent: "general", prompt: "x", description: "x", run_in_background: true }))["agent_id"]);
+  adapter.emit(id, "error", {
+    code: "CODEX_TURN_FAILED",
+    message: "You have exceeded your current quota",
+    fatal: false,
+  });
+  adapter.emit(id, "turn.completed", { turnId: "quota", status: "failed" });
+  await waitUntil(() => supervisor.listAgents().find(agent => agent["agent_id"] === id)?.["state"] === "failed");
+
+  const error = supervisor.listAgents().find(agent => agent["agent_id"] === id)?.["error"] as
+    | { category: string; recommended_action: string; retryable: boolean }
+    | undefined;
+  assert.equal(error?.category, "quota");
+  assert.equal(error?.recommended_action, "quarantine");
+  assert.equal(error?.retryable, false);
+});
+
+test("a dead backend is marked stale, then failed, and releases its capacity slot", async () => {
+  const adapter = new FakeAdapter("codex");
+  const supervisor = new Supervisor({
+    registry: testRegistry([codexAgentConfig()]),
+    adapters: new AdapterRegistry([adapter]),
+    cwd: "/work",
+    maxConcurrent: 1,
+  });
+  adapter.queueScript([]);
+  const id = String((await supervisor.spawnAgent({ agent: "general", prompt: "x", description: "x", run_in_background: true }))["agent_id"]);
+  adapter.setLiveness(id, { state: "stale", reason: "process exited" });
+
+  const first = supervisor.listAgents().find(agent => agent["agent_id"] === id);
+  assert.equal(first?.["state"], "running");
+  assert.equal(first?.["liveness"], "stale");
+  assert.match(String(first?.["liveness_reason"]), /process exited/);
+  assert.equal(supervisor.concurrency().active, 1);
+
+  const second = supervisor.listAgents().find(agent => agent["agent_id"] === id);
+  assert.equal(second?.["state"], "failed");
+  assert.equal((second?.["error"] as { code: string }).code, "AGENT_UNRESPONSIVE");
+  assert.equal((second?.["error"] as { category: string }).category, "process");
+  assert.equal((second?.["error"] as { recommended_action: string }).recommended_action, "resume");
+  assert.equal(supervisor.concurrency().active, 0);
+  await waitUntil(() => supervisor.listAgents().find(agent => agent["agent_id"] === id)?.["state"] === "failed");
+});
+
+test("an unknown probe ages into a stale marker without killing a live long task", async () => {
+  const adapter = new FakeAdapter("codex");
+  const supervisor = new Supervisor({
+    registry: testRegistry([codexAgentConfig()]),
+    adapters: new AdapterRegistry([adapter]),
+    cwd: "/work",
+    staleAgentMs: 1,
+  });
+  adapter.queueScript([]);
+  const id = String((await supervisor.spawnAgent({ agent: "general", prompt: "x", description: "x", run_in_background: true }))["agent_id"]);
+  adapter.setLiveness(id, { state: "unknown", reason: "probe unavailable" });
+  await new Promise(resolve => setTimeout(resolve, 5));
+  const stale = supervisor.listAgents().find(agent => agent["agent_id"] === id);
+  assert.equal(stale?.["state"], "running");
+  assert.equal(stale?.["liveness"], "stale");
+
+  adapter.setLiveness(id, { state: "live" });
+  const recovered = supervisor.listAgents().find(agent => agent["agent_id"] === id);
+  assert.equal(recovered?.["state"], "running");
+  assert.equal(recovered?.["liveness"], "live");
+  assert.equal(recovered?.["stale_since"], undefined);
+});
+
+test("per-model capacity queues one local model without blocking another model", async () => {
+  const adapter = new FakeAdapter("codex");
+  const limits = {
+    ...defaultServerLimits(),
+    perModelConcurrency: [{ pattern: "codex:fake-model", limit: 1 }],
+  };
+  const supervisor = new Supervisor({
+    registry: testRegistry([
+      codexAgentConfig(),
+      codexAgentConfig({ name: "other", model: "other-model" }),
+    ], {
+      codex: [{ name: "fake-model" }, { name: "other-model" }],
+    }, limits),
+    adapters: new AdapterRegistry([adapter]),
+    cwd: "/work",
+  });
+
+  adapter.queueScript([]);
+  const first = String((await supervisor.spawnAgent({ agent: "general", prompt: "first", description: "first", run_in_background: true }))["agent_id"]);
+  adapter.queueScript([]);
+  const secondSpawn = supervisor.spawnAgent({ agent: "general", prompt: "second", description: "second", run_in_background: true });
+  await waitUntil(() => supervisor.concurrency().waiting === 1);
+  assert.equal(supervisor.concurrency().per_model["codex:fake-model"]?.["active"], 1);
+
+  adapter.queueScript([]);
+  const other = String((await supervisor.spawnAgent({ agent: "other", prompt: "other", description: "other", run_in_background: true }))["agent_id"]);
+  assert.notEqual(other, first);
+  assert.equal(supervisor.concurrency().active, 2);
+  assert.equal(supervisor.concurrency().waiting, 1);
+
+  adapter.emit(first, "turn.completed", { turnId: "first", status: "completed", finalText: "done" });
+  const second = String((await secondSpawn)["agent_id"]);
+  assert.notEqual(second, other);
+  assert.equal(supervisor.concurrency().per_model["codex:fake-model"]?.["active"], 1);
+  adapter.emit(second, "turn.completed", { turnId: "second", status: "completed" });
+  adapter.emit(other, "turn.completed", { turnId: "other", status: "completed" });
+  await waitUntil(() => supervisor.concurrency().active === 0);
+});
+
+test("send_message returns a running receipt when its wait budget expires and never cancels the turn", async () => {
+  const adapter = new FakeAdapter("codex");
+  const supervisor = new Supervisor({
+    registry: testRegistry([codexAgentConfig()]),
+    adapters: new AdapterRegistry([adapter]),
+    cwd: "/work",
+    sendMessageWaitMs: 30_000,
+  });
+  adapter.queueScript([]);
+  const id = String((await supervisor.spawnAgent({ agent: "general", prompt: "first", description: "first", run_in_background: true }))["agent_id"]);
+
+  const queued = await supervisor.sendMessage({ agent: id, prompt: "queued", wait_seconds: 0 });
+  assert.equal(queued["status"], "running");
+  assert.equal(queued["queued"], true);
+  assert.equal(queued["wait_expired"], true);
+  assert.equal(supervisor.concurrency().active, 1);
+
+  adapter.emit(id, "turn.completed", { turnId: "first-turn", status: "completed", finalText: "first done" });
+  await waitUntil(() => adapter.resumeRequests.length === 1);
+  adapter.emit(id, "turn.completed", { turnId: "second-turn", status: "completed", finalText: "queued done" });
+  await waitUntil(() => supervisor.listAgents().find(agent => agent["agent_id"] === id)?.["state"] === "completed");
+
+  const resumed = await supervisor.sendMessage({ agent: id, prompt: "again", wait_seconds: 0 });
+  assert.equal(resumed["status"], "running");
+  assert.equal(resumed["wait_expired"], true);
+  assert.equal(typeof resumed["turn_id"], "string");
+
+  adapter.emit(id, "turn.completed", { turnId: "third-turn", status: "completed", finalText: "third done" });
+  await waitUntil(() => supervisor.listAgents().find(agent => agent["agent_id"] === id)?.["state"] === "completed");
+  assert.equal((supervisor.getAgentResult(id) as { result: string }).result, "third done");
+  assert.equal(supervisor.concurrency().active, 0);
 });
 
 test("concurrent unnamed spawns receive unique names", async () => {
@@ -1265,7 +1444,7 @@ test("blockClaudeModels refuses Claude spawns and resumes, allows endpoint model
     (error: Error & { code?: string }) => error.code === "BACKEND_DISABLED");
   await assert.rejects(blocked.spawnAgent({ agent: "claude-general", model: "nim/nemotron", prompt: "hi", description: "pattern" }),
     (error: Error & { code?: string }) => error.code === "MODEL_BLOCKED");
-  const configs = blocked.listAgentConfigs().configs as { name: string; blocked?: boolean; blocked_by?: string }[];
+  const configs = (await blocked.listAgentConfigs()).configs as { name: string; blocked?: boolean; blocked_by?: string }[];
   assert.equal(configs.find((config) => config.name === "general")?.blocked_by, "disabledBackends");
   assert.equal(configs.find((config) => config.name === "claude-general")?.blocked, undefined, "an unpinned config is judged per spawn");
   assert.deepEqual(await blocked.listModels("codex"), { ...(await blocked.listModels("codex", false)), live: { disabled: true } },

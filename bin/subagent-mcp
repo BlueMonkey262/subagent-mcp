@@ -6,6 +6,7 @@
 #   subagent-mcp nim set-key [KEY]           add the NVIDIA NIM endpoint with your API key
 #   subagent-mcp endpoint add NAME URL --model ID[=alias] [--key KEY]   add any OpenAI-compatible endpoint
 #   subagent-mcp endpoint list|remove NAME
+#   subagent-mcp antigravity doctor|vendor <agent-config> [--force]     audit or vendor Antigravity definitions
 #   subagent-mcp status                      endpoints, litellm and proxy state
 set -euo pipefail
 
@@ -20,6 +21,10 @@ nim)
 endpoint)
     shift
     exec node "$ROOT/bin/endpoints.mjs" "$@"
+    ;;
+antigravity)
+    shift
+    exec node "$ROOT/bin/agents.mjs" "$@"
     ;;
 status)
     node "$ROOT/bin/endpoints.mjs" list

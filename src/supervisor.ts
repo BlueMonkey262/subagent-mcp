@@ -20,9 +20,31 @@ interface ExecutionMeta {
   group_id?: string;
   /** Membership in a managed ensemble; set only by the ensemble manager, never from tool input. */
   ensemble?: EnsembleMembership;
+  /** Captured Antigravity custom-agent definition used for this conversation. */
+  agentDefinition?: AgentDefinitionMetadata;
   /** Set when the agent was started from a queued task: the task's id and creation time, which fix its list position. */
   queued_from?: string;
   queued_at?: string;
+  /** Scheduled start of the queued task that produced this agent, when it was delayed. */
+  start_at?: string;
+  /** Completion ping policy; defaults to always. */
+  notify?: NotifyMode;
+}
+
+interface AgentDefinitionMetadata {
+  readonly name: string;
+  readonly sourcePath: string;
+  readonly source: "explicit" | "project" | "global";
+  readonly portable: boolean;
+  readonly sha256: string;
+  readonly description?: string;
+  readonly tools?: readonly string[];
+  readonly permission?: unknown;
+  readonly capturedAt: string;
+  /** Project-local copy of the exact definition, when persistence is enabled. */
+  readonly snapshotPath?: string;
+  /** Antigravity owns tool policy; this bridge only passes --agent. */
+  readonly bridge_enforced: false;
 }
 /** Trusted ensemble membership of an agent (see src/ensemble/manager.ts). */
 export interface EnsembleMembership { readonly id: string; readonly role: string }
@@ -44,29 +66,51 @@ export interface ListAgentsInput {
   states?: string[] | undefined; backend?: Backend | undefined; updated_since?: string | undefined;
   limit?: number | undefined; cursor?: string | undefined;
 }
+export type NotifyMode = 'always' | 'on_failure' | 'never';
+
+/** One prerequisite of a queued task: the pinned turn's result, or why it can never arrive. */
+interface DependencyCheck {
+  readonly agent: string;
+  readonly turn: number;
+  readonly result?: Row;
+  readonly error?: FailureInfo;
+}
+
 interface PendingTask {
   id: string; created_at: string; updated_at?: string; input: SpawnAgentInput; dependencies: { agent: string; turn: number }[];
   state: 'queued' | 'starting' | 'blocked' | 'interrupted' | 'completed'; result?: Record<string, unknown>;
+  /** ISO time before which the task must not start, fixed when it was scheduled so it survives restart. */
+  start_at?: string;
+  /** Completion ping policy; defaults to always. */
+  notify?: NotifyMode;
 }
 
 
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
-import { dirname } from "node:path";
+import { dirname, join } from "node:path";
 
-import { AdapterRegistry, type BackendAdapter } from "./adapters/adapter.js";
+import { AdapterRegistry, type AdapterLiveness, type BackendAdapter } from "./adapters/adapter.js";
+import {
+  AntigravityAgentDefinitionError,
+  FileAntigravityAgentResolver,
+  type AntigravityAgentDefinition,
+  type AntigravityAgentResolver,
+} from "./adapters/antigravity/agent-definition.js";
 import { ApprovalCoordinator } from "./approval/coordinator.js";
 import type { ApprovalDecision } from "./approval/types.js";
 import { AGENT_NAMES } from "./agent-names.js";
 import type { AgentConfigSource } from "./config/registry.js";
 import type { Backend, Usage } from "./core/types.js";
-import type { ModelEntry } from "./config/schema.js";
-import { AgentCapacity, childDepthEnv } from "./core/limits.js";
+import { BACKENDS } from "./core/types.js";
+import type { ModelConcurrencyRule, ModelEntry, ResolvedAgentConfig } from "./config/schema.js";
+import { AgentCapacity, childDepthEnv, DEFAULT_SCHEDULED_GRACE_MS } from "./core/limits.js";
 import { classifyProviderError, providerOf, type ProviderErrorClass } from "./core/providers.js";
-import { blockReason, describeBlock, envDisabledBackends, isRestrictive, ModelBlockedError } from "./core/model-policy.js";
+import { blockReason, describeBlock, envDisabledBackends, isRestrictive, matchesModelPattern, ModelBlockedError } from "./core/model-policy.js";
 import { ConfigInvalidError, ConfigurationError, SubagentError } from "./core/errors.js";
+import { classifyFailure, normalizeFailure, type FailureInfo } from "./core/failure.js";
 import { EventBuffer } from "./events/buffer.js";
 import type { EventReadOptions } from "./events/buffer.js";
-import type { AgentEvent } from "./events/schema.js";
+import type { AgentEvent, NormalizedEventData } from "./events/schema.js";
 import { scanChildOutput } from "./safety/output.js";
 import { describeToolInput } from "./tool-describe.js";
 import { remainingAllowances, UsageLedger, usageByProvider } from "./usage.js";
@@ -75,6 +119,12 @@ import { compareVersions, currentVersion, updateCheckDisabled } from "./update-c
 
 /** Cap on one backend's live `providerInfo` query, so `list_models` never hangs on it. */
 const LIVE_INFO_TIMEOUT_MS = 30_000;
+/** Longest a delayed spawn may be scheduled ahead. */
+const MAX_SCHEDULE_MS = 7 * 24 * 60 * 60 * 1000;
+/** Node's setTimeout limit; longer waits are re-armed in chunks. */
+const MAX_TIMER_MS = 2 ** 31 - 1;
+/** Bound on persisted completion pings waiting for a client to attach. */
+const MAX_UNDELIVERED_PINGS = 100;
 
 export type ToolAgentState = "starting" | "running" | "needs_approval" | "completed" | "interrupted" | "failed";
 
@@ -93,18 +143,31 @@ interface AgentRecord {
   detached: boolean;
   readonly createdAt: string;
   updatedAt: string;
+  /** Last event observed from the adapter, separate from user-visible activity. */
+  heartbeatAt: string;
+  /** Consecutive authoritative stale probes; two transitions the agent to failed. */
+  staleProbes: number;
+  staleSince?: string;
   cursor: number;
+  /** Adapter turn id for the turn in progress, when known. */
+  currentTurnId?: string;
   pendingApprovalId?: string;
   /** One queued send_message, delivered once the current turn reaches turn.completed. */
-  pendingMessage?: { readonly prompt: string; readonly effort?: string; readonly timeout?: number };
+  pendingMessage?: {
+    readonly prompt: string;
+    readonly effort?: string;
+    readonly timeout?: number;
+    /** Carried so a queued Antigravity resume can accept a changed agent definition. */
+    readonly allowDefinitionChange?: boolean;
+  };
   /** The turn number each adapter turn id belongs to, so a late turn.completed can't settle a newer turn. */
   turnIds?: Map<string, number>;
   /** Tool calls started and not yet ended, by toolCallId, in start order. */
   openTools?: Map<string, string>;
   /** Set while a queued message waits out its provider's cooldown; stop_agent calls it to drop the message. */
   abortCooldownWait?: () => void;
-  /** lastError came from a non-fatal error that a successful turn.completed should clear. */
-  lastErrorTransient?: boolean;
+  /** `lastError` describes how a successful turn went (a denial, for example), so completion must not clear it. */
+  lastErrorPersists?: boolean;
   /** Seconds. Null when neither the call nor the agent config set a cap. */
   timeoutSeconds: number | null;
   timedOut: boolean;
@@ -117,7 +180,9 @@ interface AgentRecord {
   liveUsage?: Usage;
   result?: string;
   usage?: Readonly<Record<string, unknown>>;
-  lastError?: { readonly code: string; readonly message: string };
+  lastError?: FailureInfo;
+  /** Supervisor turn number that produced `lastError`, so a stale error cannot label a later turn. */
+  lastErrorTurn?: number;
   waiters: (() => void)[];
   release: () => void;
 }
@@ -138,7 +203,7 @@ export interface AgentSnapshot {
   readonly timeoutSeconds: number | null;
   readonly timedOut?: boolean;
   readonly result?: string;
-  readonly lastError?: { readonly code: string; readonly message: string };
+  readonly lastError?: FailureInfo;
   readonly warning?: string;
   readonly nameNote?: string;
 }
@@ -149,6 +214,12 @@ export interface SpawnAgentInput {
   readonly result_schema?: Record<string, unknown> | undefined;
   readonly group_id?: string | undefined;
   readonly depends_on?: readonly string[] | undefined;
+  /** ISO datetime at which a queued spawn may start. Mutually exclusive with delay_seconds. */
+  readonly start_at?: string | undefined;
+  /** Positive seconds from now at which a queued spawn may start. Mutually exclusive with start_at. */
+  readonly delay_seconds?: number | undefined;
+  /** When to push a completion ping: always (default), on_failure, or never. */
+  readonly notify?: NotifyMode | undefined;
   readonly agent: string;
   readonly prompt: string;
   readonly description: string;
@@ -198,6 +269,12 @@ export interface SendMessageInput {
    */
   readonly allow_expensive_resume?: boolean | undefined;
   readonly max_result_chars?: number | undefined;
+  /** When to push a completion ping for this and later turns: always (default), on_failure, or never. */
+  readonly notify?: NotifyMode | undefined;
+  /** Seconds to wait before returning a running receipt instead of blocking for the whole turn. */
+  readonly wait_seconds?: number | undefined;
+  /** Resume an Antigravity conversation even though its custom-agent file changed. */
+  readonly allow_agent_definition_change?: boolean | undefined;
 }
 
 export interface SupervisorOptions {
@@ -210,13 +287,20 @@ export interface SupervisorOptions {
   readonly maxConcurrent?: number;
   /** Overrides the registry's Codex resume idle limit. */
   readonly codexResumeIdleMs?: number;
+  /** Overrides the registry's stale-agent heartbeat threshold. */
+  readonly staleAgentMs?: number;
+  /** Overrides the default send_message wait budget. */
+  readonly sendMessageWaitMs?: number;
+  /** Overrides how late a restored scheduled task may start before it is blocked. */
+  readonly scheduledGraceMs?: number;
+  /** Resolves Antigravity custom-agent definitions for audit and drift checks. */
+  readonly antigravityResolver?: AntigravityAgentResolver;
   readonly usage?: UsageLedger;
   /** Update cache written by the host's background release check. */
   readonly updateCachePath?: string;
 }
 
 interface ProviderGate {
-  capacity?: AgentCapacity;
   /** Earliest time a waiter may resume after a rate limit. */
   cooldownUntil: number;
   /** Each waiter adds a random share of this to cooldownUntil, so waiters don't resume together. */
@@ -233,6 +317,48 @@ export class SupervisorError extends SubagentError {
   }
 }
 
+/** Shutdown began before a child launched: a queued task must stay queued for the next host. */
+class HostShutdownError extends SupervisorError {
+  constructor() {
+    super("The host began shutting down before the task launched", { reason: "shutting_down" });
+  }
+}
+
+function resolveNotify(value: unknown, fallback: NotifyMode = 'always'): NotifyMode {
+  if (value === undefined) return fallback;
+  if (value === 'always' || value === 'on_failure' || value === 'never') return value;
+  throw new SupervisorError('notify must be "always", "on_failure", or "never"', { notify: value });
+}
+
+/** Resolve start_at/delay_seconds to one fixed ISO start time, rejecting both, the past, and >7 days. */
+function resolveStartAt(input: { readonly start_at?: string | undefined; readonly delay_seconds?: number | undefined }, now = Date.now()): string | undefined {
+  if (input.start_at !== undefined && input.delay_seconds !== undefined) {
+    throw new SupervisorError('Provide exactly one of start_at or delay_seconds, not both');
+  }
+  if (input.delay_seconds !== undefined) {
+    const seconds = input.delay_seconds;
+    if (!Number.isSafeInteger(seconds) || seconds <= 0) {
+      throw new SupervisorError('delay_seconds must be a positive integer', { delay_seconds: seconds });
+    }
+    if (seconds * 1000 > MAX_SCHEDULE_MS) {
+      throw new SupervisorError('delay_seconds must be at most 7 days (604800 seconds)', { delay_seconds: seconds });
+    }
+    return new Date(now + seconds * 1000).toISOString();
+  }
+  if (input.start_at === undefined) return undefined;
+  const start = Date.parse(input.start_at);
+  if (!Number.isFinite(start)) {
+    throw new SupervisorError('start_at must be a valid ISO datetime', { start_at: input.start_at });
+  }
+  if (start <= now) {
+    throw new SupervisorError('start_at must be in the future', { start_at: input.start_at });
+  }
+  if (start - now > MAX_SCHEDULE_MS) {
+    throw new SupervisorError('start_at must be at most 7 days in the future', { start_at: input.start_at });
+  }
+  return new Date(start).toISOString();
+}
+
 /** Backend-neutral orchestration: capacity/depth, blocking-with-escalation spawn/resume, and lookup. */
 const CODEX_RESUME_WARNING =
   "Codex resume replays the whole thread with no prompt cache, so this turn is billed for the full history. " +
@@ -243,7 +369,7 @@ export class Supervisor {
   readonly #adapters: AdapterRegistry;
   readonly #cwd: string;
   readonly #capacity: AgentCapacity;
-  /** Per-provider slots, cooldown and failure counts (models.yaml `providerLimits`). */
+  /** Per-provider cooldown and failure counts (models.yaml `providerLimits`); the slots live in `#capacity`. */
   readonly #providers = new Map<string, ProviderGate>();
   readonly #approvals: ApprovalCoordinator;
   readonly #agents = new Map<string, AgentRecord>();
@@ -251,14 +377,24 @@ export class Supervisor {
   readonly #events = new EventBuffer();
   readonly #onDetachedSettled: ((result: Readonly<Record<string, unknown>>) => void) | undefined;
   readonly #codexResumeIdleMs: number | undefined;
+  readonly #antigravityResolver: AntigravityAgentResolver;
+  #staleAgentMs: number;
+  #sendMessageWaitMs: number;
+  #scheduledGraceMs: number;
   readonly #usage: UsageLedger;
   readonly #updateCachePath: string | undefined;
   #persistencePath: string | undefined;
+  #persistenceClosed = false;
   #resultsStore: AppendOnlyJsonlStore<Record<string, unknown>> | undefined;
   #nameCursor = 0;
   #writes: Promise<void> = Promise.resolve();
   #storageError: string | undefined;
   #pending = new Map<string, PendingTask>();
+  #taskTimers = new Map<string, NodeJS.Timeout>();
+  #taskRuns = new Set<Promise<void>>();
+  #stopping = false;
+  #undeliveredPings: Record<string, unknown>[] = [];
+  #pingFlush: Promise<void> = Promise.resolve();
   #changes = new Set<() => void>();
   readonly #liveUsageListeners = new Set<() => void>();
   /** When each agent last signaled live usage, for the once-a-second limit. */
@@ -270,9 +406,14 @@ export class Supervisor {
     this.#cwd = options.cwd;
     this.#onDetachedSettled = options.onDetachedSettled;
     this.#codexResumeIdleMs = options.codexResumeIdleMs;
+    this.#antigravityResolver = options.antigravityResolver ?? new FileAntigravityAgentResolver();
+    this.#staleAgentMs = options.staleAgentMs ?? options.registry.staleAgentMs();
+    this.#sendMessageWaitMs = options.sendMessageWaitMs ?? options.registry.sendMessageWaitMs();
+    this.#scheduledGraceMs = options.scheduledGraceMs ?? options.registry.scheduledGraceMs();
     this.#usage = options.usage ?? new UsageLedger();
     this.#updateCachePath = options.updateCachePath;
     this.#capacity = new AgentCapacity(options.maxConcurrent ?? options.registry.maxConcurrent());
+    this.setCapacityConfig(options.registry.perBackendConcurrency(), options.registry.perModelConcurrency());
     this.#approvals = new ApprovalCoordinator({
       adapterFor: (request) => this.#adapters.get(request.backend),
     });
@@ -282,11 +423,94 @@ export class Supervisor {
     this.#capacity.setLimit(limit);
   }
 
-  concurrency(): { readonly limit: number; readonly active: number; readonly waiting: number } {
+  setStaleAgentMs(value: number): void {
+    if (!Number.isSafeInteger(value) || value <= 0) throw new ConfigurationError("staleAgentMs must be a positive integer", { value });
+    this.#staleAgentMs = value;
+  }
+
+  setSendMessageWaitMs(value: number): void {
+    if (!Number.isSafeInteger(value) || value < 0) throw new ConfigurationError("sendMessageWaitMs must be a non-negative integer", { value });
+    this.#sendMessageWaitMs = value;
+  }
+
+  setScheduledGraceMs(value: number): void {
+    if (!Number.isSafeInteger(value) || value < 0) throw new ConfigurationError("scheduledGraceMs must be a non-negative integer", { value });
+    this.#scheduledGraceMs = value;
+  }
+
+  /** True while queued work (including a time-delayed task) still needs this host alive. */
+  hasPendingWork(): boolean {
+    return [...this.#pending.values()].some(task => task.state === 'queued' || task.state === 'starting');
+  }
+
+  /**
+   * Stop launching queued work before the host exits: clear scheduled timers and refuse new
+   * starts, then wait (bounded) for tasks already launching. Queued tasks stay queued so the
+   * next host starts them exactly once instead of this one racing the final snapshot.
+   */
+  async quiesce(timeoutMs = 5_000): Promise<void> {
+    this.#stopping = true;
+    for (const id of [...this.#taskTimers.keys()]) this.#clearTaskTimer(id);
+    if (this.#taskRuns.size === 0) return;
+    let timer: NodeJS.Timeout | undefined;
+    try {
+      await Promise.race([
+        Promise.allSettled([...this.#taskRuns]),
+        new Promise<void>((resolve) => {
+          timer = setTimeout(resolve, timeoutMs);
+          timer.unref();
+        }),
+      ]);
+    } finally {
+      if (timer !== undefined) clearTimeout(timer);
+    }
+  }
+
+  /** Replace the per-backend, per-model and per-provider pools after a live config reload. */
+  setCapacityConfig(
+    perBackend: Readonly<Partial<Record<Backend, number>>>,
+    perModel: readonly ModelConcurrencyRule[],
+  ): void {
+    const limits: Record<string, number> = {};
+    for (const backend of BACKENDS) {
+      const limit = perBackend[backend];
+      if (limit !== undefined) limits[`backend:${backend}`] = limit;
+    }
+    for (const rule of perModel) limits[`model:${rule.pattern}`] = rule.limit;
+    for (const [provider, limit] of Object.entries(this.#registry.providerLimits())) {
+      if (limit.maxConcurrent !== undefined) limits[`provider:${provider}`] = limit.maxConcurrent;
+    }
+    this.#capacity.setPoolLimits(limits);
+  }
+
+  concurrency(): {
+    readonly limit: number;
+    readonly active: number;
+    readonly waiting: number;
+    /** Queued tasks with a future `start_at`; they persist across a host replacement. */
+    readonly scheduled: number;
+    readonly per_backend: Readonly<Record<string, Readonly<Record<string, unknown>>>>;
+    readonly per_model: Readonly<Record<string, Readonly<Record<string, unknown>>>>;
+  } {
+    const perBackend: Record<string, Readonly<Record<string, unknown>>> = {};
+    const perModel: Record<string, Readonly<Record<string, unknown>>> = {};
+    for (const pool of this.#capacity.poolViews()) {
+      const view = {
+        ...(pool.limit === undefined ? {} : { limit: pool.limit }),
+        active: pool.active,
+        waiting: pool.waiting,
+      };
+      if (pool.key.startsWith("backend:")) perBackend[pool.key.slice("backend:".length)] = view;
+      else if (pool.key.startsWith("model:")) perModel[pool.key.slice("model:".length)] = view;
+    }
     return {
       limit: this.#capacity.limit,
       active: this.#capacity.activeCount,
       waiting: this.#capacity.waitingCount,
+      scheduled: [...this.#pending.values()].filter(task =>
+        task.start_at !== undefined && (task.state === 'queued' || task.state === 'starting')).length,
+      per_backend: perBackend,
+      per_model: perModel,
     };
   }
 
@@ -437,15 +661,18 @@ export class Supervisor {
     const last = page.at(-1);
     return { agents: page,
       next_cursor: filtered.length > limit && last ? Buffer.from(JSON.stringify({ created_at: listKey(last).at, agent_id: listKey(last).id })).toString('base64url') : null,
-      concurrency: this.concurrency(), config_warning: this.#registry.configWarning(), storage_error: this.#storageError };
+      concurrency: this.concurrency(), liveness: this.#livenessSummary(), config_warning: this.#registry.configWarning(), storage_error: this.#storageError };
   }
 
   listAgents(): readonly Readonly<Record<string, unknown>>[] {
+    this.checkLiveness();
     const started = new Set([...this.#agents.values()].map(record => record.meta.queued_from));
     return [...this.#agents.values()].map(record => this.#publicRecord(record))
       .concat([...this.#pending.values()].filter(task => !task.result?.agent_id && !started.has(task.id)).map(task => ({
         agent_id: task.id, state: task.state, backend: task.input.backend, created_at: task.created_at,
         updated_at: task.updated_at ?? task.created_at, group_id: task.input.group_id,
+        ...(task.start_at === undefined ? {} : { start_at: task.start_at }),
+        notify: task.notify ?? 'always',
       })))
       .sort(newestFirst);
   }
@@ -458,15 +685,48 @@ export class Supervisor {
     return reason === undefined ? {} : { blocked: true, blocked_by: describeBlock(reason) };
   }
 
-  listAgentConfigs() {
-    return { configs: this.#registry.listAgents().map(config => ({ name: config.name, source_path: config.sourcePath,
-      backend: config.backend, model: config.model, effort: config.reasoningEffort, capabilities: capabilities(config.backend),
-      ...this.#configBlock(config.backend, config.model) })),
-      config_warning: this.#registry.configWarning() };
+  async listAgentConfigs() {
+    const configs = await Promise.all(this.#registry.listAgents().map(async config => {
+      const base = { name: config.name, source_path: config.sourcePath,
+        backend: config.backend, model: config.model, effort: config.reasoningEffort, capabilities: capabilities(config.backend),
+        ...(config.antigravityAgent === undefined ? {} : { antigravity_agent: config.antigravityAgent }),
+        ...(config.antigravityAgentFile === undefined ? {} : { antigravity_agent_file: config.antigravityAgentFile }),
+        ...this.#configBlock(config.backend, config.model) };
+      if (config.backend !== "antigravity" || config.antigravityAgent === undefined) return base;
+      try {
+        const definition = await this.#resolveAntigravityDefinition({
+          backend: config.backend,
+          antigravityAgent: config.antigravityAgent,
+          ...(config.antigravityAgentFile === undefined ? {} : { antigravityAgentFile: config.antigravityAgentFile }),
+        }, this.#cwd);
+        return {
+          ...base,
+          ...(definition === undefined ? {} : {
+            agent_definition: {
+              name: definition.name,
+              source_path: definition.sourcePath,
+              source: definition.source,
+              portable: definition.portable,
+              sha256: definition.sha256,
+              ...(definition.description === undefined ? {} : { description: definition.description }),
+              ...(definition.tools === undefined ? {} : { tools: definition.tools }),
+              ...(definition.permission === undefined ? {} : { permission: definition.permission }),
+              bridge_enforced: false,
+              project_owned: definition.source === "project"
+                || (definition.source === "explicit" && definition.portable),
+            },
+          }),
+        };
+      } catch (error) {
+        return { ...base, agent_definition_error: error instanceof Error ? error.message : String(error) };
+      }
+    }));
+    return { configs, config_warning: this.#registry.configWarning() };
   }
 
   async waitForAgents(agents: readonly string[], mode: 'any' | 'all' = 'all', timeout = 60, since?: string, maxResultChars?: number) {
     if (!agents.length) throw new SupervisorError('At least one agent is required');
+    this.checkLiveness();
     const statuses = () => agents.map(identifier => {
       const task = this.#pending.get(identifier);
       if (task && !task.result?.agent_id) return { identifier, state: task.state, updated_at: task.updated_at ?? task.created_at };
@@ -489,7 +749,7 @@ export class Supervisor {
     await new Promise<void>((resolve, reject) => {
       let timer: NodeJS.Timeout;
       const cleanup = () => { clearTimeout(timer); this.#changes.delete(check); };
-      const check = () => { try { if (ready()) { cleanup(); resolve(); } } catch(error) { cleanup(); reject(error); } };
+      const check = () => { try { this.checkLiveness(); if (ready()) { cleanup(); resolve(); } } catch(error) { cleanup(); reject(error); } };
       this.#changes.add(check);
       timer = setTimeout(() => { timed_out = true; cleanup(); resolve(); }, Math.max(0, Math.min(60, timeout)) * 1000);
       check();
@@ -618,54 +878,224 @@ export class Supervisor {
   }
 
   async #schedule(input: SpawnAgentInput) {
-    const dependencies = input.depends_on!.map(agent => {
+    const dependencies = (input.depends_on ?? []).map(agent => {
       if (this.#pending.has(agent)) return { agent, turn: 1 };
       const record = this.#requireRecord(agent); return { agent: record.id, turn: record.meta.turn };
     });
     input = { ...input, backend: this.#registry.resolveAgent({ agent: input.agent, ...(input.model ? { model: input.model } : {}), ...(input.backend ? { backend: input.backend } : {}) }).backend };
-    const task: PendingTask = { id: `task-${randomUUID()}`, created_at: new Date().toISOString(), input, dependencies, state: 'queued' };
+    const task: PendingTask = {
+      id: `task-${randomUUID()}`, created_at: new Date().toISOString(), input, dependencies, state: 'queued',
+      ...(input.start_at === undefined ? {} : { start_at: input.start_at }),
+      notify: input.notify ?? 'always',
+    };
     this.#pending.set(task.id, task);
     await this.#writeSnapshot();
     void this.#runTask(task);
-    return { task_id: task.id, agent_id: task.id, status: task.state };
+    return { task_id: task.id, agent_id: task.id, status: task.state,
+      ...(task.start_at === undefined ? {} : { start_at: task.start_at }) };
   }
 
   /** Every state change stamps updated_at, so `since` / `updated_since` see when a queued task settled. */
   #setTaskState(task: PendingTask, state: PendingTask['state']): void {
+    const previous = task.state;
     task.state = state;
     task.updated_at = new Date().toISOString();
+    if (state !== 'queued') this.#clearTaskTimer(task.id);
+    if (state === 'blocked' && previous !== 'blocked') this.#emitTaskPing(task);
+  }
+
+  /** Arm the next readiness check for a delayed task, re-arming in chunks beyond Node's timer limit. */
+  #armTaskTimer(task: PendingTask, check: () => void): void {
+    this.#clearTaskTimer(task.id);
+    const due = Date.parse(task.start_at!);
+    const delay = Math.min(Math.max(0, due - Date.now()), MAX_TIMER_MS);
+    const timer = setTimeout(() => {
+      this.#taskTimers.delete(task.id);
+      check();
+    }, delay);
+    (timer as NodeJS.Timeout & { unref?: () => void }).unref?.();
+    this.#taskTimers.set(task.id, timer);
+  }
+
+  #clearTaskTimer(id: string): void {
+    const timer = this.#taskTimers.get(id);
+    if (timer === undefined) return;
+    clearTimeout(timer);
+    this.#taskTimers.delete(id);
+  }
+
+  /**
+   * Why a scheduled task is too late to start, or undefined when it may run now (or was not
+   * scheduled). Shared by restorePending() and live timers, including a timer that fires late
+   * because the host was suspended.
+   */
+  #missedStart(task: PendingTask, now = Date.now()): FailureInfo | undefined {
+    if (task.start_at === undefined) return undefined;
+    const due = Date.parse(task.start_at);
+    if (!Number.isFinite(due)) return undefined;
+    const lateMs = now - due;
+    if (lateMs <= this.#scheduledGraceMs) return undefined;
+    return classifyFailure({
+      code: 'MISSED_START',
+      message: `Scheduled start ${task.start_at} was missed by ${Math.round(lateMs / 1000)}s ` +
+        `(grace ${Math.round(this.#scheduledGraceMs / 1000)}s). The host was probably asleep or stopped.`,
+      ...(task.input.backend === undefined ? {} : { backend: task.input.backend }),
+      source: 'supervisor',
+      details: {
+        start_at: task.start_at,
+        late_by_seconds: Math.round(lateMs / 1000),
+        grace_seconds: Math.round(this.#scheduledGraceMs / 1000),
+      },
+    });
+  }
+
+  /** Block a task whose start is beyond the grace window; #setTaskState emits its ping. */
+  #blockMissedStart(task: PendingTask, now = Date.now()): boolean {
+    const error = this.#missedStart(task, now);
+    if (error === undefined) return false;
+    task.result = { error, missed_start: true };
+    this.#setTaskState(task, 'blocked');
+    return true;
+  }
+
+  #dependencyError(
+    dependency: { readonly agent: string; readonly turn: number },
+    code: string,
+    message: string,
+    details: Readonly<Record<string, unknown>> = {},
+  ): FailureInfo {
+    return classifyFailure({
+      code,
+      message,
+      source: 'supervisor',
+      details: { agent: dependency.agent, turn: dependency.turn, ...details },
+    });
+  }
+
+  /** An existing turn outcome that failed or produced invalid structured output. */
+  #dependencyResultError(dependency: { readonly agent: string; readonly turn: number }, result: Row): FailureInfo {
+    const invalid = result.validation_errors !== undefined;
+    const persisted = normalizeFailure(result.error, { failed: result.status !== 'completed' || invalid });
+    if (persisted !== undefined) return persisted;
+    return this.#dependencyError(
+      dependency,
+      invalid ? 'DEPENDENCY_INVALID_RESULT' : 'DEPENDENCY_FAILED',
+      invalid
+        ? `Prerequisite ${dependency.agent} turn ${dependency.turn} returned invalid structured output`
+        : `Prerequisite ${dependency.agent} turn ${dependency.turn} ended ${String(result.status)}`,
+      { status: result.status, ...(invalid ? { validation_errors: result.validation_errors } : {}) },
+    );
+  }
+
+  /**
+   * Resolve one pinned prerequisite. Undefined result and error means it may still produce the
+   * turn. A terminal agent or task without the pinned turn can never produce it: waiting would
+   * keep the dependent queued, and the host alive, forever.
+   */
+  #checkDependency(dependency: { readonly agent: string; readonly turn: number }): DependencyCheck {
+    const base = { agent: dependency.agent, turn: dependency.turn };
+    const task = this.#pending.get(dependency.agent);
+    if (task !== undefined) {
+      if (task.state === 'blocked' || task.state === 'interrupted') {
+        return {
+          ...base,
+          error: this.#dependencyError(dependency, 'DEPENDENCY_FAILED',
+            `Prerequisite task ${task.id} is ${task.state}`, { state: task.state }),
+        };
+      }
+      if (task.state === 'queued' || task.state === 'starting') return base;
+      const agentId = task.result?.agent_id;
+      if (typeof agentId !== 'string') {
+        return {
+          ...base,
+          error: this.#dependencyError(dependency, 'DEPENDENCY_UNAVAILABLE',
+            `Prerequisite task ${task.id} completed without a linked agent`),
+        };
+      }
+      return this.#checkDependencyAgent(dependency, agentId);
+    }
+    return this.#checkDependencyAgent(dependency, dependency.agent);
+  }
+
+  #checkDependencyAgent(
+    dependency: { readonly agent: string; readonly turn: number },
+    agentId: string,
+  ): DependencyCheck {
+    const record = this.#requireRecord(agentId);
+    const result = record.meta.history.find(item => item.turn === dependency.turn);
+    if (result !== undefined) {
+      return result.status !== 'completed' || result.validation_errors
+        ? { agent: dependency.agent, turn: dependency.turn, result, error: this.#dependencyResultError(dependency, result) }
+        : { agent: dependency.agent, turn: dependency.turn, result };
+    }
+    if (isActiveState(record.state)) return { agent: dependency.agent, turn: dependency.turn };
+    return {
+      agent: dependency.agent,
+      turn: dependency.turn,
+      error: this.#dependencyError(dependency, 'DEPENDENCY_UNAVAILABLE',
+        `Prerequisite agent ${agentId} is ${record.state} and has no result for pinned turn ${dependency.turn}; ` +
+          'it can no longer produce one.',
+        { agent_id: agentId, state: record.state }),
+    };
   }
 
   async #runTask(task: PendingTask) {
     const run = async () => {
-      if (task.state !== 'queued') { this.#changes.delete(check); return; }
-      const results = task.dependencies.map(dep => {
-        const prerequisite = this.#pending.get(dep.agent);
-        if (prerequisite && ['blocked','interrupted'].includes(prerequisite.state)) return { status: 'failed' };
-        if (prerequisite && !prerequisite.result?.agent_id) return undefined;
-        return this.#requireRecord(dep.agent).meta.history.find(h => h.turn === dep.turn);
-      });
-      if (results.some(r => !r)) return;
+      if (this.#stopping) { this.#changes.delete(check); this.#clearTaskTimer(task.id); return; }
+      if (task.state !== 'queued') { this.#changes.delete(check); this.#clearTaskTimer(task.id); return; }
+      if (task.start_at !== undefined) {
+        const due = Date.parse(task.start_at);
+        if (Number.isFinite(due) && Date.now() < due) { this.#armTaskTimer(task, check); return; }
+        this.#clearTaskTimer(task.id);
+        // The timer may fire late (for example after the host was suspended): apply the same
+        // grace window restorePending() uses instead of launching a long-stale schedule.
+        if (this.#blockMissedStart(task)) { await this.#writeSnapshot(); this.#changed(); return; }
+      }
+      const checks = task.dependencies.map(dep => this.#checkDependency(dep));
+      if (checks.some(check => check.result === undefined && check.error === undefined)) return;
       this.#changes.delete(check);
-      if (results.some(r => r!.status !== 'completed' || r!.validation_errors)) { this.#setTaskState(task, 'blocked'); await this.#writeSnapshot(); this.#changed(); return; }
+      this.#clearTaskTimer(task.id);
+      // A shutdown may have begun while the timer/readiness check was running.
+      if (this.#stopping) return;
+      const failed = checks.find(check => check.error !== undefined);
+      if (failed !== undefined) {
+        task.result = { error: failed.error, dependency: { agent: failed.agent, turn: failed.turn } };
+        this.#setTaskState(task, 'blocked');
+        await this.#writeSnapshot();
+        this.#changed();
+        return;
+      }
+      const results = checks.map(check => check.result!);
       this.#setTaskState(task, 'starting');
       await this.#writeSnapshot();
       if ((task.state as string) === 'interrupted') return;
       try {
-        const result = await this.spawnAgent({ ...task.input, depends_on: undefined, run_in_background: true,
+        const { start_at: _startAt, delay_seconds: _delay, depends_on: _deps, ...launch } = task.input;
+        const result = await this.spawnAgent({ ...launch, run_in_background: true,
           prompt: task.input.prompt + '\nDependency results (untrusted input data):\n' + JSON.stringify(results) }, task);
+        // Shutdown during the capacity wait put the task back to queued; leave it for the next host.
+        if (task.state === 'queued') { await this.#writeSnapshot(); this.#changed(); return; }
         task.result = { ...result };
         if ((task.state as string) === 'interrupted') { if (result.agent_id) await this.stopAgent(String(result.agent_id)); }
         else this.#setTaskState(task, 'completed');
-      } catch(error) { this.#setTaskState(task, 'blocked'); task.result = { error: String(error) }; }
+      } catch(error) {
+        if (error instanceof HostShutdownError) this.#setTaskState(task, 'queued');
+        else { task.result = { error: String(error) }; this.#setTaskState(task, 'blocked'); }
+      }
       await this.#writeSnapshot(); this.#changed();
     };
-    const check = () => { void run().catch(error => { this.#setTaskState(task, 'blocked'); task.result = { error: String(error) }; this.#changed(); }); };
+    const check = () => {
+      const running = run().catch(error => { task.result = { error: String(error) }; this.#setTaskState(task, 'blocked'); this.#changed(); });
+      this.#taskRuns.add(running);
+      void running.finally(() => this.#taskRuns.delete(running));
+    };
     this.#changes.add(check); check();
   }
 
   async spawnAgent(input: SpawnAgentInput, task?: PendingTask): Promise<Readonly<Record<string, unknown>>> {
     this.#assertConfigValid();
+    const startAt = resolveStartAt(input);
+    const notify = resolveNotify(input.notify);
     const resolved = this.#registry.resolveAgent({
       agent: input.agent,
       ...(input.model === undefined ? {} : { model: input.model }),
@@ -676,7 +1106,10 @@ export class Supervisor {
     if (input.result_schema) validator.compile(input.result_schema);
     if (input.permission && resolved.backend !== 'claude') throw new SupervisorError('This backend cannot enforce per-spawn permission restrictions');
     const permission = restrictPermission(resolved.permission, input.permission);
-    if (input.depends_on?.length) return this.#schedule(input);
+    if (startAt !== undefined || input.depends_on?.length) {
+      const { start_at: _startAt, delay_seconds: _delay, ...rest } = input;
+      return this.#schedule({ ...rest, notify, ...(startAt === undefined ? {} : { start_at: startAt }) });
+    }
     const adapter = this.#requireAdapter(resolved.backend);
     if (input.name !== undefined && this.#names.has(input.name)) {
       throw new SupervisorError(`Agent name "${input.name}" is already in use by an active or completed agent`, {
@@ -688,10 +1121,21 @@ export class Supervisor {
     const timeoutSeconds = input.timeout ?? resolved.timeout ?? null;
     const release = await this.#acquireCapacity(resolved.backend, resolved.model);
     if (task?.state === 'interrupted') { release(); return { status: 'interrupted' }; }
+    // Shutdown may have begun while this spawn waited for a slot. Do not launch after the
+    // host's adapters have closed; leave a queued task for the replacement host.
+    if (this.#stopping) {
+      release();
+      if (task !== undefined) {
+        this.#setTaskState(task, 'queued');
+        return { status: 'queued', task_id: task.id };
+      }
+      throw new HostShutdownError();
+    }
     // The policy can change while a spawn waits for a slot (models.yaml is hot-reloaded).
     try { this.#assertModelAllowed(resolved.backend, resolved.model); } catch (error) { release(); throw error; }
     let worktree: Worktree | undefined;
     let launched = false;
+    let agentDefinition: AgentDefinitionMetadata | undefined;
     try {
       if (input.isolation === 'worktree') {
         worktree = await createWorktree(this.#cwd, input.worktree_snapshot?.base);
@@ -706,6 +1150,10 @@ export class Supervisor {
       // Config can hot-reload while worktree setup commands run.
       this.#assertConfigValid();
       this.#assertModelAllowed(resolved.backend, resolved.model);
+      agentDefinition = await this.#captureAgentDefinition(resolved, worktree?.path ?? this.#cwd);
+      // The last point at which no child exists: config resolution, worktree setup and agent
+      // definition capture are all async, so shutdown may have started meanwhile.
+      if (this.#stopping) throw new HostShutdownError();
       const turn = await adapter.spawn({
         prompt: input.prompt + (input.result_schema ? '\nReturn only JSON matching this schema: ' + JSON.stringify(input.result_schema) : ''),
         description: input.description,
@@ -728,10 +1176,13 @@ export class Supervisor {
       const picked = input.name !== undefined ? { name: input.name } : this.#nextAgentName();
       const name = picked.name;
       const record: AgentRecord = {
-        meta: { turn: 1, history: [], ...(input.permission ? { permission } : {}), ...(worktree ? { worktree } : {}),
-          ...(input.group_id ? { group_id: input.group_id } : {}), ...(input.ensemble ? { ensemble: { id: input.ensemble.id, role: input.ensemble.role } } : {}),
+        meta: { turn: 1, history: [], notify, ...(input.permission ? { permission } : {}), ...(worktree ? { worktree } : {}),
+          ...(input.group_id ? { group_id: input.group_id } : {}),
+          ...(input.ensemble ? { ensemble: { id: input.ensemble.id, role: input.ensemble.role } } : {}),
           ...(input.result_schema ? { schema: input.result_schema } : {}),
-          ...(task ? { queued_from: task.id, queued_at: task.created_at } : {}) },
+          ...(agentDefinition ? { agentDefinition } : {}),
+          ...(task ? { queued_from: task.id, queued_at: task.created_at } : {}),
+          ...(task?.start_at === undefined ? {} : { start_at: task.start_at }) },
         id: turn.agentId,
         turnIds: new Map([[turn.turnId, 1]]),
         name,
@@ -745,7 +1196,10 @@ export class Supervisor {
         detached: input.run_in_background === true,
         createdAt: now,
         updatedAt: now,
+        heartbeatAt: now,
+        staleProbes: 0,
         cursor: 0,
+        currentTurnId: turn.turnId,
         timeoutSeconds,
         timedOut: false,
         ...(picked.note === undefined ? {} : { nameNote: picked.note }),
@@ -773,7 +1227,17 @@ export class Supervisor {
 
   async sendMessage(input: SendMessageInput): Promise<Readonly<Record<string, unknown>>> {
     this.#assertConfigValid();
+    this.checkLiveness();
     const record = this.#requireRecord(input.agent);
+    if (input.notify !== undefined) {
+      record.meta.notify = resolveNotify(input.notify);
+      record.updatedAt = new Date().toISOString();
+      void this.#writeSnapshot().catch(error => { this.#storageError = String(error); });
+    }
+    const waitSeconds = input.wait_seconds ?? this.#sendMessageWaitMs / 1000;
+    if (!Number.isFinite(waitSeconds) || waitSeconds < 0) {
+      throw new SupervisorError("wait_seconds must be a non-negative number", { wait_seconds: input.wait_seconds });
+    }
     if (record.meta.cleaned) throw new SupervisorError("Worktree was removed; spawn a new agent");
     this.#assertModelAllowed(record.backend, record.model);
     if (record.state === "starting" || record.state === "running") {
@@ -790,13 +1254,21 @@ export class Supervisor {
         prompt: input.prompt,
         ...(input.effort === undefined ? {} : { effort: input.effort }),
         ...(input.timeout === undefined ? {} : { timeout: input.timeout }),
+        ...(input.allow_agent_definition_change === true ? { allowDefinitionChange: true } : {}),
       };
       if (input.timeout !== undefined) record.timeoutSeconds = input.timeout;
       record.updatedAt = new Date().toISOString();
       void this.#writeSnapshot().catch(error => { this.#storageError = String(error); });
       if (input.run_in_background === true) record.detached = true;
-      else await this.#waitForNotableState(record);
-      return this.#cappedResult(record, input.max_result_chars);
+      let settled = true;
+      if (input.run_in_background !== true) settled = await this.#waitWithBudget(record, waitSeconds);
+      if (!settled && record.state !== "running" && record.state !== "starting") settled = true;
+      if (!settled) record.detached = true;
+      return {
+        ...this.#cappedResult(record, input.max_result_chars),
+        ...(settled ? {} : { wait_expired: true, wait_seconds: waitSeconds,
+          hint: "The turn is still running. Use wait_for_agents or get_agent_events; it was not cancelled." }),
+      };
     }
     if (record.state === "needs_approval") {
       throw new SupervisorError(`Agent ${record.id} has a pending approval; resolve it before sending a new message`, {
@@ -812,37 +1284,63 @@ export class Supervisor {
     // again, so re-count it. The call waits when the pool is full.
     record.release = await this.#acquireCapacity(record.backend, record.model);
     try { this.#assertModelAllowed(record.backend, record.model); } catch (error) { record.release(); throw error; }
+    const previousState = record.state;
     record.state = "running";
     record.timedOut = false;
+    this.#clearLastError(record);
     record.detached = input.run_in_background === true;
     delete record.result;
     record.updatedAt = new Date().toISOString();
+    record.heartbeatAt = record.updatedAt;
+    record.staleProbes = 0;
+    delete record.staleSince;
     if (!record.pumping) {
       record.pumping = true;
       this.#pump(record, adapter);
     }
     try {
-      await this.#deliverResume(record, adapter, input.prompt, input.effort ?? record.effort, input.timeout);
+      await this.#deliverResume(record, adapter, input.prompt, input.effort ?? record.effort, input.timeout,
+        input.allow_agent_definition_change === true);
     } catch (error) {
       record.release();
+      record.state = previousState;
+      record.updatedAt = new Date().toISOString();
+      void this.#writeSnapshot().catch(() => undefined);
       throw error;
     }
-    if (input.run_in_background !== true) await this.#waitForNotableState(record);
+    if (input.run_in_background !== true) {
+      const settled = await this.#waitWithBudget(record, waitSeconds);
+      if (!settled && record.state !== "running" && record.state !== "starting") {
+        return this.#cappedResult(record, input.max_result_chars);
+      }
+      if (!settled) {
+        record.detached = true;
+        return {
+          ...this.#cappedResult(record, input.max_result_chars),
+          wait_expired: true,
+          wait_seconds: waitSeconds,
+          hint: "The turn is still running. Use wait_for_agents or get_agent_events; it was not cancelled.",
+        };
+      }
+    }
     return this.#cappedResult(record, input.max_result_chars);
   }
 
   /** Shared by sendMessage() and the queued-message delivery inside #pump(). */
-  async #deliverResume(record: AgentRecord, adapter: BackendAdapter, prompt: string, effort?: string, timeout?: number): Promise<void> {
+  async #deliverResume(record: AgentRecord, adapter: BackendAdapter, prompt: string, effort?: string, timeout?: number, allowDefinitionChange = false): Promise<void> {
     // Checked here too, not only when send_message is called: a queued message is delivered after
     // the current turn ends, by which time the policy may have changed.
     this.#assertConfigValid();
     this.#assertModelAllowed(record.backend, record.model);
+    this.#clearLastError(record);
     const resolved = this.#registry.resolveAgent({
       agent: record.agentConfig,
       model: record.model,
       backend: record.backend,
       ...(effort === undefined ? {} : { reasoningEffort: effort }),
     });
+    const definition = await this.#captureAgentDefinition(resolved, record.cwd, record.meta.agentDefinition, allowDefinitionChange);
+    if (definition !== undefined) record.meta.agentDefinition = definition;
     const childEnv = childDepthEnv(process.env);
     const timeoutSeconds = timeout ?? resolved.timeout ?? record.timeoutSeconds;
     record.timeoutSeconds = timeoutSeconds;
@@ -852,9 +1350,9 @@ export class Supervisor {
     delete record.result;
     delete record.usage;
     // A new turn starts clean: an error from the previous turn (for example a permission denial)
-    // must not stick to this resume, including when #pump delivers a queued message.
-    delete record.lastError;
-    delete record.lastErrorTransient;
+    // must not stick to this resume, including when #pump delivers a queued message. #deliverResume
+    // already cleared `lastError`/`lastErrorTurn` up front, so only the persistence flag is left.
+    delete record.lastErrorPersists;
     delete record.meta.structured;
     delete record.meta.validation_errors;
     const resumed = await adapter.resume({
@@ -874,6 +1372,7 @@ export class Supervisor {
       ...(resolved.reasoningEffort === undefined ? {} : { reasoningEffort: resolved.reasoningEffort }),
     });
     (record.turnIds ??= new Map()).set(resumed.turnId, record.meta.turn);
+    record.currentTurnId = resumed.turnId;
     this.#usage.recordResume(record.backend, record.model);
   }
 
@@ -1033,9 +1532,11 @@ export class Supervisor {
       try {
         for await (const event of adapter.events(record.id, { since: record.cursor })) {
           record.cursor = event.sequence;
-          this.#events.append({ type: event.type, agentId: record.id, backend: event.backend, data: event.data } as never);
+          const errorData = event.type === "error" ? this.#classifiedError(record, event.data) : undefined;
+          this.#events.append({ type: event.type, agentId: record.id, backend: event.backend, data: errorData ?? event.data } as never);
           const previousActivity = record.meta.checkpointAt;
           record.updatedAt = new Date().toISOString();
+          record.heartbeatAt = record.updatedAt;
           record.meta.activityAt = record.updatedAt;
           // Calls can run in parallel: activity shows the latest call still open, and clears once none is.
           if (event.type === 'tool.start') {
@@ -1091,12 +1592,16 @@ export class Supervisor {
             // The final usage wins; without one (an interrupt or crash), keep what was observed live.
             const turnUsage = event.data.usage ?? record.liveUsage;
             delete record.liveUsage;
-            // A warning or a retried provider error doesn't make a successful turn an error.
-            if (event.data.status === "completed" && record.lastErrorTransient === true) delete record.lastError;
-            delete record.lastErrorTransient;
             if (event.data.finalText !== undefined) record.result = scanChildOutput(event.data.finalText);
             if (turnUsage !== undefined) record.usage = { ...turnUsage };
             else delete record.usage;
+            // A failed turn always carries an actionable error, even when the backend only said
+            // `status: "failed"`. A completed turn keeps only the errors that say how the turn went
+            // (`persists: true`, e.g. actions the backend denied) and drops the ones it recovered
+            // from (a rate limit it retried past).
+            if (event.data.status === "failed") this.#ensureFailure(record, event.data.finalText);
+            else if (event.data.status === "completed" && record.lastErrorPersists !== true) this.#clearLastError(record);
+            delete record.lastErrorPersists;
             if (record.meta.history.some(h => h.turn_id === event.data.turnId)) continue;
             // A fatal error already recorded this turn without its usage or text (#notify). The adapter's
             // turn.completed carries both, so it replaces that provisional entry instead of adding a second
@@ -1112,7 +1617,8 @@ export class Supervisor {
             }
             const outcome = { agent_id: record.id, turn: record.meta.turn, turn_id: event.data.turnId,
               status: event.data.status, result: record.result, usage: record.usage, finished_at: record.updatedAt,
-              structured_result: record.meta.structured, validation_errors: record.meta.validation_errors };
+              structured_result: record.meta.structured, validation_errors: record.meta.validation_errors,
+              ...(record.lastError === undefined ? {} : { error: record.lastError }) };
             if (!record.meta.history.some(h => h.turn_id === event.data.turnId)) {
               const first = provisional < 0 ? undefined : record.meta.history[provisional];
               const merged = first?.error === undefined ? outcome : { ...outcome, error: first.error };
@@ -1128,6 +1634,9 @@ export class Supervisor {
               // #waitForNotableState callers (sendMessage/resolveApproval) keep waiting correctly.
               delete record.pendingMessage;
               record.updatedAt = new Date().toISOString();
+              record.heartbeatAt = record.updatedAt;
+              record.staleProbes = 0;
+              delete record.staleSince;
               this.#usage.recordTurn(record.backend, record.model, turnUsage, {
                 failed: event.data.status !== "completed",
                 timedOut: record.timedOut,
@@ -1144,11 +1653,21 @@ export class Supervisor {
                 continue;
               }
               try {
-                await this.#deliverResume(record, adapter, pending.prompt, pending.effort, pending.timeout);
+                await this.#deliverResume(record, adapter, pending.prompt, pending.effort, pending.timeout,
+                  pending.allowDefinitionChange === true);
               } catch (error) {
-                if (!(error instanceof ModelBlockedError) && !(error instanceof ConfigInvalidError)) throw error;
-                // The queued message is refused; the agent ends on the turn that just finished.
-                record.lastError = { code: error.code, message: error.message };
+                // Every supervisor error (a blocked model/config, an Antigravity definition change,
+                // etc.) is a real refusal for the queued message, not a broken event stream. The
+                // agent ends on the turn that just finished, carrying the classified error.
+                if (!(error instanceof SubagentError)) throw error;
+                this.#setLastError(record, classifyFailure({
+                  code: error.code,
+                  message: error.message,
+                  backend: record.backend,
+                  source: "supervisor",
+                  ...(error.details === undefined ? {} : { details: error.details }),
+                }));
+                if (event.data.status === "failed") this.#ensureFailure(record, event.data.finalText);
                 record.state = settled;
                 record.release();
                 await this.#notify(record);
@@ -1172,20 +1691,32 @@ export class Supervisor {
             continue;
           }
           if (event.type === "error") {
-            record.lastError = { code: event.data.code, message: scanChildOutput(event.data.message) };
-            record.lastErrorTransient = !event.data.fatal && event.data.persists !== true;
-            this.#noteProviderError(record, event.data.code, record.lastError.message, event.data.details);
+            const failure = this.#failureFromEvent(record, event.data);
+            this.#setLastError(record, failure);
+            // Set when the error says how the turn went (a denial, for example) rather than being
+            // something the backend recovered from; a completed turn keeps only the first kind.
+            record.lastErrorPersists = event.data.fatal || event.data.persists === true;
+            this.#noteProviderError(record, event.data.code, failure.message, event.data.details);
             if (/TIMEOUT/.test(event.data.code)) record.timedOut = true;
             if (event.data.fatal) {
               record.state = "failed";
+              this.#ensureFailure(record, undefined);
               record.release();
               await this.#notify(record);
             }
           }
         }
       } catch (error) {
+        const failure = classifyFailure({
+          code: "SUPERVISOR_STREAM_ERROR",
+          message: error instanceof Error ? error.message : String(error),
+          backend: record.backend,
+          source: "supervisor",
+        });
+        this.#setLastError(record, failure);
+        this.#appendSyntheticError(record, failure, true);
         record.state = "failed";
-        record.lastError = { code: "SUPERVISOR_STREAM_ERROR", message: error instanceof Error ? error.message : String(error) };
+        record.release();
         await this.#notify(record);
       } finally {
         if (record.state !== "running" && record.state !== "starting" && record.state !== "needs_approval") {
@@ -1212,6 +1743,190 @@ export class Supervisor {
     void this.#writeSnapshot().catch(error => { this.#storageError = String(error); });
   }
 
+  #classifiedError(record: AgentRecord, data: NormalizedEventData["error"]): NormalizedEventData["error"] {
+    const info = this.#failureFromEvent(record, data);
+    return {
+      code: info.code,
+      message: info.message,
+      fatal: data.fatal,
+      ...(data.persists === true ? { persists: true } : {}),
+      category: info.category,
+      retryable: info.retryable,
+      recommended_action: info.recommended_action,
+      ...(info.retry_after_seconds === undefined ? {} : { retry_after_seconds: info.retry_after_seconds }),
+      source: "adapter",
+      ...(data.turnId === undefined ? {} : { turnId: data.turnId }),
+      ...(info.subtype === undefined ? {} : { subtype: info.subtype }),
+      ...(info.details === undefined ? {} : { details: info.details }),
+    };
+  }
+
+  #failureFromEvent(record: AgentRecord, data: NormalizedEventData["error"]): FailureInfo {
+    const details = data.details;
+    const subtype = data.subtype ?? (typeof details?.["subtype"] === "string" ? details["subtype"] : undefined);
+    return classifyFailure({
+      code: data.code,
+      message: scanChildOutput(data.message),
+      backend: record.backend,
+      source: "adapter",
+      ...(subtype === undefined ? {} : { subtype }),
+      ...(details === undefined ? {} : { details }),
+    });
+  }
+
+  #setLastError(record: AgentRecord, info: FailureInfo): void {
+    record.lastError = info;
+    record.lastErrorTurn = record.meta.turn;
+  }
+
+  #clearLastError(record: AgentRecord): void {
+    delete record.lastError;
+    delete record.lastErrorTurn;
+  }
+
+  /**
+   * Every failed turn must carry an actionable error, even when a backend only sent
+   * `turn.completed {status: "failed"}` with no accompanying error record.
+   */
+  #ensureFailure(record: AgentRecord, finalText?: string): void {
+    const current = record.lastError !== undefined && record.lastErrorTurn === record.meta.turn ? record.lastError : undefined;
+    if (current !== undefined && !(record.timedOut && !/TIMEOUT/.test(current.code))) return;
+    const info = classifyFailure({
+      code: record.timedOut ? "TURN_TIMEOUT" : "TURN_FAILED",
+      message: record.timedOut
+        ? record.timeoutSeconds === null
+          ? "The turn exceeded its time limit"
+          : `The turn exceeded its ${record.timeoutSeconds}s time limit`
+        : "The backend reported a failed turn without an error record",
+      backend: record.backend,
+      source: "supervisor",
+      ...(finalText === undefined || finalText.trim() === "" ? {} : { details: { result_preview: scanChildOutput(finalText).slice(0, 500) } }),
+    });
+    this.#setLastError(record, info);
+    this.#appendSyntheticError(record, info, true);
+  }
+
+  #appendSyntheticError(record: AgentRecord, info: FailureInfo, fatal: boolean): void {
+    this.#events.append({
+      type: "error",
+      agentId: record.id,
+      backend: record.backend,
+      data: {
+        code: info.code,
+        message: info.message,
+        fatal,
+        category: info.category,
+        retryable: info.retryable,
+        recommended_action: info.recommended_action,
+        ...(info.retry_after_seconds === undefined ? {} : { retry_after_seconds: info.retry_after_seconds }),
+        source: "supervisor",
+        ...(info.subtype === undefined ? {} : { subtype: info.subtype }),
+      },
+    });
+  }
+
+  /**
+   * Probe active agents and fail one whose backend has authoritatively disappeared. A single stale
+   * probe only marks it; two probes are required so a process exit racing its terminal event does
+   * not turn an otherwise normal completion into a failure.
+   */
+  checkLiveness(now = Date.now()): void {
+    for (const record of this.#agents.values()) {
+      if (!isActiveState(record.state)) continue;
+      const probe = this.#adapterLiveness(record);
+      if (probe?.state === "stale") {
+        record.staleProbes += 1;
+        if (record.staleSince === undefined) record.staleSince = new Date(now).toISOString();
+        if (record.staleProbes >= 2) this.#failUnresponsive(record, probe.reason);
+        continue;
+      }
+      if (probe?.state === "live") {
+        record.staleProbes = 0;
+        delete record.staleSince;
+        continue;
+      }
+      // Without an adapter probe, only age can suggest a problem; report it but do not kill work
+      // that may be a legitimate long-running tool call.
+      const heartbeatAge = Math.max(0, now - Date.parse(record.heartbeatAt));
+      if (heartbeatAge >= this.#staleAgentMs) {
+        if (record.staleSince === undefined) record.staleSince = new Date(now).toISOString();
+      } else {
+        delete record.staleSince;
+      }
+    }
+  }
+
+  #adapterLiveness(record: AgentRecord): AdapterLiveness | undefined {
+    try {
+      return this.#adapters.get(record.backend).liveness?.(record.id);
+    } catch {
+      return { state: "unknown", reason: "backend adapter is unavailable" };
+    }
+  }
+
+  #failUnresponsive(record: AgentRecord, reason: string): void {
+    if (!isActiveState(record.state)) return;
+    if (record.pendingApprovalId !== undefined) {
+      try { this.#approvals.cancel(record.pendingApprovalId); } catch { /* already settled */ }
+      delete record.pendingApprovalId;
+    }
+    const queued = record.pendingMessage !== undefined;
+    if (queued) delete record.pendingMessage;
+    const info = classifyFailure({
+      code: "AGENT_UNRESPONSIVE",
+      message: `The ${record.backend} backend is no longer reporting for this agent: ${reason}`,
+      backend: record.backend,
+      source: "supervisor",
+      details: { reason, ...(queued ? { queued_message_dropped: true } : {}) },
+    });
+    this.#setLastError(record, info);
+    this.#appendSyntheticError(record, info, true);
+    record.state = "failed";
+    record.updatedAt = new Date().toISOString();
+    record.release();
+    void this.#notify(record).catch(() => undefined);
+  }
+
+  #livenessView(record: AgentRecord, now = Date.now()): Readonly<Record<string, unknown>> {
+    const checkedAt = new Date(now).toISOString();
+    const base = {
+      liveness_checked_at: checkedAt,
+      last_heartbeat_at: record.heartbeatAt,
+      heartbeat_age_seconds: Math.max(0, Math.round((now - Date.parse(record.heartbeatAt)) / 1000)),
+    };
+    if (!isActiveState(record.state)) return { ...base, liveness: "settled" };
+    const probe = this.#adapterLiveness(record);
+    if (probe?.state === "stale") {
+      if (record.staleSince === undefined) record.staleSince = checkedAt;
+      return { ...base, liveness: "stale", liveness_reason: probe.reason, stale_since: record.staleSince };
+    }
+    if (probe?.state === "live") return { ...base, liveness: "live" };
+    const ageMs = Math.max(0, now - Date.parse(record.heartbeatAt));
+    if (ageMs >= this.#staleAgentMs) {
+      if (record.staleSince === undefined) record.staleSince = checkedAt;
+      return {
+        ...base,
+        liveness: "stale",
+        liveness_reason: `no heartbeat for ${Math.round(ageMs / 1000)}s`,
+        stale_since: record.staleSince,
+      };
+    }
+    return { ...base, liveness: "unknown", ...(probe?.reason === undefined ? {} : { liveness_reason: probe.reason }) };
+  }
+
+  #livenessSummary(now = Date.now()): Readonly<Record<string, unknown>> {
+    let live = 0;
+    let stale = 0;
+    let unresponsive = 0;
+    for (const record of this.#agents.values()) {
+      const view = this.#livenessView(record, now);
+      if (view["liveness"] === "live") live += 1;
+      else if (view["liveness"] === "stale") stale += 1;
+      if (record.state === "failed" && record.lastError?.code === "AGENT_UNRESPONSIVE") unresponsive += 1;
+    }
+    return { checked_at: new Date(now).toISOString(), live, stale, unresponsive };
+  }
+
   /** Opaque re-read, breaking TS's narrowing of `record.state` across the preceding `await`. */
   #currentState(record: AgentRecord): ToolAgentState {
     return record.state;
@@ -1228,26 +1943,61 @@ export class Supervisor {
       } catch(error) { this.#storageError = String(error); }
     }
     try { await this.#writeSnapshot(); }
-    catch(error) { this.#storageError = String(error); record.lastError = { code: 'STORAGE_ERROR', message: String(error) }; }
+    catch(error) {
+      this.#storageError = String(error);
+      if (record.state === "failed") {
+        this.#setLastError(record, classifyFailure({ code: 'STORAGE_ERROR', message: String(error), backend: record.backend, source: 'supervisor' }));
+      }
+    }
     this.#changed();
     if (record.detached && record.state !== "running" && record.state !== "starting") {
       // Nobody is blocked on this turn, so push the outcome instead of leaving the caller to poll.
-      // Cleared first: the follow-up (resolve_approval / send_message) blocks, or re-sets it.
-      record.detached = false;
-      try {
-        this.#onDetachedSettled?.(this.#result(record));
-      } catch {
-        // A failing notifier must not break the event pump.
+      // needs_approval is not terminal: keep detached armed so the turn's eventual outcome still
+      // pings once. A terminal outcome clears it first; the follow-up re-sets it if it blocks.
+      const terminal = record.state !== "needs_approval";
+      if (this.#shouldNotify(record)) {
+        try {
+          this.#onDetachedSettled?.(this.#result(record));
+        } catch {
+          // A failing notifier must not break the event pump.
+        }
       }
+      if (terminal) record.detached = false;
     }
     const waiters = record.waiters;
     record.waiters = [];
     for (const waiter of waiters) waiter();
   }
 
+  /** needs_approval always pings (the agent is blocked); otherwise the job's notify policy decides. */
+  #shouldNotify(record: AgentRecord): boolean {
+    if (record.state === "needs_approval") return true;
+    const notify = record.meta.notify ?? "always";
+    if (notify === "never") return false;
+    if (notify === "on_failure" && record.state === "completed") return false;
+    return true;
+  }
+
   #waitForNotableState(record: AgentRecord): Promise<void> {
     if (record.state !== "running" && record.state !== "starting") return Promise.resolve();
     return new Promise((resolve) => record.waiters.push(resolve));
+  }
+
+  /** Wait at most `seconds`; false means the turn is still active and was left running. */
+  async #waitWithBudget(record: AgentRecord, seconds: number): Promise<boolean> {
+    if (record.state !== "running" && record.state !== "starting") return true;
+    if (seconds <= 0) return false;
+    let timer: NodeJS.Timeout | undefined;
+    try {
+      return await Promise.race([
+        this.#waitForNotableState(record).then(() => true),
+        new Promise<boolean>((resolve) => {
+          timer = setTimeout(() => resolve(false), Math.min(seconds, 86_400) * 1000);
+        }),
+      ]);
+    } finally {
+      if (timer !== undefined) clearTimeout(timer);
+    }
   }
 
   #result(record: AgentRecord): Readonly<Record<string, unknown>> {
@@ -1268,6 +2018,13 @@ export class Supervisor {
       timeout_seconds: record.timeoutSeconds,
       ...(record.warning === undefined ? {} : { warning: record.warning }),
       ...(record.nameNote === undefined ? {} : { name_note: record.nameNote }),
+      ...(record.currentTurnId === undefined ? {} : { turn_id: record.currentTurnId }),
+      ...(record.meta.agentDefinition === undefined ? {} : { agent_definition: record.meta.agentDefinition }),
+      ...(record.meta.start_at === undefined ? {} : { start_at: record.meta.start_at }),
+      notify: record.meta.notify ?? "always",
+      last_activity_at: record.meta.activityAt,
+      current_activity: record.meta.activity ?? null,
+      ...this.#livenessView(record),
     };
     if (record.state === "needs_approval") {
       return { ...base, status: "needs_approval", ...this.#approvalDetails(record) };
@@ -1361,11 +2118,16 @@ export class Supervisor {
       timeout_seconds: record.timeoutSeconds,
       ...(record.timedOut ? { timed_out: true } : {}),
       ...(record.warning === undefined ? {} : { warning: record.warning }),
+      ...(record.lastError === undefined ? {} : { error: record.lastError }),
       last_activity_at: record.meta.activityAt,
       current_activity: record.meta.activity ?? null,
       activity_source: record.meta.activity ? 'tool_event' : null,
       phase: agentPhase(record),
       last_tool: record.meta.lastTool ?? null,
+      ...(record.meta.agentDefinition === undefined ? {} : { agent_definition: record.meta.agentDefinition }),
+      ...(record.meta.start_at === undefined ? {} : { start_at: record.meta.start_at }),
+      notify: record.meta.notify ?? "always",
+      ...this.#livenessView(record),
       cumulative_usage: this.#totalUsage(record),
       created_at: record.createdAt,
       ...(record.meta.queued_from === undefined ? {} : { queued_from: record.meta.queued_from, queued_at: record.meta.queued_at }),
@@ -1400,6 +2162,19 @@ export class Supervisor {
     void this.#writeSnapshot().catch(error => { this.#storageError = String(error); });
   }
 
+  /** Wait for all queued writes, then persist the current snapshot (used before the host exits). */
+  async flushSnapshot(): Promise<void> {
+    await this.#writeSnapshot();
+  }
+
+  /**
+   * Make later snapshot writes no-ops. Called after the host's final flush so a task that
+   * outlived quiesce cannot overwrite a replacement host's state when it finally settles.
+   */
+  closePersistence(): void {
+    this.#persistenceClosed = true;
+  }
+
   async recoverResults(): Promise<void> {
     if (!this.#persistencePath) return;
     // Snapshots written before the fatal-error fix can hold two entries for one turn; keep the last.
@@ -1420,7 +2195,13 @@ export class Supervisor {
       if (Number(value.turn) >= record.meta.turn) {
         record.meta.turn = Number(value.turn);
         record.state = value.status as ToolAgentState;
-        if (record.lastError?.code === 'HOST_RESTARTED') delete record.lastError;
+        if (record.lastError?.code === 'HOST_RESTARTED') this.#clearLastError(record);
+        const persistedError = normalizeFailure(value.error, { failed: value.status === 'failed' });
+        if (persistedError !== undefined) {
+          this.#setLastError(record, persistedError);
+        } else if (record.state === 'failed') {
+          this.#ensureFailure(record);
+        }
         if (typeof value.result === 'string') record.result = value.result;
         if (value.structured_result !== undefined) record.meta.structured = value.structured_result;
         if (value.validation_errors !== undefined) record.meta.validation_errors = value.validation_errors;
@@ -1433,11 +2214,102 @@ export class Supervisor {
   }
 
   restorePending(tasks: readonly PendingTask[]): void {
+    const rerun = new Set<string>();
     for (const task of tasks) {
-      if (task.state === 'starting') this.#setTaskState(task, 'interrupted');
+      if (task.state === 'starting') {
+        const record = [...this.#agents.values()].find(agent => agent.meta.queued_from === task.id);
+        if (record !== undefined) {
+          // The agent launched before the snapshot, so the task did settle even if its own state
+          // update never made it to disk.
+          this.#setTaskState(task, 'completed');
+          task.result = { agent_id: record.id };
+        } else {
+          // No agent record means spawnAgent never launched, so run the task instead of losing it.
+          // This is at-least-once: a crash between adapter.spawn and the snapshot can rerun the task.
+          this.#setTaskState(task, 'queued');
+          rerun.add(task.id);
+        }
+      }
       this.#pending.set(task.id, task);
     }
-    for (const task of tasks) if (task.state === 'queued') void this.#runTask(task);
+    let changed = rerun.size > 0;
+    for (const task of tasks) {
+      if (task.state !== 'queued') continue;
+      // This also applies to a rerun `starting` task: its original start is still the schedule,
+      // so a restart long after that time must not launch it as if nothing happened.
+      if (this.#blockMissedStart(task)) { changed = true; continue; }
+      void this.#runTask(task);
+    }
+    if (changed) void this.#writeSnapshot();
+  }
+
+  /** Persist a completion ping that had no connected client; the oldest is dropped past the bound. */
+  async enqueueUndeliveredPing(result: Readonly<Record<string, unknown>>): Promise<void> {
+    this.#undeliveredPings.push({ ...result });
+    if (this.#undeliveredPings.length > MAX_UNDELIVERED_PINGS) {
+      this.#undeliveredPings.splice(0, this.#undeliveredPings.length - MAX_UNDELIVERED_PINGS);
+    }
+    await this.#writeSnapshot();
+  }
+
+  /** How many completion pings are still waiting for an attached consumer. */
+  undeliveredPingCount(): number {
+    return this.#undeliveredPings.length;
+  }
+
+  /**
+   * Deliver queued pings, removing each entry only after its write reports success. Failed entries
+   * stay queued. A crash between a successful write and the snapshot can redeliver that ping.
+   * Flushes are serialized so concurrent attaches cannot both deliver the same entry.
+   */
+  flushUndeliveredPings(
+    deliver: (result: Readonly<Record<string, unknown>>) => boolean | void | Promise<boolean | void>,
+  ): Promise<number> {
+    const run = this.#pingFlush.then(() => this.#flushUndeliveredPings(deliver));
+    this.#pingFlush = run.then(() => undefined, () => undefined);
+    return run;
+  }
+
+  async #flushUndeliveredPings(
+    deliver: (result: Readonly<Record<string, unknown>>) => boolean | void | Promise<boolean | void>,
+  ): Promise<number> {
+    if (this.#undeliveredPings.length === 0) return 0;
+    const queued = [...this.#undeliveredPings];
+    const delivered = new Set<Record<string, unknown>>();
+    for (const result of queued) {
+      try {
+        if (await deliver(result) !== false) delivered.add(result);
+      } catch {
+        // A failing notifier leaves this ping queued for the next attach.
+      }
+    }
+    if (delivered.size === 0) return 0;
+    // Remove exactly the entries that were delivered (by identity), keeping any added meanwhile.
+    this.#undeliveredPings = this.#undeliveredPings.filter(ping => !delivered.has(ping));
+    await this.#writeSnapshot().catch(() => undefined);
+    return delivered.size;
+  }
+
+  restoreUndeliveredPings(pings: unknown): void {
+    if (!Array.isArray(pings)) return;
+    this.#undeliveredPings = pings
+      .filter((ping): ping is Record<string, unknown> => typeof ping === 'object' && ping !== null && !Array.isArray(ping))
+      .slice(-MAX_UNDELIVERED_PINGS)
+      .map(ping => ({ ...ping }));
+  }
+
+  /** Emit a queued task's settlement ping when it transitions to blocked. */
+  #emitTaskPing(task: PendingTask): void {
+    if ((task.notify ?? 'always') === 'never') return;
+    try {
+      this.#onDetachedSettled?.({
+        agent_id: task.id, task_id: task.id, status: task.state, backend: task.input.backend,
+        ...(task.start_at === undefined ? {} : { start_at: task.start_at }),
+        ...(task.result ?? {}),
+      });
+    } catch {
+      // A failing notifier must not break restore.
+    }
   }
 
   exportSnapshot(): readonly AgentSnapshot[] {
@@ -1456,6 +2328,14 @@ export class Supervisor {
       const picked = snapshot.name !== undefined ? { name: snapshot.name } : this.#nextAgentName(reservedNames);
       const name = picked.name;
       reservedNames.add(name.toLowerCase());
+      const restoredFailure = live
+        ? classifyFailure({
+            code: "HOST_RESTARTED",
+            message: "The subagent host restarted while this agent was running. send_message resumes it.",
+            backend: snapshot.backend,
+            source: "supervisor",
+          })
+        : normalizeFailure(snapshot.lastError, { failed: snapshot.state === "failed" });
       const record: AgentRecord = {
         meta: snapshot.meta ?? { turn: 1, history: [] },
         id: snapshot.id,
@@ -1470,6 +2350,8 @@ export class Supervisor {
         detached: false,
         createdAt: snapshot.createdAt,
         updatedAt: snapshot.updatedAt,
+        heartbeatAt: snapshot.updatedAt,
+        staleProbes: 0,
         cursor: 0,
         timeoutSeconds: snapshot.timeoutSeconds,
         timedOut: snapshot.timedOut === true,
@@ -1478,19 +2360,14 @@ export class Supervisor {
         pumping: false,
         ...(snapshot.meta?.history.at(-1)?.usage ? { usage: snapshot.meta.history.at(-1)!.usage as Record<string, unknown> } : {}),
         ...(snapshot.result === undefined ? {} : { result: snapshot.result }),
-        ...(live
-          ? {
-              lastError: {
-                code: "HOST_RESTARTED",
-                message: "The subagent host restarted while this agent was running. send_message resumes it.",
-              },
-            }
-          : snapshot.lastError === undefined
-            ? {}
-            : { lastError: snapshot.lastError }),
+        ...(restoredFailure === undefined ? {} : { lastError: restoredFailure }),
         waiters: [],
         release: () => undefined,
       };
+      if (restoredFailure !== undefined) record.lastErrorTurn = record.meta.turn;
+      if (!live && record.state === "failed" && record.lastError === undefined) {
+        this.#ensureFailure(record);
+      }
       if (live) delete record.meta.activity;
       this.#agents.set(record.id, record);
       this.#names.set(name, record.id);
@@ -1521,15 +2398,22 @@ export class Supervisor {
   }
 
   #writeSnapshot(): Promise<void> {
+    if (this.#persistenceClosed) return Promise.resolve();
     const operation = this.#writes.then(() => this.#saveSnapshot());
     this.#writes = operation.catch(error => { this.#storageError = String(error); });
     return operation;
   }
 
   async #saveSnapshot(): Promise<void> {
+    if (this.#persistenceClosed) return;
     const path = this.#persistencePath;
     if (path === undefined) return;
-    const body = `${JSON.stringify({ version: 1, agents: this.exportSnapshot(), pending: [...this.#pending.values()] }, null, 2)}\n`;
+    const body = `${JSON.stringify({
+      version: 1,
+      agents: this.exportSnapshot(),
+      pending: [...this.#pending.values()],
+      ...(this.#undeliveredPings.length === 0 ? {} : { undeliveredPings: this.#undeliveredPings }),
+    }, null, 2)}\n`;
     await mkdir(dirname(path), { recursive: true });
     const temporary = `${path}.${process.pid}.tmp`;
     await writeFile(temporary, body, { encoding: "utf8", mode: 0o600 });
@@ -1585,34 +2469,35 @@ export class Supervisor {
   }
 
   /**
-   * A global slot, plus a provider slot when models.yaml limits that provider. A provider in
-   * cooldown after a rate limit is waited out first, and the provider slot is taken before the
-   * global one, so a throttled provider never holds global slots that other backends could use.
+   * One capacity guard covers the global cap and every named pool this spawn belongs to:
+   * `backend:<name>`, `model:<glob>` (models.yaml `perBackendConcurrency`/`perModelConcurrency`)
+   * and `provider:<id>` (models.yaml `providerLimits`). A provider in cooldown after a rate limit
+   * is waited out before it takes a slot, and a slot grabbed just before a rate limit is handed
+   * back so the next turn waits too. Queued spawns hold no global slot, so a throttled provider
+   * never blocks backends that are not throttled.
    */
-  async #acquireCapacity(backend: Backend, model: string): Promise<() => void> {
-    const releaseProvider = await this.#acquireProvider(backend, model);
-    let releaseGlobal: () => void;
-    try {
-      releaseGlobal = await this.#capacity.acquireWhenFree(`pending-${randomUUID()}`);
-    } catch (error) {
-      releaseProvider();
-      throw error;
+  #capacityKeys(backend: Backend, model: string): readonly string[] {
+    const keys: string[] = [];
+    if (this.#registry.perBackendConcurrency()[backend] !== undefined) keys.push(`backend:${backend}`);
+    for (const rule of this.#registry.perModelConcurrency()) {
+      if (matchesModelPattern(rule.pattern, backend, model)) keys.push(`model:${rule.pattern}`);
     }
-    return () => { releaseGlobal(); releaseProvider(); };
+    const provider = providerOf(backend, model);
+    if (provider !== undefined && this.#registry.providerLimits()[provider]?.maxConcurrent !== undefined) {
+      keys.push(`provider:${provider}`);
+    }
+    return keys;
   }
 
-  async #acquireProvider(backend: Backend, model: string): Promise<() => void> {
+  async #acquireCapacity(backend: Backend, model: string): Promise<() => void> {
+    const keys = this.#capacityKeys(backend, model);
     const provider = providerOf(backend, model);
-    if (provider === undefined) return () => undefined;
+    if (provider === undefined) return this.#capacity.acquireWhenFree(`pending-${randomUUID()}`, keys);
     const gate = this.#gate(provider);
     for (;;) {
       await this.#waitOutCooldown(gate);
-      const limit = this.#registry.providerLimits()[provider]?.maxConcurrent;
-      if (limit === undefined) return () => undefined;
-      if (gate.capacity === undefined) gate.capacity = new AgentCapacity(limit);
-      else if (gate.capacity.limit !== limit) gate.capacity.setLimit(limit);
-      const release = await gate.capacity.acquireWhenFree(`pending-${randomUUID()}`);
-      // A rate limit hit while this call queued for the slot starts a cooldown it must also wait out.
+      const release = await this.#capacity.acquireWhenFree(`pending-${randomUUID()}`, keys);
+      // A rate limit hit while this call queued for a slot starts a cooldown it must also wait out.
       if (gate.cooldownUntil <= Date.now()) return release;
       release();
     }
@@ -1682,16 +2567,24 @@ export class Supervisor {
     gate.cooldownSpreadMs = seconds * 1000 * 0.4;
   }
 
-  /** Provider gates for list_models: limits, live slots, cooldown and failure counts. */
+  /** Provider gates for list_models: slots come from the shared capacity guard, plus cooldown and failure counts. */
   providersView(): Readonly<Record<string, unknown>> {
     const limits = this.#registry.providerLimits();
     const names = new Set([...Object.keys(limits), ...this.#providers.keys()]);
+    const pools = this.#capacity.poolViews();
     const view: Record<string, unknown> = {};
     for (const provider of [...names].sort()) {
       const gate = this.#providers.get(provider);
       const limit = limits[provider];
+      const pool = limit?.maxConcurrent === undefined
+        ? undefined
+        : pools.find((entry) => entry.key === `provider:${provider}`);
       view[provider] = {
-        ...(limit?.maxConcurrent === undefined ? {} : { limit: limit.maxConcurrent, active: gate?.capacity?.activeCount ?? 0, waiting: gate?.capacity?.waitingCount ?? 0 }),
+        ...(limit?.maxConcurrent === undefined ? {} : {
+          limit: limit.maxConcurrent,
+          active: pool?.active ?? 0,
+          waiting: pool?.waiting ?? 0,
+        }),
         ...(limit?.cooldownSeconds === undefined ? {} : { cooldown_seconds: limit.cooldownSeconds }),
         ...(gate !== undefined && gate.cooldownUntil > Date.now() ? { cooling_down_until: new Date(gate.cooldownUntil).toISOString() } : {}),
         rate_limited: gate?.rate_limited ?? 0,
@@ -1702,8 +2595,81 @@ export class Supervisor {
     }
     return view;
   }
+
+  async #resolveAntigravityDefinition(
+    resolved: Pick<ResolvedAgentConfig, "backend" | "antigravityAgent" | "antigravityAgentFile">,
+    cwd: string,
+  ): Promise<AntigravityAgentDefinition | undefined> {
+    if (resolved.backend !== "antigravity" || resolved.antigravityAgent === undefined) return undefined;
+    return this.#antigravityResolver.resolve({
+      name: resolved.antigravityAgent,
+      cwd,
+      ...(resolved.antigravityAgentFile === undefined ? {} : { file: resolved.antigravityAgentFile }),
+    });
+  }
+
+  async #captureAgentDefinition(
+    resolved: Pick<ResolvedAgentConfig, "backend" | "antigravityAgent" | "antigravityAgentFile">,
+    cwd: string,
+    existing?: AgentDefinitionMetadata,
+    allowChange = false,
+  ): Promise<AgentDefinitionMetadata | undefined> {
+    const definition = await this.#resolveAntigravityDefinition(resolved, cwd);
+    if (definition === undefined) return undefined;
+    if (existing !== undefined) {
+      if (existing.sha256 === definition.sha256) return existing;
+      if (!allowChange) {
+        throw new AntigravityAgentDefinitionError(
+          `Antigravity agent "${definition.name}" changed since this conversation started ` +
+            `(${existing.sha256.slice(0, 12)} -> ${definition.sha256.slice(0, 12)}). ` +
+            "Pass allow_agent_definition_change: true to resume anyway, or spawn a new agent.",
+          "ANTIGRAVITY_AGENT_CHANGED",
+          {
+            agent: definition.name,
+            previousSha256: existing.sha256,
+            currentSha256: definition.sha256,
+            previousSourcePath: existing.sourcePath,
+            currentSourcePath: definition.sourcePath,
+          },
+        );
+      }
+    }
+    return this.#storeAgentDefinition(definition);
+  }
+
+  async #storeAgentDefinition(definition: AntigravityAgentDefinition): Promise<AgentDefinitionMetadata> {
+    let snapshotPath: string | undefined;
+    if (this.#persistencePath !== undefined) {
+      const directory = join(dirname(this.#persistencePath), "antigravity-agents");
+      try {
+        await mkdir(directory, { recursive: true });
+        snapshotPath = join(directory, `${definition.sha256}.md`);
+        await writeFile(snapshotPath, definition.content, { encoding: "utf8", mode: 0o600 });
+      } catch (error) {
+        this.#storageError = `Unable to snapshot Antigravity agent definition: ${String(error)}`;
+        snapshotPath = undefined;
+      }
+    }
+    return {
+      name: definition.name,
+      sourcePath: definition.sourcePath,
+      source: definition.source,
+      portable: definition.portable,
+      sha256: definition.sha256,
+      ...(definition.description === undefined ? {} : { description: definition.description }),
+      ...(definition.tools === undefined ? {} : { tools: definition.tools }),
+      ...(definition.permission === undefined ? {} : { permission: definition.permission }),
+      capturedAt: new Date().toISOString(),
+      ...(snapshotPath === undefined ? {} : { snapshotPath }),
+      bridge_enforced: false,
+    };
+  }
 }
 
 export function modelRosterList(entries: readonly ModelEntry[]): readonly string[] {
   return entries.map((entry) => entry.name);
+}
+
+function isActiveState(state: ToolAgentState): boolean {
+  return state === "starting" || state === "running" || state === "needs_approval";
 }

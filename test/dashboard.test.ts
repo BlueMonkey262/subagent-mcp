@@ -55,7 +55,13 @@ test("a fatal error followed by turn.completed records the turn once, with its u
   const turns = turnsOf();
   assert.equal(turns.length, 1, "one history entry for the turn");
   assert.equal(turns[0]?.["result"], "partial");
-  assert.deepEqual(turns[0]?.["error"], { code: "CODEX_TURN_TIMEOUT", message: "turn exceeded" });
+  // Main normalizes every error through classifyFailure, so the recorded error carries more than
+  // the adapter's raw code/message; the original cause is still the first error.
+  const error = turns[0]?.["error"] as Record<string, unknown>;
+  assert.equal(error["code"], "CODEX_TURN_TIMEOUT");
+  assert.equal(error["message"], "turn exceeded");
+  assert.equal(error["category"], "timeout");
+  assert.equal(error["source"], "adapter");
   const usage = supervisor.listAgents().find((agent) => agent["agent_id"] === id)?.["cumulative_usage"] as Record<string, unknown>;
   assert.equal(usage["inputTokens"], 520, "cumulative usage stays known");
 });
