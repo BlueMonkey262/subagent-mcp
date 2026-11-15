@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { access, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -343,5 +343,43 @@ test("list_models names the backends the environment disables", async () => {
   } finally {
     if (previous === undefined) delete process.env["SUBAGENT_MCP_DISABLED_BACKENDS"];
     else process.env["SUBAGENT_MCP_DISABLED_BACKENDS"] = previous;
+  }
+});
+
+test("get_agent_diff runs no filter, textconv or fsmonitor the worktree configures, and keeps symlinks and modes", async () => {
+  const root = await mkdtemp(join(tmpdir(), "subagent-diff-filter-"));
+  const repo = join(root, "repo");
+  const marker = join(root, "ran");
+  try {
+    await exec("git", ["init", "-q", repo]);
+    const git = (...args: string[]) => exec("git", ["-c", "user.name=t", "-c", "user.email=t@t", ...args], { cwd: repo });
+    await writeFile(join(repo, "a.txt"), "one\n");
+    await git("add", ".");
+    await git("commit", "-qm", "init");
+    const supervisor = new Supervisor({ registry: registry(), adapters: new AdapterRegistry([new FakeAdapter("codex")]), cwd: repo });
+    const spawned = await supervisor.spawnAgent({ agent: "general", prompt: "work", description: "filter", run_in_background: true, isolation: "worktree" } as never);
+    const tree = (spawned["worktree"] as { path: string }).path;
+    const inTree = (...args: string[]) => exec("git", args, { cwd: tree });
+    // What an agent could set up to run a command as the host when the diff is taken.
+    const hook = `touch ${marker}; cat`;
+    await inTree("config", "filter.evil.clean", hook);
+    await inTree("config", "filter.evil.process", `touch ${marker}`);
+    await inTree("config", "diff.evil.textconv", `touch ${marker}; cat`);
+    await inTree("config", "diff.external", `touch ${marker}`);
+    await inTree("config", "core.fsmonitor", `touch ${marker}`);
+    await writeFile(join(tree, ".gitattributes"), "*.txt filter=evil diff=evil\n");
+    await writeFile(join(tree, "a.txt"), "one\nchanged\n");
+    await writeFile(join(tree, "new.txt"), "fresh\n");
+    await writeFile(join(tree, "run.sh"), "#!/bin/sh\n", { mode: 0o755 });
+    await symlink("a.txt", join(tree, "link"));
+
+    const diff = await supervisor.agentDiff(spawned["agent_id"] as string);
+    await assert.rejects(access(marker), "nothing the worktree configured ran");
+    assert.match(diff.patch, /\+changed/);
+    assert.match(diff.patch, /\+fresh/);
+    assert.match(diff.patch, /new file mode 100755[\s\S]*run\.sh|run\.sh[\s\S]*new file mode 100755/);
+    assert.match(diff.patch, /new file mode 120000/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
   }
 });

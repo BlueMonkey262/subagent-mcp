@@ -105,7 +105,9 @@ until the child completes or needs your approval; when it needs approval, call
   line counts plus a unified diff capped at `max_chars`. The agent can't hide a change from it:
   `skip-worktree` and `assume-unchanged` flags are ignored, untracked files are filtered only by the
   tree's `.gitignore` files (not the shared repository's `info/exclude` or your global excludes), and
-  a new `.gitignore` always appears.
+  a new `.gitignore` always appears. Taking the diff runs nothing the worktree configures: files are
+  staged as raw bytes without `git add`, so no clean filter runs, and textconv, external diff and
+  fsmonitor are off.
 - `get_dashboard` is for status UIs such as the `/subagent-mcp` panel and its poller (its
   description steers the model to `list_agents`; hiding it with a `tool.list` hook would also take
   it from the mod's own `$.mcp.call`): live agents, the most recent finished ones (`recent`, default 10) and any that settled in
