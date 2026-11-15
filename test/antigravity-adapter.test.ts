@@ -116,6 +116,156 @@ test("persistent process normalizes events and warm-resumes the same conversatio
   }
 });
 
+test("a headless permission denial ends the tool as denied and names the denied actions", async (t) => {
+  await t.test("empty response fails the turn with the denial as its result", async () => {
+    const cwd = await realpath(await mkdtemp(path.join(os.tmpdir(), "antigravity-denied-")));
+    const adapter = fixtureAdapter(cwd);
+    try {
+      const turn = await adapter.spawn(spawnRequest(cwd, "DENIED"));
+      const events = await eventsThrough(adapter, turn.agentId, (event) => event.type === "turn.completed");
+      const toolEnd = events.find((event) => event.type === "tool.end")?.data as {
+        status: string;
+        output?: { error?: { message?: string } };
+      };
+      assert.equal(toolEnd.status, "denied", "an ERROR tool step must still end the tool");
+      assert.match(String(toolEnd.output?.error?.message), /permission check failed/);
+      const error = events.find((event) => event.type === "error")?.data as { code: string; fatal: boolean; message: string };
+      assert.equal(error.code, "ANTIGRAVITY_PERMISSION_DENIED");
+      assert.equal(error.fatal, false);
+      const completed = events.find((event) => event.type === "turn.completed")?.data as { status: string; finalText?: string };
+      assert.equal(completed.status, "failed");
+      assert.match(completed.finalText ?? "", /auto-denied: command \(RunCommand\)/);
+      assert.match(completed.finalText ?? "", /permissions\.allow/);
+    } finally {
+      await adapter.closeAll();
+    }
+  });
+
+  await t.test("a response that explains the denial keeps the turn completed", async () => {
+    const cwd = await realpath(await mkdtemp(path.join(os.tmpdir(), "antigravity-denied-explained-")));
+    const adapter = fixtureAdapter(cwd);
+    try {
+      const turn = await adapter.spawn(spawnRequest(cwd, "DENIED EXPLAINED"));
+      const events = await eventsThrough(adapter, turn.agentId, (event) => event.type === "turn.completed");
+      assert.equal(events.find((event) => event.type === "error")?.data.code, "ANTIGRAVITY_PERMISSION_DENIED");
+      const completed = events.find((event) => event.type === "turn.completed")?.data as { status: string; finalText?: string };
+      assert.equal(completed.status, "completed");
+      assert.equal(completed.finalText, "I could not run date: permission denied.");
+    } finally {
+      await adapter.closeAll();
+    }
+  });
+});
+
+test("a denial is detected from the tool step and malformed denied_actions still name it", async (t) => {
+  const run = async (prompt: string): Promise<{ events: AgentEvent[]; completed: { status: string; finalText?: string } }> => {
+    const cwd = await realpath(await mkdtemp(path.join(os.tmpdir(), "antigravity-denied-shape-")));
+    const adapter = fixtureAdapter(cwd);
+    try {
+      const turn = await adapter.spawn(spawnRequest(cwd, prompt));
+      const events = await eventsThrough(adapter, turn.agentId, (event) => event.type === "turn.completed");
+      return { events, completed: events.find((event) => event.type === "turn.completed")?.data as { status: string; finalText?: string } };
+    } finally {
+      await adapter.closeAll();
+    }
+  };
+
+  await t.test("missing denied_actions", async () => {
+    const { events, completed } = await run("DENIED_NO_ACTIONS");
+    assert.equal(events.find((event) => event.type === "error")?.data.code, "ANTIGRAVITY_PERMISSION_DENIED");
+    assert.equal(completed.status, "failed");
+    assert.match(completed.finalText ?? "", /auto-denied: command\./);
+    assert.match(completed.finalText ?? "", /permissions\.allow/);
+  });
+
+  await t.test("malformed entry without an action falls back to display_name", async () => {
+    const { events, completed } = await run("DENIED_MALFORMED");
+    assert.equal(events.find((event) => event.type === "error")?.data.code, "ANTIGRAVITY_PERMISSION_DENIED");
+    assert.equal(completed.status, "failed");
+    assert.match(completed.finalText ?? "", /auto-denied: RunCommand\./);
+  });
+
+  await t.test("malformed entry without an action or display_name falls back to the tool error", async () => {
+    const { events, completed } = await run("DENIED_NO_ACTION");
+    assert.equal(events.find((event) => event.type === "error")?.data.code, "ANTIGRAVITY_PERMISSION_DENIED");
+    assert.equal(completed.status, "failed");
+    assert.match(completed.finalText ?? "", /auto-denied: .*permission check failed/);
+  });
+
+  await t.test("whitespace-only response fails the turn", async () => {
+    const { events, completed } = await run("DENIED_WHITESPACE");
+    assert.equal(events.find((event) => event.type === "error")?.data.code, "ANTIGRAVITY_PERMISSION_DENIED");
+    assert.equal(completed.status, "failed");
+    assert.match(completed.finalText ?? "", /auto-denied: command \(RunCommand\)/);
+  });
+});
+
+test("a non-denial ERROR step ends failed and keeps its error beside empty output", async (t) => {
+  const run = async (prompt: string): Promise<AgentEvent[]> => {
+    const cwd = await realpath(await mkdtemp(path.join(os.tmpdir(), "antigravity-tool-error-")));
+    const adapter = fixtureAdapter(cwd);
+    try {
+      const turn = await adapter.spawn(spawnRequest(cwd, prompt));
+      return await eventsThrough(adapter, turn.agentId, (event) => event.type === "turn.completed");
+    } finally {
+      await adapter.closeAll();
+    }
+  };
+
+  await t.test("a non-permission ERROR step is failed", async () => {
+    const events = await run("TOOL_FAIL");
+    const toolEnd = events.find((event) => event.type === "tool.end")?.data as {
+      status: string;
+      output?: { output?: string; error?: { message?: string } };
+    };
+    assert.equal(toolEnd.status, "failed");
+    assert.equal(toolEnd.output?.output, "");
+    assert.equal(toolEnd.output?.error?.message, "exit status 1");
+    assert.equal(events.some((event) => event.type === "error"), false);
+  });
+
+  await t.test("empty tool_info.output does not drop the failure reason", async () => {
+    const events = await run("ERROR_OUTPUT");
+    const toolEnd = events.find((event) => event.type === "tool.end")?.data as {
+      status: string;
+      output?: { output?: string; error?: { message?: string } };
+    };
+    assert.equal(toolEnd.status, "failed");
+    assert.equal(toolEnd.output?.output, "");
+    assert.equal(toolEnd.output?.error?.message, "disk full while writing notes.txt");
+  });
+});
+
+test("a denial in one turn does not mark a later turn on the same process", async () => {
+  const cwd = await realpath(await mkdtemp(path.join(os.tmpdir(), "antigravity-denied-reset-")));
+  const adapter = fixtureAdapter(cwd);
+  const request = spawnRequest(cwd, "DENIED");
+  try {
+    const first = await adapter.spawn(request);
+    const firstEvents = await eventsThrough(adapter, first.agentId, (event) => event.type === "turn.completed");
+    assert.equal(firstEvents.find((event) => event.type === "turn.completed")?.data.status, "failed");
+    const cursor = firstEvents.at(-1)!.sequence;
+
+    const second = await adapter.resume(resumeRequest(request, first.agentId, "SECOND"));
+    const secondEvents = await eventsThrough(
+      adapter,
+      second.agentId,
+      (event) => event.type === "turn.completed" && event.data.turnId === second.turnId,
+      cursor,
+    );
+    assert.equal(
+      secondEvents.some((event) => event.type === "error" && event.data.code === "ANTIGRAVITY_PERMISSION_DENIED"),
+      false,
+      "the denial flag must reset for the next turn",
+    );
+    const completed = secondEvents.find((event) => event.type === "turn.completed")?.data as { status: string; finalText?: string };
+    assert.equal(completed.status, "completed");
+    assert.equal(completed.finalText, "<system\\-reminder>final 2</system\\-reminder>");
+  } finally {
+    await adapter.closeAll();
+  }
+});
+
 test("interrupt, malformed output, and cold resume reconcile into normalized terminal events", async (t) => {
   await t.test("interrupt", async () => {
     const cwd = await realpath(await mkdtemp(path.join(os.tmpdir(), "antigravity-adapter-interrupt-")));
