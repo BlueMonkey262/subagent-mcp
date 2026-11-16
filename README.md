@@ -635,6 +635,42 @@ the outcome. See `src/channel.ts`.
   generalize by program+subcommand (`sessionRuleForRequest()` in `src/approval/policy.ts`), not
   just an exact repeat of the same command.
 
+### Completion without channels
+
+Where channels are unavailable (the desktop app, other MCP clients), two commands give the same
+wake-up through ordinary background commands. Run them from the project directory, or pass `--cwd`.
+
+- `subagent-mcp wait <agent...> [--any] [--timeout SECONDS] [--max-result-chars N]` blocks until
+  the agents settle, or until one needs approval, using `wait_for_agents` in 60-second rounds and
+  reconnecting if the host restarts. It then prints one JSON line per agent (`name`, `agent_id`,
+  `state`, `error`, `approval` with the `request_id` for `resolve_approval`, and the capped
+  `result`). Exit codes: `0` completed (with `--any`, the agents that settled did), `2` failed or
+  interrupted, `3` needs approval, `124` `--timeout` reached, `1` error such as an unknown agent.
+  If no host is running, it reports each agent's last turn from the results log.
+- `subagent-mcp events [--follow] [--all | --since ISO-TIME] [--full] [--max-result-chars N]`
+  prints one JSON line per settled turn (`name`, `agent_id`, `turn`, `status`, `finished_at`,
+  `error`, and the first 500 characters of `result`). With `--follow` it keeps printing as turns
+  settle, starting from now unless `--all` or `--since` is given; `--full` prints log entries
+  unchanged. Approval requests are not in the log: use `wait` (or `list_agents`) for those.
+
+**Results log format.** `.subagents/memory/sessions.json.results.jsonl` is a supported interface.
+Each line is one JSON object for a turn that settled, appended before any completion ping:
+
+| Field | Meaning |
+| --- | --- |
+| `agent_id` | the agent's id |
+| `name` | the agent's name (missing on lines written by older versions) |
+| `turn` | turn number, from 1 |
+| `status` | `completed`, `failed` or `interrupted` |
+| `finished_at` | ISO time the turn settled |
+| `result` | the final text, uncapped |
+| `error` | on failure: `code`, `message`, and classification fields |
+| `turn_id`, `usage`, `structured_result`, `validation_errors` | when known |
+
+The file is append-only, and fields are only ever added. A turn can appear more than once (a
+provisional entry written on a fatal error, then the complete one), and the last line for an
+`agent_id` and `turn` wins. A crash can leave a torn final line, which the host repairs at start.
+
 ### Delayed agents
 
 `spawn_agent` can schedule work for later instead of starting it now. Pass exactly one of:

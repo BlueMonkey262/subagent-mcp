@@ -10,6 +10,8 @@
 #   subagent-mcp endpoint list|remove NAME
 #   subagent-mcp antigravity doctor|vendor <agent-config> [--force]     audit or vendor Antigravity definitions
 #   subagent-mcp status                      endpoints, litellm and proxy state
+#   subagent-mcp wait <agent...> [--any] [--timeout S]   block until agents settle (exit code = outcome)
+#   subagent-mcp events [--follow]           one JSON line per settled turn (tails the results log)
 set -euo pipefail
 
 SELF="$(readlink -f "${BASH_SOURCE[0]}")"
@@ -49,6 +51,9 @@ endpoint)
 antigravity)
     shift
     exec node "$ROOT/bin/agents.mjs" "$@"
+    ;;
+wait|events)
+    exec node "$ROOT/bin/watch.mjs" "$@"
     ;;
 status)
     node "$ROOT/bin/endpoints.mjs" list

@@ -52,7 +52,9 @@ test('config discovery, bounded listing, progress and durable successive structu
   assert.equal((result.turns as unknown[]).length, 2);
   assert.ok(result.validation_errors);
   assert.equal((result.cumulative_usage as Record<string, unknown>).costUsd, 3);
-  assert.equal((await readFile(path + '.results.jsonl', 'utf8')).trim().split('\n').length, 2);
+  const logged = (await readFile(path + '.results.jsonl', 'utf8')).trim().split('\n').map(line => JSON.parse(line) as Record<string, unknown>);
+  assert.equal(logged.length, 2);
+  assert.ok(logged.every(entry => entry.name === s.listAgents()[0]?.name && entry.agent_id === id), 'each entry names its agent');
   const restored = fixture().supervisor; restored.restore(s.exportSnapshot());
   assert.equal(((restored.getAgentResult(id) as Record<string, unknown>).turns as unknown[]).length, 2);
   assert.equal((s.sessionView({ limit: 1 }).agents as unknown[]).length, 1);

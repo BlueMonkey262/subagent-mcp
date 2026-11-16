@@ -96,6 +96,11 @@ twice. The MCP server registered in step 3 is available to desktop sessions too.
   background agent finishes. The mod's toasts tell you instead: an agent finished or failed, an
   agent needs approval, an ensemble completed. Turn them off with the mod's `toasts` option
   (`/config`) if the terminal's channel events are enough.
+- To wake Claude itself, have it run `subagent-mcp wait <agent...>` as a background command after
+  a background spawn: the command exits when the agents settle or one needs approval, and the
+  desktop app reports the finished command as a new turn. For a stream of every settled agent, a
+  Monitor on `subagent-mcp events --follow` works the same way. See "Completion without channels"
+  in the README.
 - `/subagent-mcp widget` opens the panel as the desktop app's small floating widget: running and
   waiting counts and what each running agent is doing. Run `/subagent-mcp` for the full panel.
 - The desktop app has no status line, so step 4's rows don't apply there.
