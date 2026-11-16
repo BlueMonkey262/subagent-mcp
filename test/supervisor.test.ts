@@ -1291,6 +1291,38 @@ test("list_models adds live backend info (default on for a named backend) and fl
   assert.ok(failed["models"], "a live failure keeps the local roster");
 });
 
+test("list_models reports each signed-in account's live usage under accounts, naming its configs", async () => {
+  const adapter = new FakeAdapter("codex");
+  const queried: (string | undefined)[] = [];
+  Object.assign(adapter, {
+    accountOf: (env: Readonly<Record<string, string>>) => env["CODEX_HOME"],
+    providerInfo: async (_signal?: AbortSignal, env?: Readonly<Record<string, string>>) => {
+      queried.push(env?.["CODEX_HOME"]);
+      const percent = env?.["CODEX_HOME"] === undefined ? 70 : 20;
+      return { models: [{ id: "fake-model" }], usage_limits: { plan: { weekly: { remaining_percent: percent } } } };
+    },
+  });
+  const altEnv = { CODEX_HOME: "/homes/alt" };
+  const supervisor = new Supervisor({
+    registry: testRegistry([
+      codexAgentConfig(),
+      codexAgentConfig({ name: "alt-a", env: altEnv }),
+      codexAgentConfig({ name: "alt-b", env: altEnv }),
+    ]),
+    adapters: new AdapterRegistry([adapter]),
+    cwd: "/work",
+  });
+
+  const live = (await supervisor.listModels("codex"))["live"] as Record<string, unknown>;
+  assert.deepEqual(queried.sort(), ["/homes/alt", undefined], "one query per account, not per config");
+  assert.deepEqual(live["usage_limits"], { plan: { weekly: { remaining_percent: 70 } } });
+  assert.deepEqual(live["accounts"], [{
+    account: "/homes/alt",
+    agents: ["alt-a", "alt-b"],
+    usage_limits: { plan: { weekly: { remaining_percent: 20 } } },
+  }]);
+});
+
 test("list_models marks blocked models in the live backend catalog", async () => {
   const adapter = new FakeAdapter("codex");
   Object.assign(adapter, {

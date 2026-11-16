@@ -86,9 +86,10 @@ const candidateId = (candidate: Candidate) => `${candidate.backend}/${candidate.
 /**
  * Every runnable (config, model) pair the criteria allow. A config that pins a model offers only that
  * model; an unpinned config offers every unblocked roster model of its backend. When several configs
- * offer the same backend/model, the first in `criteria.configs` order (else by name) represents it.
+ * offer the same backend/model, the first in `criteria.configs` order (else by name) represents it,
+ * and the others are kept in that order under `alternates` (keyed by `backend/model`) as fallbacks.
  */
-export function gatherCandidates(source: CandidateSource, criteria: SelectionCriteria): { candidates: Candidate[]; rejected: { candidate: string; reason: string }[] } {
+export function gatherCandidates(source: CandidateSource, criteria: SelectionCriteria): { candidates: Candidate[]; alternates: Map<string, string[]>; rejected: { candidate: string; reason: string }[] } {
   const rejected: { candidate: string; reason: string }[] = [];
   const configOrder = criteria.configs ?? [];
   const configs = [...source.configs()]
@@ -98,6 +99,7 @@ export function gatherCandidates(source: CandidateSource, criteria: SelectionCri
       return rank(a.name) - rank(b.name) || a.name.localeCompare(b.name);
     });
   const seen = new Map<string, Candidate>();
+  const alternates = new Map<string, string[]>();
   for (const config of configs) {
     if (criteria.backends !== undefined && !criteria.backends.includes(config.backend)) continue;
     if (criteria.exclude_backends?.includes(config.backend)) continue;
@@ -116,7 +118,12 @@ export function gatherCandidates(source: CandidateSource, criteria: SelectionCri
     for (const entry of models) {
       const candidate = { config: config.name, backend: config.backend, model: entry.name };
       const id = candidateId(candidate);
-      if (seen.has(id)) continue;
+      if (seen.has(id)) {
+        const others = alternates.get(id);
+        if (others === undefined) alternates.set(id, [config.name]);
+        else if (!others.includes(config.name)) others.push(config.name);
+        continue;
+      }
       if (entry.blocked === true) { rejected.push({ candidate: id, reason: "blocked by model policy" }); continue; }
       if (criteria.exclude_models?.some((pattern) => pattern === entry.name || pattern === id)) {
         rejected.push({ candidate: id, reason: "excluded by criteria" });
@@ -125,16 +132,20 @@ export function gatherCandidates(source: CandidateSource, criteria: SelectionCri
       seen.set(id, candidate);
     }
   }
-  return { candidates: [...seen.values()], rejected };
+  return { candidates: [...seen.values()], alternates, rejected };
 }
 
-/** Local allowances, then (when asked) the backend's live plan usage. Missing data stays "unknown". */
+/**
+ * Local allowances, then (when asked) the backend's live plan usage. Missing data stays "unknown".
+ * Keyed by backend, plus `config:<name>` for a config whose `env:` selects another signed-in
+ * account (live `accounts`): that config is judged by its own account's plan usage.
+ */
 export async function quotaStates(
   source: CandidateSource,
   backends: readonly Backend[],
   criteria: SelectionCriteria,
-): Promise<Map<Backend, QuotaState>> {
-  const states = new Map<Backend, QuotaState>();
+): Promise<Map<string, QuotaState>> {
+  const states = new Map<string, QuotaState>();
   const remaining = source.remaining();
   for (const backend of backends) {
     const allowance = remaining[backend];
@@ -150,36 +161,71 @@ export async function quotaStates(
       if (states.get(backend)?.state === "exhausted") return;
       let info: Readonly<Record<string, unknown>> | undefined;
       try { info = await source.live!(backend); } catch { return; }
-      const percents = collectNumbers(info, "remaining_percent");
-      if (percents.length === 0) return;
-      const lowest = Math.min(...percents);
-      states.set(backend, lowest < threshold
-        ? { state: "exhausted", source: "live", detail: `live plan usage has ${lowest}% left (< ${threshold}%)` }
-        : { state: "available", source: "live", remaining_percent: lowest });
+      if (info === undefined) return;
+      const { accounts, ...own } = info;
+      const allowance = states.get(backend);
+      const state = liveQuota(own, threshold);
+      if (state !== undefined) states.set(backend, state);
+      for (const account of liveAccounts(accounts)) {
+        const accountState = liveQuota(account, threshold) ?? allowance;
+        if (accountState === undefined) continue;
+        for (const name of account.agents) states.set(`config:${name}`, accountState);
+      }
     }));
   }
   return states;
 }
 
-/** Models the backend's live catalog says it does not offer. */
-export async function unofferedModels(source: CandidateSource, backends: readonly Backend[]): Promise<Set<string>> {
-  const missing = new Set<string>();
-  if (source.live === undefined) return missing;
+function liveQuota(info: unknown, threshold: number): QuotaState | undefined {
+  const percents = collectNumbers(info, "remaining_percent");
+  if (percents.length === 0) return undefined;
+  const lowest = Math.min(...percents);
+  return lowest < threshold
+    ? { state: "exhausted", source: "live", detail: `live plan usage has ${lowest}% left (< ${threshold}%)` }
+    : { state: "available", source: "live", remaining_percent: lowest };
+}
+
+/** The live `accounts` entries (list_models): another signed-in account and the configs on it. */
+function liveAccounts(value: unknown): (Readonly<Record<string, unknown>> & { readonly agents: readonly string[] })[] {
+  if (!Array.isArray(value)) return [];
+  return value.flatMap((entry) => {
+    if (typeof entry !== "object" || entry === null) return [];
+    const agents = (entry as Record<string, unknown>)["agents"];
+    return Array.isArray(agents) ? [{ ...(entry as Record<string, unknown>), agents: agents.filter((name): name is string => typeof name === "string") }] : [];
+  });
+}
+
+function notOffered(info: unknown): readonly string[] {
+  const list = typeof info === "object" && info !== null ? (info as Record<string, unknown>)["roster_not_offered"] : undefined;
+  return Array.isArray(list) ? list.filter((model): model is string => typeof model === "string") : [];
+}
+
+/**
+ * Models the backend's live catalog says it does not offer: `backend/model` ids for the default
+ * account, and per config for a config on another account (its plan may offer less).
+ */
+export async function unofferedModels(source: CandidateSource, backends: readonly Backend[]): Promise<{ byBackend: Set<string>; byConfig: Map<string, Set<string>> }> {
+  const byBackend = new Set<string>();
+  const byConfig = new Map<string, Set<string>>();
+  if (source.live === undefined) return { byBackend, byConfig };
   await Promise.all(backends.map(async (backend) => {
     try {
       const info = await source.live!(backend);
-      const list = info?.["roster_not_offered"];
-      if (Array.isArray(list)) for (const model of list) if (typeof model === "string") missing.add(`${backend}/${model}`);
+      for (const model of notOffered(info)) byBackend.add(`${backend}/${model}`);
+      for (const account of liveAccounts(info?.["accounts"])) {
+        const missing = new Set(notOffered(account).map((model) => `${backend}/${model}`));
+        for (const name of account.agents) byConfig.set(name, missing);
+      }
     } catch { /* unknown: keep */ }
   }));
-  return missing;
+  return { byBackend, byConfig };
 }
 
 /** Deterministic, explainable score. Reliability, cost and latency prefer measured history over declarations. */
 export function scoreCandidates(
   candidates: readonly Candidate[],
   criteria: SelectionCriteria,
-  options: { readonly profiles?: CapabilityProfiles; readonly history?: RoutingHistory; readonly quotas?: ReadonlyMap<Backend, QuotaState>; readonly active?: ReadonlyMap<Backend, number> } = {},
+  options: { readonly profiles?: CapabilityProfiles; readonly history?: RoutingHistory; readonly quotas?: ReadonlyMap<string, QuotaState>; readonly active?: ReadonlyMap<Backend, number> } = {},
 ): { scored: ScoredCandidate[]; rejected: { candidate: string; reason: string }[] } {
   const profiles = options.profiles ?? EMPTY_PROFILES;
   const history = options.history ?? new RoutingHistory();
@@ -196,7 +242,7 @@ export function scoreCandidates(
   for (const candidate of candidates) {
     const id = candidateId(candidate);
     const profile = profiles.get(candidate.backend, candidate.model);
-    const quota = options.quotas?.get(candidate.backend) ?? { state: "unknown" as const };
+    const quota = options.quotas?.get(`config:${candidate.config}`) ?? options.quotas?.get(candidate.backend) ?? { state: "unknown" as const };
     if (quota.state === "exhausted") { rejected.push({ candidate: id, reason: quota.detail }); continue; }
     const missingCapabilities = (criteria.require ?? []).filter((capability) => !(profile?.capabilities ?? []).includes(capability));
     if (missingCapabilities.length > 0) {
@@ -288,17 +334,31 @@ export async function selectModels(
   const gathered = gatherCandidates(source, criteria);
   const backends = [...new Set(gathered.candidates.map((candidate) => candidate.backend))];
   const notes: string[] = [];
-  let candidates = gathered.candidates;
   const rejected = [...gathered.rejected];
-  if (criteria.live_quota === true) {
-    const unoffered = await unofferedModels(source, backends);
-    candidates = candidates.filter((candidate) => {
-      if (!unoffered.has(candidateId(candidate))) return true;
-      rejected.push({ candidate: candidateId(candidate), reason: "not offered by the backend's live catalog" });
-      return false;
-    });
-  }
+  const unoffered = criteria.live_quota === true ? await unofferedModels(source, backends) : undefined;
   const quotas = await quotaStates(source, backends, criteria);
+  // Why a config cannot run this candidate's model now: its account's catalog lacks it, or its
+  // account (or the backend) has no quota left.
+  const blocker = (config: string, candidate: Candidate): string | undefined => {
+    const missing = unoffered === undefined ? undefined : unoffered.byConfig.get(config) ?? unoffered.byBackend;
+    if (missing?.has(candidateId(candidate))) return "not offered by the backend's live catalog";
+    const quota = quotas.get(`config:${config}`) ?? quotas.get(candidate.backend);
+    return quota?.state === "exhausted" ? quota.detail : undefined;
+  };
+  // Another config offering the same model (for example one on a second signed-in account) takes
+  // over when the representative's account is out of quota or lacks the model.
+  const candidates = gathered.candidates.flatMap((candidate) => {
+    const id = candidateId(candidate);
+    const reason = blocker(candidate.config, candidate);
+    if (reason === undefined) return [candidate];
+    const fallback = (gathered.alternates.get(id) ?? []).find((config) => blocker(config, candidate) === undefined);
+    if (fallback === undefined) {
+      rejected.push({ candidate: id, reason });
+      return [];
+    }
+    notes.push(`${id}: ${candidate.config} skipped (${reason}); using ${fallback}`);
+    return [{ ...candidate, config: fallback }];
+  });
   const { scored, rejected: scoreRejected } = scoreCandidates(candidates, criteria, {
     ...(options.profiles === undefined ? {} : { profiles: options.profiles }),
     ...(options.history === undefined ? {} : { history: options.history }),

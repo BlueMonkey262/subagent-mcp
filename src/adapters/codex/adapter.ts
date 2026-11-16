@@ -1,4 +1,6 @@
 import { spawn as nodeSpawn, type ChildProcessWithoutNullStreams, type SpawnOptionsWithoutStdio } from "node:child_process";
+import { homedir } from "node:os";
+import { join, resolve } from "node:path";
 
 import { signalProcessGroup } from "../../process-group.js";
 
@@ -170,7 +172,7 @@ export class CodexAdapter implements BackendAdapter {
       await this.#startTurn(existing, request.prompt, request.timeoutMs, request.reasoningEffort);
       return { agentId: request.agentId, turnId: requireString(existing.currentTurn.id, "turn id"), backend: this.backend };
     }
-    const session = this.#launch({ cwd: request.cwd, model: request.model }, request.agentId);
+    const session = this.#launch({ cwd: request.cwd, model: request.model, env: request.env }, request.agentId);
     await this.#handshake(session);
     const resumed = await this.#request(session, "thread/resume", {
       threadId: request.agentId,
@@ -267,9 +269,9 @@ export class CodexAdapter implements BackendAdapter {
    * mode (`account/read`). Each section fails on its own: with API-key auth there are no plan limits,
    * and that shows up under `errors` while the model list still comes back.
    */
-  async providerInfo(signal?: AbortSignal): Promise<ProviderInfo> {
+  async providerInfo(signal?: AbortSignal, env?: Readonly<Record<string, string>>): Promise<ProviderInfo> {
     signal?.throwIfAborted();
-    const session = this.#launch({ cwd: process.cwd(), model: "" });
+    const session = this.#launch({ cwd: process.cwd(), model: "", ...(env === undefined ? {} : { env }) });
     const abort = (): void => this.#terminate(session);
     signal?.addEventListener("abort", abort, { once: true });
     try {
@@ -309,6 +311,15 @@ export class CodexAdapter implements BackendAdapter {
     }
   }
 
+  /** Codex keeps its ChatGPT login in `CODEX_HOME`, so a different home is a different account. */
+  accountOf(env: Readonly<Record<string, string>>): string | undefined {
+    const home = env["CODEX_HOME"];
+    if (home === undefined || home.trim() === "") return undefined;
+    const defaultHome = this.#options.env?.["CODEX_HOME"] ?? process.env["CODEX_HOME"] ?? join(homedir(), ".codex");
+    const account = resolve(home);
+    return account === resolve(defaultHome) ? undefined : account;
+  }
+
   /**
    * Stop a `providerInfo` app-server: SIGTERM, a short grace, then SIGKILL the process group. It
    * stays tracked (so `closeAll` still reaches it) until its exit is observed.
@@ -345,10 +356,14 @@ export class CodexAdapter implements BackendAdapter {
     for (const launch of this.#launches) this.#terminate(launch);
   }
 
-  #launch(request: Pick<SpawnRequest, "cwd" | "model">, expectedThreadId?: string): CodexSession {
+  /**
+   * `request.env` is the agent definition's `env:` (plus the bridge's depth variable). Setting
+   * `CODEX_HOME` there points an agent at another Codex home, and so another signed-in account.
+   */
+  #launch(request: Pick<SpawnRequest, "cwd" | "model"> & { readonly env?: SpawnRequest["env"] }, expectedThreadId?: string): CodexSession {
     const child = this.#spawnProcess(this.#options.executable, [...this.#options.executableArgs], {
       cwd: request.cwd,
-      env: { ...process.env, ...this.#options.env },
+      env: { ...process.env, ...this.#options.env, ...request.env },
       shell: false,
       windowsHide: true,
       // Own process group so stop and timeout can reap shells Codex spawned.

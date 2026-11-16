@@ -3,7 +3,7 @@ import { EventEmitter } from "node:events";
 import { PassThrough } from "node:stream";
 import test from "node:test";
 
-import type { ChildProcessWithoutNullStreams } from "node:child_process";
+import type { ChildProcessWithoutNullStreams, SpawnOptionsWithoutStdio } from "node:child_process";
 
 import { CodexAdapter } from "../src/adapters/codex/adapter.js";
 import type { ResumeRequest, SpawnRequest } from "../src/adapters/adapter.js";
@@ -161,6 +161,43 @@ test("spawn detaches Codex into its own process group", async () => {
   });
   await adapter.spawn(spawnRequest());
   assert.equal(detached, true);
+});
+
+test("spawn() and a cold resume() launch Codex with the agent definition's env", async () => {
+  const launches: (NodeJS.ProcessEnv | undefined)[] = [];
+  const spawnProcess = (_command: string, _args: readonly string[], options: SpawnOptionsWithoutStdio) => {
+    launches.push(options.env);
+    return fakeCodexServer().child;
+  };
+  const env = { CODEX_HOME: "/tmp/codex-alt" };
+  const spawned = await new CodexAdapter({ spawnProcess, initTimeoutMs: 2_000 }).spawn(spawnRequest({ env }));
+  // A fresh adapter has no live session, so resume() launches a new app-server for the thread.
+  await new CodexAdapter({ spawnProcess, initTimeoutMs: 2_000 }).resume({
+    agentId: spawned.agentId, prompt: "follow up", cwd: "/tmp", model: "gpt-5.6-luna", systemPrompt: "", env, permission,
+  });
+  assert.equal(launches.length, 2);
+  for (const launched of launches) {
+    assert.equal(launched?.CODEX_HOME, "/tmp/codex-alt");
+    assert.equal(launched?.PATH, process.env.PATH, "the agent env adds to the host env rather than replacing it");
+  }
+});
+
+test("accountOf names a non-default CODEX_HOME, and providerInfo queries that home", async () => {
+  const adapter = new CodexAdapter({ env: { CODEX_HOME: "/homes/main" } });
+  assert.equal(adapter.accountOf({}), undefined);
+  assert.equal(adapter.accountOf({ CODEX_HOME: "/homes/main/" }), undefined, "the default home is the default account");
+  assert.equal(adapter.accountOf({ CODEX_HOME: "/homes/alt" }), "/homes/alt");
+
+  let launched: NodeJS.ProcessEnv | undefined;
+  const probe = new CodexAdapter({
+    env: { CODEX_HOME: "/homes/main" },
+    spawnProcess: (_command, _args, options) => { launched = options.env; return fakeCodexServer().child; },
+    initTimeoutMs: 2_000,
+    liveSectionTimeoutMs: 200,
+    probeReapGraceMs: 10,
+  });
+  await probe.providerInfo(undefined, { CODEX_HOME: "/homes/alt" });
+  assert.equal(launched?.CODEX_HOME, "/homes/alt");
 });
 
 test("spawn() sends reasoningEffort on turn/start when provided", async () => {
