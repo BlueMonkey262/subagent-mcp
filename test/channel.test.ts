@@ -124,3 +124,41 @@ test("a background send_message resume is pushed, a blocking one is not", async 
   await waitUntil(() => settled.length === 1);
   assert.equal(settled[0]?.["result"], "third");
 });
+
+test('background Codex origins survive snapshots and are not exposed in ordinary results', async () => {
+  const { adapter, supervisor, settled } = harness();
+  adapter.queueScript([]);
+  const thread = '01a1e113-23c3-7203-a5ca-cc754be5b4df';
+  const receipt = await supervisor.spawnAgent({ agent: 'general', prompt: 'p', description: 'd', run_in_background: true, codexThread: thread });
+  const id = String(receipt.agent_id);
+  assert.equal(receipt.codex_thread, undefined);
+  assert.equal(supervisor.exportSnapshot()[0]?.meta?.codexThread, thread);
+  adapter.emit(id, 'turn.completed', { turnId: 'one', status: 'completed', finalText: 'done' });
+  await waitUntil(() => settled.length === 1);
+  assert.equal(settled[0]?.codex_thread, thread);
+});
+
+test('queued pings can be selectively delivered without consuming another client target', async () => {
+  const { supervisor } = harness();
+  await supervisor.enqueueUndeliveredPing({ agent_id: 'claude' });
+  await supervisor.enqueueUndeliveredPing({ agent_id: 'codex', codex_thread: 'thread' });
+  const delivered: unknown[] = [];
+  await supervisor.flushUndeliveredPings(event => { if (event.codex_thread) return false; delivered.push(event.agent_id); return true; });
+  assert.deepEqual(delivered, ['claude']);
+  assert.equal(supervisor.hasUndeliveredCodexPings(), true);
+  await supervisor.flushUndeliveredPings(event => event.codex_thread === 'thread');
+  assert.equal(supervisor.undeliveredPingCount(), 0);
+});
+
+test('a queued message does not redirect an in-flight approval to a different Codex thread', async () => {
+  const { adapter, supervisor, settled } = harness();
+  const first = '01a1e113-23c3-7203-a5ca-cc754be5b4df';
+  const second = '01a1e113-23c3-7203-a5ca-cc754be5b4de';
+  adapter.queueScript([]);
+  const receipt = await supervisor.spawnAgent({ agent: 'general', prompt: 'p', description: 'd', run_in_background: true, codexThread: first });
+  const id = String(receipt.agent_id);
+  await supervisor.sendMessage({ agent: id, prompt: 'later', run_in_background: true, codexThread: second });
+  adapter.emit(id, 'approval.requested', { requestId: 'route-request', agentId: id, backend: 'codex', toolName: 'Bash', input: {}, cwd: '/work', requestedAt: new Date().toISOString() });
+  await waitUntil(() => settled.length > 0);
+  assert.equal(settled[0]?.codex_thread, first);
+});

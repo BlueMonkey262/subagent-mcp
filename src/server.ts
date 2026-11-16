@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { callCodexHost, codexSpawnDefaults } from "./codex-defaults.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 
@@ -72,7 +73,9 @@ async function main(): Promise<void> {
       tools: catalog.tools.map((tool) => ({
         name: tool.name,
         ...(tool.title === undefined ? {} : { title: tool.title }),
-        description: tool.description,
+        description: tool.name === "spawn_agent" && server.server.getClientVersion()?.name === "codex-mcp-client"
+          ? tool.description.replace("blocks by default until it finishes or needs your approval", "runs in the background by default, allowing you to continue working; set run_in_background to false to wait for completion or approval")
+          : tool.description,
         inputSchema: tool.inputSchema as { type: "object"; [key: string]: unknown },
       })),
     };
@@ -82,7 +85,7 @@ async function main(): Promise<void> {
     const name = request.params.name;
     const tool = catalog.tools.find((candidate) => candidate.name === name);
     if (tool === undefined) return failure(`Tool ${name} not found`);
-    let input: unknown = request.params.arguments ?? {};
+    let input: unknown = codexSpawnDefaults(server.server.getClientVersion()?.name, name, request.params.arguments ?? {});
     // A host that serves the catalog checks arguments itself; this build checks its own tools, and the
     // tools it answers itself (restart_host), which never reach the host.
     const local = LOCAL_TOOLS.has(name);
@@ -92,7 +95,14 @@ async function main(): Promise<void> {
       input = checked.value;
     }
     try {
-      const value = local ? await restart(isRecord(input) && input["force"] === true) : await call(name, input, tool.timeoutMs);
+      const meta = request.params._meta;
+      const thread = server.server.getClientVersion()?.name === "codex-mcp-client" && isRecord(meta)
+        && typeof meta["threadId"] === "string" && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(meta["threadId"])
+        ? meta["threadId"] : undefined;
+      const value = local ? await restart(isRecord(input) && input["force"] === true)
+        : thread !== undefined && (name === "spawn_agent" || name === "send_message" || name === "start_ensemble")
+          ? await callCodexHost(call, name, input, thread, tool.timeoutMs)
+          : await call(name, input, tool.timeoutMs);
       return tool.format === "compact" ? toCompactContent(value) : toContent(value);
     } catch (error) {
       return failure(error instanceof Error ? error.message : String(error));

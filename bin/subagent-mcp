@@ -3,6 +3,8 @@
 # status-line mod loaded, so you don't have to pass --dangerously-load-development-channels.
 #
 #   subagent-mcp [any claude arguments]      e.g. subagent-mcp --resume
+#   subagent-mcp --codex [codex arguments]  launch Codex with the MCP server registered
+#   subagent-mcp bar [--once]               live agent bar (or one snapshot)
 #   subagent-mcp nim set-key [KEY]           add the NVIDIA NIM endpoint with your API key
 #   subagent-mcp endpoint add NAME URL --model ID[=alias] [--key KEY]   add any OpenAI-compatible endpoint
 #   subagent-mcp endpoint list|remove NAME
@@ -15,6 +17,28 @@ ROOT="$(cd "$(dirname "$SELF")/.." && pwd)"
 PORT="${SUBAGENT_MCP_NIM_PORT:-4131}"
 
 case "${1:-}" in
+bar)
+    shift
+    exec node "$ROOT/bin/agent-bar.mjs" "$@"
+    ;;
+companion)
+    shift
+    exec node "$ROOT/bin/companion.mjs" "$@"
+    ;;
+--codex)
+    shift
+    command -v codex >/dev/null || { echo "subagent-mcp: 'codex' not found on PATH" >&2; exit 1; }
+    [[ -f "$ROOT/dist/src/server.js" ]] || { echo "subagent-mcp: not built; run 'npm install && npm run build' in $ROOT" >&2; exit 1; }
+    # Registration must persist: a queue --resume may start a fresh Codex process after this one
+    # exits, so a command-line-only MCP override would leave that resumed session without tools.
+    if ! codex mcp get subagent-mcp >/dev/null 2>&1; then
+        codex mcp list >/dev/null || { echo "subagent-mcp: could not read Codex MCP configuration" >&2; exit 1; }
+        echo "subagent-mcp: registering the MCP server with Codex" >&2
+        codex mcp add subagent-mcp -- "$ROOT/bin/run-server.sh"
+        codex mcp get subagent-mcp >/dev/null || { echo "subagent-mcp: registration is not available in this project" >&2; exit 1; }
+    fi
+    exec codex "$@"
+    ;;
 nim)
     exec node "$ROOT/bin/endpoints.mjs" "$@"
     ;;

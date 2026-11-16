@@ -148,7 +148,7 @@ export class EnsembleManager {
 
   // ------------------------------------------------------------------ tools
 
-  async start(raw: unknown): Promise<Readonly<Record<string, unknown>>> {
+  async start(raw: unknown, codexThread?: string): Promise<Readonly<Record<string, unknown>>> {
     const input = typeof raw === "object" && raw !== null ? raw as Record<string, unknown> : {};
     // The config files are read only when a profile or model selection needs them, so a broken file never blocks an explicit roster.
     const needsFiles = typeof input["profile"] === "string" || input["selection"] !== undefined
@@ -188,9 +188,10 @@ export class EnsembleManager {
       catch (error) { throw new EnsembleError(`snapshot isolation needs a git repository with a commit: ${error instanceof Error ? error.message : String(error)}`); }
       if (snapshot.submodules === true) warnings.push("This repository has submodules; snapshot worktrees do not include their contents, so snapshot reviewers see them empty.");
     }
-    const inputs = spec.agents.map((member) => this.#spawnInput(spec, member, id, snapshot));
+    const inputs = spec.agents.map((member) => ({ ...this.#spawnInput(spec, member, id, snapshot), ...(codexThread === undefined ? {} : { codexThread }) }));
     const now = new Date().toISOString();
     const record: EnsembleRecord = {
+      ...(codexThread === undefined ? {} : { codex_thread: codexThread }),
       version: 1,
       id,
       name: spec.name,
@@ -804,7 +805,7 @@ export class EnsembleManager {
         // cancel() completes a synthesizing record that has no synthesizer yet; never launch or record one after that.
         if (live.cancelRequested || record.status !== "synthesizing") return;
         try {
-          const result = await this.#supervisor.spawnAgent(this.#synthesisInput(record.spec, record.id, synthesisPrompt(record.spec, record.summary, results)));
+          const result = await this.#supervisor.spawnAgent({ ...this.#synthesisInput(record.spec, record.id, synthesisPrompt(record.spec, record.summary, results)), ...(record.codex_thread === undefined ? {} : { codexThread: record.codex_thread }) });
           if (live.cancelRequested || record.status !== "synthesizing") {
             void this.#supervisor.stopAgents([String(result["agent_id"])]).catch(() => undefined);
             return;
@@ -877,6 +878,7 @@ export class EnsembleManager {
     this.#emitting.add(key);
     try {
       const delivered = await this.#onSettled({
+        ...(record.codex_thread === undefined ? {} : { codex_thread: record.codex_thread }),
         ensemble_id: record.id, name: record.name, status: record.status, reason: record.reason,
         ...(update ? { update: true } : {}), summary: this.#summaryView(record),
       });

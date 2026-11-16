@@ -158,6 +158,7 @@ export interface SynthesisRecord {
 }
 
 export interface EnsembleRecord {
+  readonly codex_thread?: string;
   readonly version: 1;
   readonly id: string;
   readonly name: string;
